@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Local Zaseo Snap testing is unavailable; no installed snap was changed." >&2
+exit 1

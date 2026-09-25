@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+
+set -euxo pipefail
+
+if [[ $# -gt 0 ]]; then
+  echo "
+  Usage: ${0##*/}
+  Builds and installs Zaseo into ~/.local, making it available as ~/.local/bin/zaseo.
+
+  Before running this you should ensure you have all the build dependencies installed with `./script/linux`.
+  "
+  exit 1
+fi
+export ZASEO_CHANNEL=$(<crates/zed/RELEASE_CHANNEL)
+script/bundle-linux
+
+arch="$(uname -m)"
+archive="zaseo-linux-${arch}.tar.gz"
+export ZASEO_BUNDLE_PATH="${CARGO_TARGET_DIR:-target}/release/${archive}"
+script/install.sh
