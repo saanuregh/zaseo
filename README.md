@@ -58,15 +58,18 @@ before `nix build .#zaseo` includes them.
 ## Connect to Paseo
 
 Zaseo connects to a Paseo daemon you install and start yourself. It does not
-bundle or start Paseo. It targets Paseo at upstream commit `8cd9895` and shows
-an incompatibility error for older daemons. At startup it connects to the active
-profile; the default `Local` profile points to `ws://127.0.0.1:6767/ws`. Use the
-host menu at the top of the Paseo sidebar, or **Manage Hosts…**, to switch hosts
-or add one.
+bundle or start Paseo. It targets Paseo v0.9.2 and shows an incompatibility
+error when a daemon lacks the features it needs. At startup it connects to the
+active profile; the default `Local` profile points to `ws://127.0.0.1:6767/ws`.
+Use the host menu at the top of the Paseo sidebar, or **Manage Hosts…**, to
+switch hosts or add one.
 
 The Paseo sidebar (left dock, **View → Paseo Agents**) lists projects, their
 workspaces, and each workspace's agents, as Paseo 0.9 does, with pinned
-workspaces first. It can also group agents by status, or workspaces by label. Each agent opens in its own tab with its conversation,
+workspaces first. A workspace with one agent is a single row that opens the
+agent. Rows keep their order while the pointer is over the sidebar and re-sort
+when it leaves. The sidebar can also group agents by status, or workspaces by
+label. Each agent opens in its own tab with its conversation,
 permission prompts, and a composer with model, thinking, and mode pickers. A new
 agent starts as a draft tab; its first message creates the agent. Opening an
 agent switches the window to that agent's project, opening the project if needed,
@@ -150,9 +153,13 @@ Keyboard shortcuts (`ctrl` on Linux and Windows, `cmd` on macOS):
 | `escape` | Interrupt the running agent |
 | `shift-tab` | Cycle the permission mode |
 | `ctrl-/` | Choose the model |
+| `ctrl-alt-/` (Linux and Windows) | Choose the permission mode |
 | `ctrl-l` | Focus the composer |
 | `shift-alt-a` / `shift-alt-x` | Accept / deny the pending permission |
-| `ctrl-shift-backspace` | Archive the agent |
+| `ctrl-shift-backspace`, or `ctrl-backspace` in the sidebar | Archive the agent |
+| `ctrl-shift-down` | Scroll to the latest message |
+| `ctrl-f` in the sidebar (Linux and Windows) | Filter agents |
+| `ctrl-=` / `ctrl--` / `ctrl-0` | Zoom the chat and editors in / out / reset |
 | `f2` | Rename the agent |
 | `ctrl-e` in Paseo views | Open the Last turn tab |
 | `ctrl-shift-t` in Paseo views | New terminal in the agent's directory |
