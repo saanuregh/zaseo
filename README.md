@@ -18,9 +18,9 @@ telemetry is off by default because it would go to Zed's servers.
 | Project | Release |
 | --- | --- |
 | Zed | Between releases: `main` at [`e52ab15`](https://github.com/zed-industries/zed/commit/e52ab15), after [`v1.22.0-pre`](https://github.com/zed-industries/zed/releases/tag/v1.22.0-pre) |
-| Paseo | [`v0.9.2`](https://github.com/getpaseo/paseo/releases/tag/v0.9.2), protocol v1 |
+| Paseo | [`v0.10.1`](https://github.com/getpaseo/paseo/releases/tag/v0.10.1), protocol v1 |
 
-Zaseo's UI and protocol follow Paseo v0.9.2, and it was tested against a v0.9.2 daemon.
+Zaseo's UI and protocol follow Paseo v0.10.1, and it was tested against a v0.10.1 daemon.
 Future resyncs move both projects to stable release tags only.
 
 ## Build and run on Linux
@@ -58,7 +58,7 @@ before `nix build .#zaseo` includes them.
 ## Connect to Paseo
 
 Zaseo connects to a Paseo daemon you install and start yourself. It does not
-bundle or start Paseo. It targets Paseo v0.9.2 and shows an incompatibility
+bundle or start Paseo. It targets Paseo v0.10.1 and shows an incompatibility
 error when a daemon lacks the features it needs. At startup it connects to the
 active profile; the default `Local` profile points to `ws://127.0.0.1:6767/ws`.
 Use the host menu at the top of the Paseo sidebar, or **Manage Hosts…**, to
@@ -186,7 +186,11 @@ release builds do not download Zed's server, so SSH projects fail unless a
 matching server is already in the host's `~/.zed_server`.
 
 Zaseo keeps passwords in memory only and never saves them. It rejects URLs that
-contain credentials. A remote `ws://` connection is only as private as the
+contain credentials. When no password was typed, a `ws://` or `wss://` profile that
+points at the daemon running on this machine signs in with that daemon's local
+credential (`$PASEO_HOME/local-credential`, default `~/.paseo`), as the Paseo CLI
+does, so a password-protected local daemon needs no password. SSH profiles always
+use a typed password. A remote `ws://` connection is only as private as the
 network or VPN it runs over.
 
 # Zed

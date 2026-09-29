@@ -15,7 +15,7 @@ use paseo_client::{
 use project::{Completion, CompletionDisplayOptions, CompletionResponse, CompletionSource};
 use serde_json::Value;
 use settings::Settings as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use text::{Anchor, ToOffset as _};
@@ -236,6 +236,22 @@ impl BaseRef {
             detail,
         }
     }
+}
+
+/// Draft commands include project skills read from the checkout, so a branch switch needs a
+/// fresh list rather than the one cached for the old branch.
+fn draft_command_cache_key(
+    provider: &str,
+    directory: Option<&Path>,
+    branch: Option<&str>,
+) -> String {
+    format!(
+        "draft:{provider}:{}:{}",
+        directory
+            .map(|directory| directory.to_string_lossy())
+            .unwrap_or_default(),
+        branch.unwrap_or_default()
+    )
 }
 
 /// The base Paseo preselects: the current branch's upstream, because branching off the local
@@ -459,17 +475,26 @@ impl Composer {
         self.agent(cx).is_some_and(agent_is_running)
     }
 
-    fn command_cache_key(&self) -> String {
+    fn command_cache_key(&self, cx: &App) -> String {
         match &self.agent_id {
             Some(agent_id) => agent_id.clone(),
-            None => format!(
-                "draft:{}:{}",
-                self.draft.provider.as_deref().unwrap_or_default(),
-                self.draft_directory
-                    .as_deref()
-                    .map(|directory| directory.to_string_lossy())
-                    .unwrap_or_default()
-            ),
+            None => {
+                let directory = self.draft_directory.as_deref();
+                let branch = directory.and_then(|directory| {
+                    self.store
+                        .read(cx)
+                        .state
+                        .workspaces
+                        .values()
+                        .find(|workspace| workspace.directory == directory)
+                        .and_then(|workspace| workspace.current_branch.as_deref())
+                });
+                draft_command_cache_key(
+                    self.draft.provider.as_deref().unwrap_or_default(),
+                    directory,
+                    branch,
+                )
+            }
         }
     }
 
@@ -483,7 +508,7 @@ impl Composer {
         {
             return;
         }
-        let key = self.command_cache_key();
+        let key = self.command_cache_key(cx);
         let agent_id = self.agent_id.clone();
         let draft = if agent_id.is_none() {
             let choices = self.choices(cx);
@@ -525,8 +550,16 @@ impl Composer {
             let resolved = self.choices(cx).provider;
             if resolved.is_some() {
                 self.draft.provider = resolved;
-                self.load_commands(cx);
             }
+        }
+        if self.agent_id.is_none()
+            && !self
+                .store
+                .read(cx)
+                .commands
+                .contains_key(&self.command_cache_key(cx))
+        {
+            self.load_commands(cx);
         }
     }
 
@@ -2184,7 +2217,7 @@ impl CompletionProvider for PaseoCompletionProvider {
                 .store
                 .read(cx)
                 .commands
-                .get(&composer.command_cache_key())
+                .get(&composer.command_cache_key(cx))
             {
                 completions.extend(commands.iter().map(|command| {
                     (
@@ -2539,6 +2572,21 @@ mod tests {
         );
         status.current_branch = None;
         assert_eq!(default_base_ref(&status), None);
+    }
+
+    #[test]
+    fn draft_command_cache_key_includes_the_branch() {
+        let directory = Some(Path::new("/tmp/project"));
+        let main = draft_command_cache_key("claude", directory, Some("main"));
+        assert_ne!(
+            main,
+            draft_command_cache_key("claude", directory, Some("feature"))
+        );
+        assert_ne!(main, draft_command_cache_key("claude", directory, None));
+        assert_eq!(
+            main,
+            draft_command_cache_key("claude", directory, Some("main"))
+        );
     }
 
     #[test]

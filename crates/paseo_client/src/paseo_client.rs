@@ -1654,12 +1654,96 @@ pub async fn connect(
     password: Option<RuntimePassword>,
     client_id: String,
 ) -> Result<(PaseoSession, Receiver<PaseoEvent>)> {
-    connect_with_ssh_executable(target, password, client_id, PathBuf::from("ssh")).await
+    let credentials = Credentials {
+        password,
+        paseo_home: paseo_home(),
+    };
+    connect_with_ssh_executable(target, credentials, client_id, PathBuf::from("ssh")).await
+}
+
+#[derive(Default)]
+struct Credentials {
+    password: Option<RuntimePassword>,
+    /// Where a daemon on this machine keeps `paseo.pid` and `local-credential`.
+    paseo_home: Option<PathBuf>,
+}
+
+enum HelloAuth<'a> {
+    Password(&'a str),
+    LocalCredential(String),
+}
+
+impl Credentials {
+    /// A typed password wins, as in the Paseo CLI, so a stale `paseo.pid` left by a crashed daemon
+    /// cannot lock out a user who knows the password. The local credential is read on every
+    /// attempt because the daemon writes a new one when it restarts.
+    fn hello_auth(&self, target: &ConnectionTarget) -> Option<HelloAuth<'_>> {
+        match &self.password {
+            Some(password) => Some(HelloAuth::Password(password.as_str())),
+            None => self
+                .paseo_home
+                .as_deref()
+                .and_then(|home| local_credential(target, home))
+                .map(HelloAuth::LocalCredential),
+        }
+    }
+}
+
+fn paseo_home() -> Option<PathBuf> {
+    match std::env::var_os("PASEO_HOME") {
+        Some(configured) => {
+            let configured = PathBuf::from(configured);
+            match configured.strip_prefix("~") {
+                Ok(relative) => std::env::home_dir().map(|home| home.join(relative)),
+                Err(_) => Some(configured),
+            }
+        }
+        None => std::env::home_dir().map(|home| home.join(".paseo")),
+    }
+}
+
+/// The token that lets a client on the daemon's own machine connect without its password. Paseo
+/// only offers it when the target is the daemon recorded in `paseo.pid`.
+fn local_credential(target: &ConnectionTarget, paseo_home: &Path) -> Option<String> {
+    let ConnectionTarget::Direct { websocket_url, .. } = target else {
+        return None;
+    };
+    let url = url::Url::parse(websocket_url).ok()?;
+    let target_endpoint = local_endpoint(url.host_str()?, url.port_or_known_default()?);
+    let lock: Value =
+        serde_json::from_slice(&std::fs::read(paseo_home.join("paseo.pid")).ok()?).ok()?;
+    let listen = url::Url::parse(&format!("tcp://{}", lock["listen"].as_str()?)).ok()?;
+    if local_endpoint(listen.host_str()?, listen.port()?) != target_endpoint {
+        return None;
+    }
+    let token = std::fs::read_to_string(paseo_home.join("local-credential")).ok()?;
+    let token = token.trim();
+    let valid = token.len() == 43
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+    valid.then(|| token.to_owned())
+}
+
+fn local_endpoint(host: &str, port: u16) -> String {
+    let host = match host {
+        "127.0.0.1" | "0.0.0.0" | "[::1]" | "[::]" => "localhost",
+        host => host,
+    };
+    format!("{host}:{port}")
+}
+
+/// Only RFC 7230 token characters fit in the legacy `paseo.bearer.<password>` subprotocol.
+fn header_safe_password(password: &str) -> bool {
+    !password.is_empty()
+        && password
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
 }
 
 async fn connect_with_ssh_executable(
     target: ConnectionTarget,
-    password: Option<RuntimePassword>,
+    credentials: Credentials,
     client_id: String,
     ssh_executable: PathBuf,
 ) -> Result<(PaseoSession, Receiver<PaseoEvent>)> {
@@ -1667,7 +1751,7 @@ async fn connect_with_ssh_executable(
         bail!("client ID must not be empty");
     }
     let (mut socket, server_info) =
-        open_socket(&target, password.as_ref(), &client_id, &ssh_executable).await?;
+        open_socket(&target, &credentials, &client_id, &ssh_executable).await?;
     subscribe(&mut socket, &TimelineSubscriptions::default())
         .await
         .context("Paseo initial subscription failed")?;
@@ -1684,7 +1768,7 @@ async fn connect_with_ssh_executable(
     tokio::spawn(run(
         socket,
         target,
-        password,
+        credentials,
         client_id,
         ssh_executable,
         command_receiver,
@@ -1695,7 +1779,7 @@ async fn connect_with_ssh_executable(
 
 async fn open_socket(
     target: &ConnectionTarget,
-    password: Option<&RuntimePassword>,
+    credentials: &Credentials,
     client_id: &str,
     ssh_executable: &Path,
 ) -> Result<(Socket, ServerInfo)> {
@@ -1704,33 +1788,68 @@ async fn open_socket(
         .as_str()
         .into_client_request()
         .context("invalid Paseo WebSocket request")?;
-    if let Some(password) = password {
-        let protocol = HeaderValue::from_str(&format!("paseo.bearer.{}", password.as_str()))
+    let auth = credentials.hello_auth(target);
+    // COMPAT(headerAuth): daemons before v0.10 only read the password from the subprotocol.
+    let bearer = match &auth {
+        Some(HelloAuth::Password(password)) if header_safe_password(password) => {
+            Some(format!("paseo.bearer.{password}"))
+        }
+        _ => None,
+    };
+    if let Some(bearer) = &bearer {
+        let protocol = HeaderValue::from_str(bearer)
             .map_err(|_| anyhow!("password cannot be used in WebSocket subprotocol"))?;
         request
             .headers_mut()
             .insert("Sec-WebSocket-Protocol", protocol);
     }
     let (mut socket, response) = transport::connect_socket(target, request, ssh_executable).await?;
-    if let Some(password) = password {
-        let expected = format!("paseo.bearer.{}", password.as_str());
-        if response
+    if let Some(bearer) = &bearer
+        && response
             .headers()
             .get("Sec-WebSocket-Protocol")
             .and_then(|value| value.to_str().ok())
-            != Some(expected.as_str())
-        {
-            bail!("Paseo daemon did not accept password authentication");
-        }
+            != Some(bearer.as_str())
+    {
+        bail!("Paseo daemon did not accept password authentication");
     }
-    socket.send(Message::Text(json!({"type":"hello", "clientId":client_id, "clientType":"cli", "protocolVersion":1, "capabilities":{"owned_subscriptions":true, "explicit_event_subscriptions":true, "selective_agent_timeline":true, "all_providers":true, "timeline_replacement_invalidation":true, "timeline_notifications":true, "reasoning_merge_enum":true, "terminal-restore-modes":true, "provider_subagents":true, "projected_subagent_timeline":true, "project_updates":true}}).to_string().into())).await.context("Paseo hello failed")?;
+    let mut hello = json!({"type":"hello", "clientId":client_id, "clientType":"cli", "protocolVersion":1, "capabilities":{"hello_rejection":true, "owned_subscriptions":true, "explicit_event_subscriptions":true, "selective_agent_timeline":true, "all_providers":true, "timeline_replacement_invalidation":true, "timeline_notifications":true, "reasoning_merge_enum":true, "terminal-restore-modes":true, "provider_subagents":true, "projected_subagent_timeline":true, "project_updates":true}});
+    match auth {
+        Some(HelloAuth::Password(password)) => {
+            hello["auth"] = json!({"kind":"password", "password":password});
+        }
+        Some(HelloAuth::LocalCredential(token)) => {
+            hello["auth"] = json!({"kind":"localCredential", "token":token});
+        }
+        None => {}
+    }
+    socket
+        .send(Message::Text(hello.to_string().into()))
+        .await
+        .context("Paseo hello failed")?;
     let message = tokio::time::timeout(Duration::from_secs(10), socket.next())
         .await
         .context("Paseo hello timed out")?
         .context("Paseo closed during hello")?
         .context("Paseo hello failed")?;
+    if let Message::Close(frame) = &message {
+        // A daemon sends no `hello.rejected` when it rejects the bearer subprotocol or predates v0.10.
+        return Err(match frame.as_ref().map(|frame| frame.reason.as_str()) {
+            Some("Password required") => AuthRejection::PasswordRequired.into(),
+            Some("Incorrect password") => AuthRejection::IncorrectPassword.into(),
+            Some("Incompatible protocol version") => anyhow!("incompatible Paseo protocol version"),
+            _ => anyhow!("Paseo closed during hello"),
+        });
+    }
     let value: Value =
         serde_json::from_slice(&message.into_data()).context("invalid Paseo hello response")?;
+    if value["type"] == "hello.rejected" {
+        return Err(match value["reason"].as_str() {
+            Some("password_required") => AuthRejection::PasswordRequired.into(),
+            Some("incorrect_password") => AuthRejection::IncorrectPassword.into(),
+            _ => anyhow!("incompatible Paseo protocol version"),
+        });
+    }
     let info = value
         .get("message")
         .filter(|_| value["type"] == "session")
@@ -1829,7 +1948,7 @@ async fn subscribe(socket: &mut Socket, timeline: &TimelineSubscriptions) -> Res
 async fn run(
     mut socket: Socket,
     target: ConnectionTarget,
-    password: Option<RuntimePassword>,
+    credentials: Credentials,
     client_id: String,
     ssh_executable: PathBuf,
     mut commands: mpsc::Receiver<Command>,
@@ -1849,7 +1968,7 @@ async fn run(
             _ = ping_timer.tick() => {
                 pending.retain(|_, request| !request.reply.is_closed());
                 if ping_pending || socket.send(Message::Text(json!({"type":"ping"}).to_string().into())).await.is_err() {
-                    if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
+                    if !reconnect(&mut socket, &target, &ssh_executable, &credentials, &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
                 } else {
                     ping_pending = true;
                 }
@@ -1883,7 +2002,7 @@ async fn run(
                             message["agentId"] = json!(agent_id);
                             if send_message(&mut socket, message.clone()).await.is_err() {
                                 deliver(reply, Err(anyhow!("Paseo connection lost; permission outcome unknown")));
-                                if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
+                                if !reconnect(&mut socket, &target, &ssh_executable, &credentials, &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
                             } else {
                                 pending.insert(request_id, Pending { message, response_type, retry_creation, reply });
                             }
@@ -1895,7 +2014,7 @@ async fn run(
                     if send_message(&mut socket, message.clone()).await.is_err() {
                         if retry_creation { pending.insert(request_id, Pending { message, response_type, retry_creation, reply }); }
                         else { deliver(reply, Err(anyhow!("Paseo connection lost; request outcome unknown"))); }
-                        if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
+                        if !reconnect(&mut socket, &target, &ssh_executable, &credentials, &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
                     } else {
                         pending.insert(request_id, Pending { message, response_type, retry_creation, reply });
                     }
@@ -1903,7 +2022,7 @@ async fn run(
                 Some(Command::ReleaseTerminal { terminal_id, subscription_id }) => {
                     terminal_slots.retain(|_, subscribed| *subscribed != terminal_id);
                     if send_message(&mut socket, json!({"type":"subscription.release.request", "requestId":next_request_id(), "subscriptionId":subscription_id})).await.is_err() {
-                        if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
+                        if !reconnect(&mut socket, &target, &ssh_executable, &credentials, &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
                     }
                 }
                 Some(Command::Notify(message)) => {
@@ -1911,7 +2030,7 @@ async fn run(
                         terminal_slots.retain(|_, terminal_id| message["terminalId"] != terminal_id.as_str());
                     }
                     if send_message(&mut socket, message).await.is_err() {
-                        if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
+                        if !reconnect(&mut socket, &target, &ssh_executable, &credentials, &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
                     }
                 }
                 Some(Command::Close(reply)) => {
@@ -1946,12 +2065,12 @@ async fn run(
                             handle_message(message, &mut pending, &mut agents, &mut permissions, &events, &mut timeline);
                             if let Some(page_cursor) = next_directory_cursor {
                                 if send_message(&mut socket, json!({"type":"fetch_agents_request", "requestId":next_request_id(), "scope":"active", "page":{"limit":200,"cursor":page_cursor}})).await.is_err() {
-                                    if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
+                                    if !reconnect(&mut socket, &target, &ssh_executable, &credentials, &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
                                 }
                             }
                             if let Some(subscription_id) = old_subscription {
                                 if send_message(&mut socket, json!({"type":"subscription.release.request", "requestId":next_request_id(), "subscriptionId":subscription_id})).await.is_err() {
-                                    if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
+                                    if !reconnect(&mut socket, &target, &ssh_executable, &credentials, &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
                                 }
                             }
                             let follow_up = timeline_agent.and_then(|agent_id| {
@@ -1971,21 +2090,21 @@ async fn run(
                             });
                             if let Some(request) = follow_up {
                                 if send_message(&mut socket, request).await.is_err() {
-                                    if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
+                                    if !reconnect(&mut socket, &target, &ssh_executable, &credentials, &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
                                 }
                             }
                         } else if value["type"] == "pong" {
                             ping_pending = false;
                         } else if value["type"] == "ping" {
                             if socket.send(Message::Text(json!({"type":"pong"}).to_string().into())).await.is_err() {
-                                if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
+                                if !reconnect(&mut socket, &target, &ssh_executable, &credentials, &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
                             }
                         }
                     }
                 } else if let Some(Message::Binary(data)) = result {
                     emit_terminal_frame(&data, &terminal_slots, &events);
                 } else if result.is_none() {
-                    if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
+                    if !reconnect(&mut socket, &target, &ssh_executable, &credentials, &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
                 }
             }
         }
@@ -2309,7 +2428,7 @@ async fn reconnect(
     socket: &mut Socket,
     target: &ConnectionTarget,
     ssh_executable: &Path,
-    password: Option<&RuntimePassword>,
+    credentials: &Credentials,
     client_id: &str,
     events: &Sender<PaseoEvent>,
     pending: &mut HashMap<String, Pending>,
@@ -2359,9 +2478,23 @@ async fn reconnect(
                 None => return false,
             }
         }
-        if let Ok((mut replacement, server_info)) =
-            open_socket(target, password, client_id, ssh_executable).await
+        let attempt = open_socket(target, credentials, client_id, ssh_executable).await;
+        if let Err(error) = &attempt
+            && let Some(rejection) = error.downcast_ref::<AuthRejection>()
         {
+            // Retrying the same credentials cannot succeed, so the user has to enter new ones.
+            for (_, request) in pending.drain() {
+                deliver(request.reply, Err(anyhow!("{rejection}")));
+            }
+            emit_event(
+                events,
+                PaseoEvent::ConnectionFailed {
+                    reason: rejection.to_string(),
+                },
+            );
+            return false;
+        }
+        if let Ok((mut replacement, server_info)) = attempt {
             if subscribe(&mut replacement, timeline).await.is_err() {
                 continue;
             }
@@ -2620,14 +2753,23 @@ mod tests {
                     .expect("accept authenticated socket");
                 let hello = next_json(&mut socket).await;
                 assert_eq!(hello["type"], "hello");
+                assert_eq!(
+                    hello["auth"],
+                    json!({"kind":"password", "password":"test-secret"})
+                );
+                assert_eq!(hello["capabilities"]["hello_rejection"], true);
                 send_json(&mut socket, json!({"type":"session", "message":{"type":"status", "payload":{"status":"server_info", "serverId":"mock", "features":{"ownedSubscriptions":true,"providersSnapshot":true,"creationLifecycle":true}}}})).await;
-                let _ = next_request(&mut socket, "fetch_agents_request").await;
+                next_request(&mut socket, "fetch_agents_request").await;
             }
         });
-        let (_session, _events) = connect(
+        let (_session, _events) = connect_with_ssh_executable(
             target(port),
-            Some(RuntimePassword::new("test-secret".into())),
+            Credentials {
+                password: Some(RuntimePassword::new("test-secret".into())),
+                paseo_home: None,
+            },
             "test-client".into(),
+            PathBuf::from("ssh"),
         )
         .await
         .expect("authenticated connection");
@@ -2671,6 +2813,295 @@ mod tests {
         };
         assert!(!error.to_string().contains("test-secret"));
         wrong_protocol.await.expect("mock daemon task");
+    }
+
+    /// Accepts one socket, records its subprotocol header, and returns the hello it sent.
+    #[allow(clippy::result_large_err)]
+    async fn accept_recording_protocol(
+        listener: TcpListener,
+    ) -> (
+        WebSocketStream<async_tungstenite::tokio::TokioAdapter<TcpStream>>,
+        Option<String>,
+        Value,
+    ) {
+        use async_tungstenite::tokio::accept_hdr_async;
+        use async_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+        let (stream, _) = listener.accept().await.expect("accept client");
+        let mut protocol = None;
+        let mut socket = accept_hdr_async(stream, |request: &Request, response: Response| {
+            protocol = request
+                .headers()
+                .get("Sec-WebSocket-Protocol")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            Ok(response)
+        })
+        .await
+        .expect("accept mock socket");
+        let hello = next_json(&mut socket).await;
+        (socket, protocol, hello)
+    }
+
+    fn server_info_json() -> Value {
+        json!({"type":"session", "message":{"type":"status", "payload":{"status":"server_info", "serverId":"mock", "features":{"ownedSubscriptions":true,"providersSnapshot":true,"creationLifecycle":true}}}})
+    }
+
+    #[tokio::test]
+    async fn password_that_is_not_a_header_token_is_sent_only_in_hello_auth() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock daemon");
+        let port = listener.local_addr().expect("mock address").port();
+        let server = tokio::spawn(async move {
+            let (mut socket, protocol, hello) = accept_recording_protocol(listener).await;
+            assert_eq!(protocol, None);
+            assert_eq!(
+                hello["auth"],
+                json!({"kind":"password", "password":"pass word@/x"})
+            );
+            send_json(&mut socket, server_info_json()).await;
+            next_request(&mut socket, "fetch_agents_request").await;
+        });
+        let (_session, _events) = connect_with_ssh_executable(
+            target(port),
+            Credentials {
+                password: Some(RuntimePassword::new("pass word@/x".into())),
+                paseo_home: None,
+            },
+            "test-client".into(),
+            PathBuf::from("ssh"),
+        )
+        .await
+        .expect("connection with a non-token password");
+        server.await.expect("mock daemon task");
+    }
+
+    #[tokio::test]
+    async fn hello_rejections_are_auth_errors() {
+        use async_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+
+        let cases = [
+            (
+                Some("password_required"),
+                None,
+                AuthRejection::PasswordRequired,
+            ),
+            (
+                None,
+                Some("Incorrect password"),
+                AuthRejection::IncorrectPassword,
+            ),
+            (
+                Some("incorrect_password"),
+                Some("Incorrect password"),
+                AuthRejection::IncorrectPassword,
+            ),
+        ];
+        for (rejected_reason, close_reason, expected) in cases {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock daemon");
+            let port = listener.local_addr().expect("mock address").port();
+            let server = tokio::spawn(async move {
+                let (mut socket, _, _) = accept_recording_protocol(listener).await;
+                if let Some(reason) = rejected_reason {
+                    send_json(
+                        &mut socket,
+                        json!({"type":"hello.rejected", "reason":reason, "accepts":["password"]}),
+                    )
+                    .await;
+                }
+                if let Some(reason) = close_reason {
+                    socket
+                        .close(Some(CloseFrame {
+                            code: CloseCode::from(4401),
+                            reason: reason.into(),
+                        }))
+                        .await
+                        .expect("close mock socket");
+                }
+            });
+            let error = match connect_with_ssh_executable(
+                target(port),
+                Credentials::default(),
+                "test-client".into(),
+                PathBuf::from("ssh"),
+            )
+            .await
+            {
+                Ok(_) => panic!("rejected hello should fail"),
+                Err(error) => error,
+            };
+            assert_eq!(error.downcast_ref::<AuthRejection>(), Some(&expected));
+            assert_eq!(error.to_string(), expected.to_string());
+            server.await.expect("mock daemon task");
+        }
+    }
+
+    fn paseo_home_with(listen: &str, token: &str) -> tempfile::TempDir {
+        let home = tempfile::tempdir().expect("create paseo home");
+        std::fs::write(
+            home.path().join("paseo.pid"),
+            json!({"pid":1, "listen":listen}).to_string(),
+        )
+        .expect("write paseo.pid");
+        std::fs::write(home.path().join("local-credential"), format!("{token}\n"))
+            .expect("write local credential");
+        home
+    }
+
+    const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJ0123-_x";
+
+    fn direct(url: &str) -> ConnectionTarget {
+        ConnectionTarget::Direct {
+            websocket_url: url.into(),
+            editor_ssh: None,
+        }
+    }
+
+    #[test]
+    fn local_credential_matches_the_running_daemon_on_loopback() {
+        let home = paseo_home_with("127.0.0.1:6767", TOKEN);
+        for url in [
+            "ws://127.0.0.1:6767/ws",
+            "ws://localhost:6767/ws",
+            "ws://[::1]:6767/ws",
+            "wss://localhost:6767/ws",
+        ] {
+            assert_eq!(
+                local_credential(&direct(url), home.path()).as_deref(),
+                Some(TOKEN),
+                "{url}"
+            );
+        }
+        let any_address = paseo_home_with("0.0.0.0:6767", TOKEN);
+        assert_eq!(
+            local_credential(&direct("ws://localhost:6767/ws"), any_address.path()).as_deref(),
+            Some(TOKEN)
+        );
+    }
+
+    #[test]
+    fn local_credential_skips_other_daemons() {
+        let home = paseo_home_with("127.0.0.1:6767", TOKEN);
+        for target in [
+            direct("ws://127.0.0.1:6768/ws"),
+            direct("ws://example.com:6767/ws"),
+            ConnectionTarget::Ssh {
+                host: "localhost".into(),
+                username: None,
+                ssh_port: 22,
+                daemon_port: 6767,
+            },
+        ] {
+            assert_eq!(local_credential(&target, home.path()), None, "{target:?}");
+        }
+        let unix = paseo_home_with("unix:///tmp/paseo.sock", TOKEN);
+        assert_eq!(
+            local_credential(&direct("ws://localhost:6767/ws"), unix.path()),
+            None
+        );
+        let missing = tempfile::tempdir().expect("create empty paseo home");
+        assert_eq!(
+            local_credential(&direct("ws://localhost:6767/ws"), missing.path()),
+            None
+        );
+    }
+
+    #[test]
+    fn local_credential_rejects_a_malformed_token() {
+        for (name, token) in [("short", "abc"), ("symbols", &"a/".repeat(22)[..43])] {
+            let home = paseo_home_with("127.0.0.1:6767", token);
+            assert_eq!(
+                local_credential(&direct("ws://localhost:6767/ws"), home.path()),
+                None,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_password_wins_over_the_local_credential() {
+        let home = paseo_home_with("127.0.0.1:6767", TOKEN);
+        let credentials = Credentials {
+            password: Some(RuntimePassword::new("test-secret".into())),
+            paseo_home: Some(home.path().to_owned()),
+        };
+        assert!(matches!(
+            credentials.hello_auth(&direct("ws://localhost:6767/ws")),
+            Some(HelloAuth::Password("test-secret"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_credential_is_sent_without_a_header() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock daemon");
+        let port = listener.local_addr().expect("mock address").port();
+        let home = paseo_home_with(&format!("127.0.0.1:{port}"), TOKEN);
+        let server = tokio::spawn(async move {
+            let (mut socket, protocol, hello) = accept_recording_protocol(listener).await;
+            assert_eq!(protocol, None);
+            assert_eq!(
+                hello["auth"],
+                json!({"kind":"localCredential", "token":TOKEN})
+            );
+            send_json(&mut socket, server_info_json()).await;
+            next_request(&mut socket, "fetch_agents_request").await;
+        });
+        let (_session, _events) = connect_with_ssh_executable(
+            target(port),
+            Credentials {
+                password: None,
+                paseo_home: Some(home.path().to_owned()),
+            },
+            "test-client".into(),
+            PathBuf::from("ssh"),
+        )
+        .await
+        .expect("connection with the local credential");
+        server.await.expect("mock daemon task");
+    }
+
+    #[tokio::test]
+    async fn reconnect_stops_when_the_daemon_rejects_the_password() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock daemon");
+        let port = listener.local_addr().expect("mock address").port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("first connection");
+            let mut first = server_socket(stream).await;
+            next_request(&mut first, "fetch_agents_request").await;
+            drop(first);
+            let (mut second, _, _) = accept_recording_protocol(listener).await;
+            send_json(
+                &mut second,
+                json!({"type":"hello.rejected", "reason":"incorrect_password", "accepts":["password"]}),
+            )
+            .await;
+        });
+        let (_session, events) = connect_with_ssh_executable(
+            target(port),
+            Credentials::default(),
+            "test-client".into(),
+            PathBuf::from("ssh"),
+        )
+        .await
+        .expect("first connection");
+        let mut failure = None;
+        while let Ok(event) = tokio::time::timeout(Duration::from_secs(10), events.recv())
+            .await
+            .expect("event timed out")
+        {
+            if let PaseoEvent::ConnectionFailed { reason } = event {
+                failure = Some(reason);
+            }
+        }
+        assert_eq!(failure.as_deref(), Some("Incorrect password"));
+        server.await.expect("mock daemon task");
     }
 
     #[tokio::test]
@@ -2767,10 +3198,14 @@ while True:
             ssh_port: 2222,
             daemon_port: 6767,
         };
-        let (session, events) =
-            connect_with_ssh_executable(target, None, "test-client".into(), executable)
-                .await
-                .expect("connect through SSH");
+        let (session, events) = connect_with_ssh_executable(
+            target,
+            Credentials::default(),
+            "test-client".into(),
+            executable,
+        )
+        .await
+        .expect("connect through SSH");
         let mut saw_disconnect = false;
         loop {
             let event = tokio::time::timeout(Duration::from_secs(10), events.recv())

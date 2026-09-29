@@ -529,6 +529,8 @@ impl PaseoStore {
                 }
             }
             PaseoEvent::Disconnected { .. } => self.status = ConnectionStatus::Reconnecting,
+            // The event handler below records the reason after `disconnect` clears the old state.
+            PaseoEvent::ConnectionFailed { .. } => self.disconnect(cx),
             PaseoEvent::WorkspacesSnapshot {
                 next_cursor: Some(cursor),
                 ..
@@ -1744,7 +1746,9 @@ impl StoreState {
             } => {
                 self.setup.insert(workspace_id, snapshot);
             }
-            PaseoEvent::Disconnected { reason } => self.error = Some(reason),
+            PaseoEvent::Disconnected { reason } | PaseoEvent::ConnectionFailed { reason } => {
+                self.error = Some(reason)
+            }
             PaseoEvent::Connected => self.error = None,
             PaseoEvent::ProvidersChanged(_)
             | PaseoEvent::ServerInfo(_)
@@ -2258,6 +2262,10 @@ mod tests {
         assert_eq!(state.error.as_deref(), Some("network unavailable"));
         state.apply_event(PaseoEvent::Connected);
         assert!(state.error.is_none());
+        state.apply_event(PaseoEvent::ConnectionFailed {
+            reason: "Incorrect password".into(),
+        });
+        assert_eq!(state.error.as_deref(), Some("Incorrect password"));
     }
 
     #[test]

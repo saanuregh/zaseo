@@ -27,6 +27,24 @@ impl RuntimePassword {
     }
 }
 
+/// Why the daemon refused this client's credentials.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthRejection {
+    PasswordRequired,
+    IncorrectPassword,
+}
+
+impl std::fmt::Display for AuthRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::PasswordRequired => "Password required",
+            Self::IncorrectPassword => "Incorrect password",
+        })
+    }
+}
+
+impl std::error::Error for AuthRejection {}
+
 /// What the connected daemon supports, from its `server_info` hello.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ServerInfo {
@@ -291,6 +309,10 @@ pub enum PaseoEvent {
     /// The daemon's advertised features, sent before every `Connected`.
     ServerInfo(ServerInfo),
     Disconnected {
+        reason: String,
+    },
+    /// The session stopped reconnecting, so no further events follow.
+    ConnectionFailed {
         reason: String,
     },
     AgentsChanged(Vec<AgentSummary>),
