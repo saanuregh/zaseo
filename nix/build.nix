@@ -91,10 +91,9 @@ let
       stdenv' = stdenv;
     in
     rec {
-      pname = "zed-editor";
+      pname = "zaseo";
       version =
         zedCargoLock.package.version
-        + "-nightly"
         + lib.optionalString (commitSha != null) "+${builtins.substring 0 7 commitSha}";
       src = builtins.path {
         path = ../.;
@@ -232,7 +231,7 @@ let
             ../assets/fonts/ibm-plex-sans
           ];
         };
-        ZED_UPDATE_EXPLANATION = "Zed has been installed using Nix. Auto-updates have thus been disabled.";
+        ZED_UPDATE_EXPLANATION = "Zaseo has been installed using Nix. Auto-updates have thus been disabled.";
         RELEASE_VERSION = version;
         ZED_COMMIT_SHA = lib.optionalString (commitSha != null) "${commitSha}";
         LK_CUSTOM_WEBRTC = pkgs.callPackage ./livekit-libwebrtc/package.nix { };
@@ -343,7 +342,7 @@ craneLib.buildPackage (
     # TODO: put this in a separate derivation that depends on src to avoid running it on every build
     preBuild = ''
       ALLOW_MISSING_LICENSES=yes bash script/generate-licenses
-      echo nightly > crates/zed/RELEASE_CHANNEL
+      echo stable > crates/zed/RELEASE_CHANNEL
     '';
 
     installPhase =
@@ -374,26 +373,24 @@ craneLib.buildPackage (
           runHook preInstall
 
           mkdir -p $out/bin $out/libexec
-          cp $TARGET_DIR/zed $out/libexec/zed-editor
-          cp $TARGET_DIR/cli  $out/bin/zed
-          ln -s $out/bin/zed $out/bin/zeditor  # home-manager expects the CLI binary to be here
+          cp $TARGET_DIR/zaseo $out/libexec/zaseo-editor
+          cp $TARGET_DIR/cli  $out/bin/zaseo
 
+          install -D "crates/zed/resources/app-icon@2x.png" \
+            "$out/share/icons/hicolor/1024x1024/apps/zaseo.png"
+          install -D crates/zed/resources/app-icon.png \
+            $out/share/icons/hicolor/512x512/apps/zaseo.png
 
-          install -D "crates/zed/resources/app-icon-nightly@2x.png" \
-            "$out/share/icons/hicolor/1024x1024@2x/apps/zed.png"
-          install -D crates/zed/resources/app-icon-nightly.png \
-            $out/share/icons/hicolor/512x512/apps/zed.png
-
-          # TODO: icons should probably be named "zed-nightly"
+          # The desktop file is named after the app ID so Wayland compositors match the window.
           (
             export DO_STARTUP_NOTIFY="true"
-            export APP_CLI="zed"
-            export APP_ICON="zed"
-            export APP_NAME="Zed Nightly"
+            export APP_CLI="zaseo"
+            export APP_ICON="zaseo"
+            export APP_NAME="Zaseo"
             export APP_ARGS="%U"
             mkdir -p "$out/share/applications"
-            ${lib.getExe envsubst} < "crates/zed/resources/zed.desktop.in" > "$out/share/applications/dev.zed.Zed-Nightly.desktop"
-            chmod +x "$out/share/applications/dev.zed.Zed-Nightly.desktop"
+            ${lib.getExe envsubst} < "crates/zed/resources/zed.desktop.in" > "$out/share/applications/local.zaseo.Zaseo.desktop"
+            chmod +x "$out/share/applications/local.zaseo.Zaseo.desktop"
           )
 
           runHook postInstall
@@ -401,15 +398,14 @@ craneLib.buildPackage (
 
     # TODO: why isn't this also done on macOS?
     postFixup = lib.optionalString stdenv.hostPlatform.isLinux ''
-      wrapProgram $out/libexec/zed-editor --suffix PATH : ${lib.makeBinPath [ nodejs_22 ]}
+      wrapProgram $out/libexec/zaseo-editor --suffix PATH : ${lib.makeBinPath [ nodejs_22 ]}
     '';
 
     meta = {
-      description = "High-performance, multiplayer code editor from the creators of Atom and Tree-sitter";
-      homepage = "https://zed.dev";
-      changelog = "https://zed.dev/releases/preview";
+      description = "Zed fork with native Paseo agents";
+      homepage = "https://github.com/saanuregh/zaseo";
       license = lib.licenses.gpl3Only;
-      mainProgram = "zed";
+      mainProgram = "zaseo";
       platforms = lib.platforms.linux ++ lib.platforms.darwin;
     };
   }

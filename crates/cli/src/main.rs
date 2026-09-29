@@ -61,16 +61,15 @@ trait InstalledApp {
     before_help = "The Zaseo CLI binary.
 This CLI is a separate binary that invokes Zaseo.
 
+Zaseo opens projects from Paseo agents, so it takes links but no file or folder paths.
+
 Examples:
     `zaseo`
           Simply opens Zaseo
     `zaseo --foreground`
           Runs in foreground (shows all logs)
-    `zaseo path-to-your-project`
-          Open your project in Zaseo
-    `zaseo -n path-to-file `
-          Open file/folder in a new window",
-    after_help = "To read from stdin, append '-', e.g. 'ps axf | zaseo -'"
+    `zaseo zaseo://...`
+          Opens a Zaseo link"
 )]
 struct Args {
     /// Wait for all of the given paths to be opened/closed before exiting.
@@ -103,10 +102,8 @@ struct Args {
     )]
     #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
     user_data_dir: Option<String>,
-    /// The paths to open in Zaseo (space-separated).
-    ///
-    /// Use `path:line:column` syntax to open a file at the given line and column.
-    #[arg(trailing_var_arg = true, value_hint = clap::ValueHint::AnyPath)]
+    /// Links to open in Zaseo (space-separated), such as `zaseo://` links.
+    #[arg(trailing_var_arg = true, value_hint = clap::ValueHint::Url)]
     paths_with_position: Vec<String>,
     /// Print Zaseo's version and the app path.
     #[arg(short, long)]
@@ -330,6 +327,29 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_links_but_no_paths() {
+        let parse = |arguments: &[&str]| {
+            Args::try_parse_from(std::iter::once("zaseo").chain(arguments.iter().copied()))
+                .expect("arguments parse")
+        };
+        assert!(reject_path_arguments(&parse(&[])).is_ok());
+        assert!(reject_path_arguments(&parse(&["zaseo://agent/abc", "https://paseo.sh"])).is_ok());
+        for rejected in [
+            &["."][..],
+            &["src/main.rs:10"],
+            &["-"],
+            &["file:///tmp/project"],
+            &["ssh://host/project"],
+            &["--diff", "a.rs", "b.rs"],
+        ] {
+            assert!(
+                reject_path_arguments(&parse(rejected)).is_err(),
+                "{rejected:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn cli_recognizes_zaseo_links_without_claiming_zed_links() {
         assert!(URL_PREFIX.contains(&"zaseo://"));
         assert!(!URL_PREFIX.contains(&"zed://"));
@@ -496,6 +516,32 @@ fn parse_path_in_wsl(source: &str, wsl: &str) -> Result<String> {
     Ok(source.to_string(&|path| path.to_string_lossy().into_owned()))
 }
 
+/// Zaseo opens projects from Paseo agents, so the command line takes links but no paths.
+fn reject_path_arguments(args: &Args) -> Result<()> {
+    anyhow::ensure!(
+        args.diff.is_empty(),
+        "Zaseo doesn't open files from the command line, so --diff isn't supported"
+    );
+    if let Some(argument) = args
+        .paths_with_position
+        .iter()
+        .find(|argument| !is_link_argument(argument))
+    {
+        anyhow::bail!(
+            "Zaseo doesn't open files or folders from the command line: {argument}\n\
+             Run `zaseo` and open an agent; Zaseo switches to the agent's project."
+        );
+    }
+    Ok(())
+}
+
+fn is_link_argument(argument: &str) -> bool {
+    URL_PREFIX
+        .iter()
+        .filter(|prefix| !matches!(**prefix, "file://" | "ssh://"))
+        .any(|prefix| argument.starts_with(prefix))
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("error: {error:#}");
@@ -579,6 +625,8 @@ fn run() -> Result<()> {
         ];
         anyhow::bail!(msg.join("\n"));
     }
+
+    reject_path_arguments(&args)?;
 
     let (server, server_name) =
         IpcOneShotServer::<IpcHandshake>::new().context("Handshake before Zaseo spawn")?;

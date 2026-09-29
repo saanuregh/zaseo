@@ -13,6 +13,7 @@ use std::ops::Range;
 use text::PointUtf16;
 use workspace::OpenInTerminal;
 use zed_actions::agent::AddSelectionToThread;
+use zed_actions::paseo::AddSelectionToAgent;
 use zed_actions::preview::{
     markdown::OpenPreview as OpenMarkdownPreview, svg::OpenPreview as OpenSvgPreview,
 };
@@ -293,6 +294,9 @@ pub fn deploy_context_menu(
                 )
                 .when(!disable_ai && has_selections, |this| {
                     this.action("Add to Agent Thread", Box::new(AddSelectionToThread))
+                })
+                .when(has_selections, |this| {
+                    this.action("Add Selection to Agent", Box::new(AddSelectionToAgent))
                 })
                 .separator()
                 .action("Cut", Box::new(Cut))

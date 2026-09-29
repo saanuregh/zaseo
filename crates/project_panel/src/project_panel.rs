@@ -414,6 +414,8 @@ actions!(
         ToggleHideHidden,
         /// Starts a new search in the selected directory.
         NewSearchInDirectory,
+        /// Mentions the selected files and folders in the current Paseo agent's message.
+        AddToAgent,
         /// Unfolds the selected directory.
         UnfoldDirectory,
         /// Folds the selected directory.
@@ -1232,6 +1234,8 @@ impl ProjectPanel {
                                 menu.separator()
                                     .action("Download...", Box::new(DownloadFromRemote))
                             })
+                            .separator()
+                            .action("Add to Agent", Box::new(AddToAgent))
                             .separator()
                             .action("Copy Path", Box::new(zed_actions::workspace::CopyPath))
                             .action(
@@ -3960,6 +3964,27 @@ impl ProjectPanel {
         };
         if !abs_file_paths.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(abs_file_paths.join("\n")));
+        }
+    }
+
+    fn add_to_agent(&mut self, _: &AddToAgent, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = {
+            let project = self.project.read(cx);
+            self.effective_entries()
+                .into_iter()
+                .filter_map(|entry| {
+                    let entry_path = project.path_for_entry(entry.entry_id, cx)?.path;
+                    Some(
+                        project
+                            .worktree_for_id(entry.worktree_id, cx)?
+                            .read(cx)
+                            .absolutize(&entry_path),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        if !paths.is_empty() {
+            window.dispatch_action(Box::new(zed_actions::paseo::AddPathsToAgent { paths }), cx);
         }
     }
 
@@ -7458,6 +7483,7 @@ impl Render for ProjectPanel {
                 .on_action(cx.listener(Self::confirm))
                 .on_action(cx.listener(Self::cancel))
                 .on_action(cx.listener(Self::copy_path))
+                .on_action(cx.listener(Self::add_to_agent))
                 .on_action(cx.listener(Self::copy_relative_path))
                 .on_action(cx.listener(Self::open_file_permalink))
                 .on_action(cx.listener(Self::copy_file_permalink))

@@ -1044,6 +1044,7 @@ impl TerminalBuilder {
             hyperlink_regex_searches: RegexSearches::default(),
             vi_mode_enabled: false,
             is_remote_terminal: false,
+            display_only_delegate: None,
             last_mouse_move_time: Instant::now(),
             last_hyperlink_search_position: None,
             mouse_down_hyperlink: None,
@@ -1331,6 +1332,7 @@ impl TerminalBuilder {
                 ),
                 vi_mode_enabled: false,
                 is_remote_terminal,
+                display_only_delegate: None,
                 last_mouse_move_time: Instant::now(),
                 last_hyperlink_search_position: None,
                 mouse_down_hyperlink: None,
@@ -1532,6 +1534,7 @@ pub struct Terminal {
     task: Option<TaskState>,
     vi_mode_enabled: bool,
     is_remote_terminal: bool,
+    display_only_delegate: Option<DisplayOnlyDelegate>,
     last_mouse_move_time: Instant,
     last_hyperlink_search_position: Option<GpuiPoint<Pixels>>,
     mouse_down_hyperlink: Option<HyperlinkMatch>,
@@ -1554,6 +1557,13 @@ pub struct Terminal {
     suppress_hyperlink_throttle_once: bool,
     #[cfg(any(test, feature = "test-support"))]
     pty_write_log: std::cell::RefCell<Vec<Vec<u8>>>,
+}
+
+/// Receives what a display-only terminal would have sent to a PTY, so a terminal whose process
+/// runs elsewhere (such as on a remote daemon) can forward keystrokes and size changes to it.
+pub struct DisplayOnlyDelegate {
+    pub input: Box<dyn Fn(&[u8]) + Send>,
+    pub resize: Box<dyn Fn(TerminalBounds) + Send>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1731,6 +1741,8 @@ impl Terminal {
                 } = &self.terminal_type
                 {
                     pty_tx.resize(new_bounds);
+                } else if let Some(delegate) = &self.display_only_delegate {
+                    (delegate.resize)(new_bounds);
                 }
 
                 resize(term, new_bounds);
@@ -1971,8 +1983,12 @@ impl Terminal {
         self.write_raw_output(&converted, cx);
     }
 
+    pub fn set_display_only_delegate(&mut self, delegate: DisplayOnlyDelegate) {
+        self.display_only_delegate = Some(delegate);
+    }
+
     /// Terminal byte streams already contain their control sequences and must not be normalized.
-    fn write_raw_output(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+    pub fn write_raw_output(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         let mut term = self.term.lock();
         self.output_processor
             .get_or_insert_with(Processor::<StdSyncHandler>::new)
@@ -2135,6 +2151,8 @@ impl Terminal {
                 }
             }
             pty_tx.notify(input);
+        } else if let Some(delegate) = &self.display_only_delegate {
+            (delegate.input)(&input);
         }
     }
 

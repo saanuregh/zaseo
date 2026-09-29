@@ -1,4 +1,3 @@
-use collab_ui::collab_panel;
 use gpui::{App, Menu, MenuItem, OsAction};
 use project::DisableAiSettings;
 use release_channel::ReleaseChannel;
@@ -41,10 +40,12 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
         }),
         MenuItem::separator(),
         MenuItem::action("Project Panel", project_panel::ToggleFocus),
-        MenuItem::action("Paseo Panel", paseo_ui::TogglePanel),
-        MenuItem::action("Paseo Tab", paseo_ui::OpenTab),
+        MenuItem::action("Paseo Agents", paseo_ui::TogglePanel),
+        MenuItem::action("New Paseo Agent", paseo_ui::NewAgent),
+        MenuItem::action("Paseo Command Center", paseo_ui::ToggleCommandCenter),
+        MenuItem::action("Paseo Last Turn", paseo_ui::ReviewLastTurn),
+        MenuItem::action("Paseo Provider Usage", paseo_ui::OpenProviderUsage),
         MenuItem::action("Outline Panel", outline_panel::ToggleFocus),
-        MenuItem::action("Collab Panel", collab_panel::ToggleFocus),
         MenuItem::action("Terminal Panel", terminal_panel::Toggle),
         MenuItem::action("Debugger Panel", debug_panel::ToggleFocus),
     ];
@@ -119,21 +120,6 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             items: vec![
                 MenuItem::action("New", workspace::NewFile),
                 MenuItem::action("New Window", workspace::NewWindow),
-                MenuItem::separator(),
-                #[cfg(not(target_os = "macos"))]
-                MenuItem::action("Open File...", workspace::OpenFiles),
-                MenuItem::action(
-                    if cfg!(not(target_os = "macos")) {
-                        "Open Folder..."
-                    } else {
-                        "Open…"
-                    },
-                    workspace::Open::default(),
-                ),
-                MenuItem::action("Open Recent…", zed_actions::OpenRecent::default()),
-                MenuItem::action("Open Remote…", zed_actions::OpenRemote::default()),
-                MenuItem::separator(),
-                MenuItem::action("Add Folder to Project…", workspace::AddFolderToProject),
                 MenuItem::separator(),
                 MenuItem::action("Save", workspace::Save { save_intent: None }),
                 MenuItem::action("Save As…", workspace::SaveAs),
@@ -309,27 +295,29 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                 MenuItem::action("View Dependency Licenses", zed_actions::OpenLicenses),
                 MenuItem::action("Show Welcome", onboarding::ShowWelcome),
                 MenuItem::separator(),
-                MenuItem::action("File Bug Report...", zed_actions::feedback::FileBugReport),
-                MenuItem::action("Request Feature...", zed_actions::feedback::RequestFeature),
-                MenuItem::action("Email Us...", zed_actions::feedback::EmailZed),
+                MenuItem::action(
+                    "Report an Issue...",
+                    super::OpenBrowser {
+                        url: "https://github.com/saanuregh/zaseo/issues/new".into(),
+                    },
+                ),
+                MenuItem::action(
+                    "Zaseo Repository",
+                    super::OpenBrowser {
+                        url: "https://github.com/saanuregh/zaseo".into(),
+                    },
+                ),
                 MenuItem::separator(),
                 MenuItem::action(
-                    "Documentation",
+                    "Zed Documentation",
                     super::OpenBrowser {
                         url: "https://zed.dev/docs".into(),
                     },
                 ),
-                MenuItem::action("Zed Repository", feedback::OpenZedRepo),
                 MenuItem::action(
-                    "Zed Twitter",
+                    "Paseo Documentation",
                     super::OpenBrowser {
-                        url: "https://twitter.com/zeddotdev".into(),
-                    },
-                ),
-                MenuItem::action(
-                    "Join the Team",
-                    super::OpenBrowser {
-                        url: "https://zed.dev/jobs".into(),
+                        url: "https://paseo.sh".into(),
                     },
                 ),
             ],

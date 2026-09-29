@@ -4637,8 +4637,9 @@ impl Render for Pane {
                                 if self.welcome_page.is_none() {
                                     let workspace = self.workspace.clone();
                                     self.welcome_page = Some(cx.new(|cx| {
+                                        // No recent projects: Zaseo opens projects from agents.
                                         crate::welcome::WelcomePage::new(
-                                            workspace, true, window, cx,
+                                            workspace, false, window, cx,
                                         )
                                     }));
                                 }

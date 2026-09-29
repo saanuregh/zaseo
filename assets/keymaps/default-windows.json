@@ -24,8 +24,6 @@
       "ctrl-alt-enter": ["picker::ConfirmInput", { "secondary": true }],
       "ctrl-shift-w": "workspace::CloseWindow",
       "shift-escape": "workspace::ToggleZoom",
-      "ctrl-o": "workspace::OpenFiles",
-      "ctrl-k ctrl-o": "workspace::Open",
       "ctrl-=": ["zed::IncreaseBufferFontSize", { "persist": false }],
       "ctrl-shift-=": ["zed::IncreaseBufferFontSize", { "persist": false }],
       "ctrl--": ["zed::DecreaseBufferFontSize", { "persist": false }],
@@ -136,7 +134,7 @@
       "ctrl-k z": "editor::ToggleSoftWrap",
       "ctrl-f": "buffer_search::Deploy",
       "ctrl-h": "buffer_search::DeployReplace",
-      "ctrl-shift-.": "agent::AddSelectionToThread",
+      "ctrl-shift-.": "paseo_ui::AddSelectionToAgent",
       "shift-alt-e": "editor::SelectEnclosingSymbol",
       "ctrl-shift-backspace": "editor::GoToPreviousChange",
       "ctrl-shift-alt-backspace": "editor::GoToNextChange",
@@ -202,6 +200,17 @@
       "shift-alt-y": "agent::KeepAll",
       "shift-alt-z": "agent::RejectAll",
       "ctrl-shift-r": "agent::OpenAgentDiff",
+    },
+  },
+  {
+    "context": "Editor && paseo_agent_edits",
+    "use_key_equivalents": true,
+    "bindings": {
+      "alt-y": "paseo_ui::KeepEdit",
+      "ctrl-alt-y": "paseo_ui::KeepEdit",
+      "ctrl-alt-z": "paseo_ui::RejectEdit",
+      "shift-alt-y": "paseo_ui::KeepAllEdits",
+      "shift-alt-z": "paseo_ui::RejectAllEdits",
     },
   },
   {
@@ -380,6 +389,14 @@
     "bindings": {
       "ctrl-enter": "agent::Chat",
       "enter": "editor::Newline",
+    },
+  },
+  {
+    "context": "PaseoComposer > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "enter": "paseo_ui::SendMessage",
+      "ctrl-enter": "paseo_ui::QueueMessage",
     },
   },
   {
@@ -642,12 +659,8 @@
       "shift-f6": "workspace::FocusPreviousPart",
       "ctrl-f6": "workspace::FocusNextPart",
       // Change the default action on `menu::Confirm` by setting the parameter
-      // "ctrl-alt-o": ["projects::OpenRecent", { "create_new_window": true }],
       "f11": "zed::ToggleFullScreen",
-      "ctrl-r": "projects::OpenRecent",
       // Change to open path modal for existing remote connection by setting the parameter
-      // "ctrl-shift-alt-o": ["projects::OpenRemote", { "from_existing_connection": true }],
-      "ctrl-shift-alt-o": ["projects::OpenRemote", { "from_existing_connection": false }],
       "shift-alt-b": "branches::OpenRecent",
       "shift-alt-w": "git::Worktree",
       "shift-alt-enter": "toast::RunAction",
@@ -671,8 +684,6 @@
       "ctrl-alt-b": "workspace::ToggleRightDock",
       "ctrl-b": "workspace::ToggleLeftDock",
       "ctrl-j": "workspace::ToggleBottomDock",
-      "ctrl-alt-j": "multi_workspace::ToggleWorkspaceSidebar",
-      "ctrl-alt-;": "multi_workspace::FocusWorkspaceSidebar",
       "ctrl-shift-y": "workspace::ToggleAllDocks",
       "alt-r": "workspace::ResetActiveDockSize",
       // For 0px parameter, uses UI font size value.
@@ -922,7 +933,6 @@
     "context": "!Terminal",
     "use_key_equivalents": true,
     "bindings": {
-      "ctrl-shift-c": "collab_panel::ToggleFocus",
     },
   },
   {
@@ -1283,8 +1293,6 @@
     "use_key_equivalents": true,
     "bindings": {
       "ctrl-k": "recent_projects::ToggleActionsMenu",
-      "ctrl-k ctrl-o": "workspace::Open",
-      "ctrl-shift-a": "workspace::AddFolderToProject",
       "shift-backspace": "recent_projects::RemoveSelected",
       "ctrl-shift-enter": "recent_projects::AddToWorkspace",
     },
@@ -1498,11 +1506,6 @@
       "ctrl-+": ["zed::IncreaseUiFontSize", { "persist": false }],
       "ctrl--": ["zed::DecreaseUiFontSize", { "persist": false }],
       "ctrl-0": ["zed::ResetUiFontSize", { "persist": false }],
-      "ctrl-1": ["welcome::OpenRecentProject", 0],
-      "ctrl-2": ["welcome::OpenRecentProject", 1],
-      "ctrl-3": ["welcome::OpenRecentProject", 2],
-      "ctrl-4": ["welcome::OpenRecentProject", 3],
-      "ctrl-5": ["welcome::OpenRecentProject", 4],
     },
   },
   {
@@ -1688,6 +1691,90 @@
       "ctrl-enter": "skill_creator::SaveSkill",
       "tab": "skill_creator::FocusNextField",
       "shift-tab": "skill_creator::FocusPreviousField",
+    },
+  },
+  {
+    "context": "Workspace",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-alt-p": "paseo_ui::TogglePanel",
+      "ctrl-alt-k": "paseo_ui::ToggleCommandCenter",
+      "ctrl-alt-n": "paseo_ui::NewAgent",
+      "ctrl-alt-]": "paseo_ui::NextAgent",
+      "ctrl-alt-[": "paseo_ui::PreviousAgent",
+    },
+  },
+  {
+    "context": "PaseoAgentView || PaseoSidebar",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-k": "paseo_ui::ToggleCommandCenter",
+      "ctrl-n": "paseo_ui::NewAgent",
+      "ctrl-shift-backspace": "paseo_ui::ArchiveAgent",
+      "ctrl-e": "paseo_ui::ReviewLastTurn",
+      "ctrl-shift-t": "paseo_ui::NewTerminal",
+      "ctrl-1": ["paseo_ui::OpenAgentAtIndex", { "index": 1 }],
+      "ctrl-2": ["paseo_ui::OpenAgentAtIndex", { "index": 2 }],
+      "ctrl-3": ["paseo_ui::OpenAgentAtIndex", { "index": 3 }],
+      "ctrl-4": ["paseo_ui::OpenAgentAtIndex", { "index": 4 }],
+      "ctrl-5": ["paseo_ui::OpenAgentAtIndex", { "index": 5 }],
+      "ctrl-6": ["paseo_ui::OpenAgentAtIndex", { "index": 6 }],
+      "ctrl-7": ["paseo_ui::OpenAgentAtIndex", { "index": 7 }],
+      "ctrl-8": ["paseo_ui::OpenAgentAtIndex", { "index": 8 }],
+      "ctrl-9": ["paseo_ui::OpenAgentAtIndex", { "index": 9 }],
+    },
+  },
+  {
+    "context": "PaseoAgentView",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-l": "paseo_ui::FocusComposer",
+      "shift-alt-a": "paseo_ui::AllowPermission",
+      "shift-alt-x": "paseo_ui::DenyPermission",
+      "ctrl-shift-down": "paseo_ui::ScrollToBottom",
+      "f2": "paseo_ui::RenameAgent",
+    },
+  },
+  {
+    "context": "PaseoSidebar",
+    "use_key_equivalents": true,
+    "bindings": {
+      "up": "menu::SelectPrevious",
+      "down": "menu::SelectNext",
+      "home": "menu::SelectFirst",
+      "end": "menu::SelectLast",
+      "enter": "menu::Confirm",
+      "escape": "menu::Cancel",
+      "f2": "paseo_ui::RenameAgent",
+      "ctrl-backspace": "paseo_ui::ArchiveAgent",
+      "ctrl-f": "paseo_ui::FocusSidebarFilter",
+    },
+  },
+  {
+    "context": "PaseoSidebar > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "up": "menu::SelectPrevious",
+      "down": "menu::SelectNext",
+      "enter": "menu::Confirm",
+      "escape": "menu::Cancel",
+    },
+  },
+  {
+    // After the base Editor bindings so these keys reach Paseo while the composer has focus.
+    "context": "PaseoComposer > Editor && !showing_completions",
+    "use_key_equivalents": true,
+    "bindings": {
+      "escape": "paseo_ui::InterruptAgent",
+      "ctrl-d": "paseo_ui::ToggleDictation",
+      "ctrl-e": "paseo_ui::ReviewLastTurn",
+      "ctrl-shift-t": "paseo_ui::NewTerminal",
+      "shift-tab": "paseo_ui::CycleMode",
+      "ctrl-/": "paseo_ui::ToggleModelPicker",
+      "ctrl-alt-/": "paseo_ui::ToggleModePicker",
+      "shift-alt-a": "paseo_ui::AllowPermission",
+      "shift-alt-x": "paseo_ui::DenyPermission",
+      "ctrl-shift-down": "paseo_ui::ScrollToBottom",
     },
   },
 ]

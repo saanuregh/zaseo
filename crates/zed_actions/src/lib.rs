@@ -429,6 +429,31 @@ pub mod project_panel {
         ]
     );
 }
+
+pub mod paseo {
+    use gpui::{Action, actions};
+    use std::path::PathBuf;
+
+    actions!(
+        paseo_ui,
+        [
+            /// Adds the selected code, with its file and lines, to the current Paseo agent's
+            /// message.
+            AddSelectionToAgent
+        ]
+    );
+
+    /// Adds file and folder mentions to the current Paseo agent's message.
+    ///
+    /// An internal forwarding action: the user-facing entry point is
+    /// `project_panel::AddToAgent`, which resolves the selected entries.
+    #[derive(Clone, Debug, Default, PartialEq, Action)]
+    #[action(namespace = paseo_ui, no_json, no_register)]
+    pub struct AddPathsToAgent {
+        pub paths: Vec<PathBuf>,
+    }
+}
+
 pub mod feedback {
     use gpui::actions;
 

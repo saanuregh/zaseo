@@ -15,6 +15,7 @@ doctest = false
 [dependencies]
 anyhow.workspace = true
 async-channel.workspace = true
+base64.workspace = true
 async-tungstenite = { workspace = true, features = ["tokio", "tokio-rustls-manual-roots"] }
 futures.workspace = true
 log.workspace = true

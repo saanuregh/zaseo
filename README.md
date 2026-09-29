@@ -3,10 +3,25 @@
 
 # Zaseo
 
-Zaseo is a fork of Zed that shows [Paseo](https://paseo.sh) agents in native
-panels and tabs. Zed's built-in AI features are always off. Zaseo uses its own
+Zaseo is a fork of Zed that shows [Paseo](https://paseo.sh) agents in a native
+sidebar and agent tabs. Zed's built-in AI features are always off. Zaseo uses its own
 `zaseo` command, `zaseo://` links, and data directory, so it can be installed
 next to Zed. It does not update itself.
+
+Run `zaseo` with no arguments. It opens projects from agents, so the command takes
+`zaseo://` links but not file or folder paths, and the File menu, title bar, and welcome
+page have no project-opening actions. Zed's sign-in and collaboration are removed, and
+telemetry is off by default because it would go to Zed's servers.
+
+## Upstream versions
+
+| Project | Release |
+| --- | --- |
+| Zed | Between releases: `main` at [`e52ab15`](https://github.com/zed-industries/zed/commit/e52ab15), after [`v1.22.0-pre`](https://github.com/zed-industries/zed/releases/tag/v1.22.0-pre) |
+| Paseo | [`v0.9.2`](https://github.com/getpaseo/paseo/releases/tag/v0.9.2), protocol v1 |
+
+Zaseo's UI and protocol follow Paseo v0.9.2, and it was tested against a v0.9.2 daemon.
+Future resyncs move both projects to stable release tags only.
 
 ## Build and run on Linux
 
@@ -26,13 +41,128 @@ To build a release bundle and install it as `~/.local/bin/zaseo`, run
 `script/install-linux`. `script/uninstall.sh` removes the installed app but
 keeps your settings and data.
 
+### Nix
+
+The flake builds a stable release package with the `zaseo` command:
+
+```sh
+nix build .#zaseo
+```
+
+To install it from another flake, add this repository as an input and use
+`inputs.zaseo.packages.${system}.zaseo`, or apply `inputs.zaseo.overlays.default`
+and use `pkgs.zaseo`. It installs next to nixpkgs' `zed-editor`.
+Flakes only see files tracked by git, so new source files must be committed
+before `nix build .#zaseo` includes them.
+
 ## Connect to Paseo
 
 Zaseo connects to a Paseo daemon you install and start yourself. It does not
 bundle or start Paseo. It targets Paseo at upstream commit `8cd9895` and shows
-an incompatibility error for older daemons. Open **View → Paseo Panel** or **View → Paseo Tab**. Then
-pick a connection profile or add one. The default `Local` profile points to
-`ws://127.0.0.1:6767/ws`.
+an incompatibility error for older daemons. At startup it connects to the active
+profile; the default `Local` profile points to `ws://127.0.0.1:6767/ws`. Use the
+host menu at the top of the Paseo sidebar, or **Manage Hosts…**, to switch hosts
+or add one.
+
+The Paseo sidebar (left dock, **View → Paseo Agents**) lists projects, their
+workspaces, and each workspace's agents, as Paseo 0.9 does, with pinned
+workspaces first. It can also group agents by status, or workspaces by label. Each agent opens in its own tab with its conversation,
+permission prompts, and a composer with model, thinking, and mode pickers. A new
+agent starts as a draft tab; its first message creates the agent. Opening an
+agent switches the window to that agent's project, opening the project if needed,
+as Paseo does. Remote agents switch only when an SSH target is known (see
+`editor_ssh_uri` below). The default theme is **Paseo Dark** / **Paseo Light**.
+
+Features the connected daemon supports also appear:
+
+- **Last turn** tab (the diff button next to the composer's microphone,
+  **View → Paseo Last Turn**, or **Review** on the changed files card under the
+  latest finished turn): the files the turn changed as an
+  editor diff. Hunks can be edited or reverted in place. Paseo keeps no per-turn
+  checkpoints, so the old text is rebuilt by undoing the turn's edits. A file
+  that changed after the turn shows only its edit snippets, and files outside
+  the open project are read through the daemon and shown read-only. Use Zed's
+  git panel for uncommitted and branch changes.
+- **Rewind** from a user message's hover row (conversation, files, or both, as
+  the agent's provider allows). A rewind cannot be undone.
+- **Terminals** on the Paseo host in the agent's directory, from the command
+  center or `ctrl-shift-t`. Closing a tab keeps the shell running; the tab's
+  **Kill** stops it.
+- **Subagents** (Claude Tasks and other provider subagents): a track above the
+  composer counts them (`3 subagents · 1 working`) and always lists running
+  ones on one line each with their latest action. Click it to list every
+  subagent; a row opens the subagent's conversation in a read-only tab, and
+  finished ones can be archived from the track. A subagent's tool row shows its
+  action count (and its latest action while it runs), opens the subagent's tab
+  from its ↗ button, and expands to the numbered action list.
+- **New worktree** isolation in a new-agent draft starts the agent on a new
+  branch in its own git worktree. **Base** picks the branch it branches off;
+  it defaults to the current branch's upstream, as in Paseo.
+- **Dictation** with the composer's microphone button, when the daemon has
+  speech-to-text enabled.
+- **Provider Usage** (**View → Paseo Provider Usage**, or the host menu): each
+  provider's plan limits.
+- **Send code to an agent** from the editor: **Add Selection to Agent** (right
+  click, or `ctrl->`) adds `@file:lines` and the selected code, or the cursor's
+  line; the project panel's **Add to Agent** adds `@path` mentions; **Ask Agent
+  to Fix** in the code actions menu (`ctrl-.`) on an error or warning adds the
+  problem and its lines. The text goes to the agent tab used last in this
+  project, else the agent last focused anywhere (opened here), else a new agent
+  draft, and is never sent on its own.
+- **Workspaces and projects**:
+  - A workspace row's right-click menu has rename, **Mark as Read** or **Mark as
+    Unread**, pin, labels (assign, create, rename, recolor, delete), scripts
+    (start, stop, open, run a blocked setup), copy path or branch, and **Archive
+    Workspace…**. Archiving a Paseo worktree workspace removes the worktree folder
+    once no other workspace uses it; the branch is kept.
+  - A project's menu has a new agent, **New Workspace…** (Local or a new worktree
+    from a base branch, starting a chat or only a terminal), **Paseo Worktrees…**
+    (list and archive the project's Paseo worktrees), rename, icon, and remove.
+    Removing a project never changes files on disk.
+  - The sidebar's grouping menu adds a project or creates a project directory.
+  - Archived agents group under their workspace when it can be restored, with
+    **Restore**.
+- **Daemon Status** (host menu): version, PID, listen address, relay, and each
+  provider's availability; refresh providers, run a provider's diagnostic, and
+  restart or update the daemon. Paseo Desktop's own daemon updates only through
+  Paseo Desktop.
+- **Agent edits in editors**: unreviewed edits from every agent in the project
+  show inline in open editors until kept or rejected, like Zed's own agent. Each
+  hunk has **Keep** and **Reject** (Reject restores the text before it), and the
+  toolbar has **Keep All**, **Reject All**, and hunk navigation. Your own typing
+  isn't highlighted, an agent edit you undo by hand is dropped, and kept or
+  rejected edits stay reviewed after a restart. Whole-file writes aren't
+  highlighted, since the text they replaced is unknown, and neither is a pure
+  deletion the daemon can't place. While a file shows agent edits, its git hunks
+  are hidden. Only local projects with agents on this machine are covered.
+
+Keyboard shortcuts (`ctrl` on Linux and Windows, `cmd` on macOS):
+
+| Keys | Action |
+| --- | --- |
+| `ctrl-alt-p` | Focus or hide the Paseo sidebar |
+| `ctrl-alt-n`, or `ctrl-n` in Paseo views | New agent |
+| `ctrl-alt-k`, or `ctrl-k` in Paseo views | Command center |
+| `ctrl-alt-]` / `ctrl-alt-[` | Next / previous agent |
+| `ctrl-1` … `ctrl-9` in Paseo views | Open the agent at that sidebar position |
+| `enter` / `shift-enter` | Send (steers a running agent) / new line |
+| `ctrl-enter` | Queue the message until the agent finishes |
+| `escape` | Interrupt the running agent |
+| `shift-tab` | Cycle the permission mode |
+| `ctrl-/` | Choose the model |
+| `ctrl-l` | Focus the composer |
+| `shift-alt-a` / `shift-alt-x` | Accept / deny the pending permission |
+| `ctrl-shift-backspace` | Archive the agent |
+| `f2` | Rename the agent |
+| `ctrl-e` in Paseo views | Open the Last turn tab |
+| `ctrl-shift-t` in Paseo views | New terminal in the agent's directory |
+| `ctrl-d` in the composer | Start or stop dictation |
+| `ctrl->` in the editor (`ctrl-shift-.` on Windows) | Add the selection to the agent |
+| `alt-y` / `ctrl-alt-z` on an agent edit (`cmd-y` / `cmd-alt-z` on macOS) | Keep / reject it |
+| `shift-alt-y` / `shift-alt-z` on a file with agent edits | Keep / reject all of them |
+
+In the composer, `/` lists the agent's commands and `@` completes file paths.
+Pasted images are sent with the message.
 
 Profiles are stored under `paseo.profiles` in your settings:
 
@@ -43,7 +173,7 @@ Profiles are stored under `paseo.profiles` in your settings:
   Workspace** uses to open an agent's directory remotely. SSH profiles use their
   own target for this.
 
-SSH editing (including **Open Workspace** for remote agents) needs a remote
+SSH editing (including project switching for remote agents) needs a remote
 server on the host. Builds run with `cargo run` compile and upload one. Installed
 release builds do not download Zed's server, so SSH projects fail unless a
 matching server is already in the host's `~/.zed_server`.

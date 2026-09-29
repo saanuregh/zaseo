@@ -314,6 +314,23 @@ impl Editor {
         Some((buffer_snapshot.remote_id(), range.start.row))
     }
 
+    pub fn add_code_action_provider(
+        &mut self,
+        provider: Rc<dyn CodeActionProvider>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .code_action_providers
+            .iter()
+            .any(|existing| existing.id() == provider.id())
+        {
+            return;
+        }
+        self.code_action_providers.push(provider);
+        self.refresh_code_actions_for_selection(window, cx);
+    }
+
     pub fn code_actions_enabled_for_toolbar(&self, cx: &App) -> bool {
         !self.code_action_providers.is_empty()
             && EditorSettings::get_global(cx).toolbar.code_actions

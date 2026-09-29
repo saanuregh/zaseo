@@ -21,8 +21,18 @@ use transport::Socket;
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 const TIMELINE_PAGE_SIZE: usize = 100;
+const DIRECTORY_SUGGESTION_LIMIT: usize = 100;
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Commits and pushes can run hooks; the daemon allows its own git commands two minutes.
+const GIT_ACTION_TIMEOUT: Duration = Duration::from_secs(150);
+const WORKSPACE_PAGE_SIZE: usize = 200;
+/// Paseo's own client waits this long for a provider health check and a daemon update.
+const PROVIDER_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(180);
+const DAEMON_UPDATE_TIMEOUT: Duration = Duration::from_secs(300);
+const PROVIDER_REFRESH_TIMEOUT: Duration = Duration::from_secs(120);
+const TERMINAL_RESTORE_SCROLLBACK: usize = 200;
+const DICTATION_FORMAT: &str = "audio/pcm;rate=16000;bits=16";
 
 enum Command {
     Request {
@@ -30,6 +40,13 @@ enum Command {
         response_type: &'static str,
         retry_creation: bool,
         reply: oneshot::Sender<Result<Value>>,
+    },
+    /// A message the daemon never answers, such as terminal input or dictation audio.
+    Notify(Value),
+    /// Releases a terminal output subscription and stops routing its frames.
+    ReleaseTerminal {
+        terminal_id: String,
+        subscription_id: String,
     },
     Close(oneshot::Sender<Result<()>>),
 }
@@ -128,8 +145,19 @@ impl PaseoSession {
     }
 
     pub async fn select_agent_page(&self, id: &str) -> Result<TimelinePage> {
-        self.request(json!({"type":"agent.timeline.set_subscription.request", "requestId":next_request_id(), "agentIds":[id]}), "agent.timeline.set_subscription.response", false).await?;
-        let payload = self.request(json!({"type":"fetch_agent_timeline_request", "requestId":next_request_id(), "agentId":id, "direction":"tail", "limit":TIMELINE_PAGE_SIZE, "projection":"projected"}), "fetch_agent_timeline_response", false).await?;
+        self.set_timeline_subscriptions(vec![id.to_owned()]).await?;
+        self.timeline_tail(id).await
+    }
+
+    /// Replaces the set of agents whose live timeline is streamed. An agent newly added to the
+    /// set needs a `timeline_tail` so reconnects can catch it up from a known cursor.
+    pub async fn set_timeline_subscriptions(&self, agent_ids: Vec<String>) -> Result<()> {
+        self.request(json!({"type":"agent.timeline.set_subscription.request", "requestId":next_request_id(), "agentIds":agent_ids}), "agent.timeline.set_subscription.response", false).await?;
+        Ok(())
+    }
+
+    pub async fn timeline_tail(&self, agent_id: &str) -> Result<TimelinePage> {
+        let payload = self.request(json!({"type":"fetch_agent_timeline_request", "requestId":next_request_id(), "agentId":agent_id, "direction":"tail", "limit":TIMELINE_PAGE_SIZE, "projection":"projected"}), "fetch_agent_timeline_response", false).await?;
         protocol::parse_timeline_page(&payload)
     }
 
@@ -156,6 +184,12 @@ impl PaseoSession {
         if let Some(title) = request.title {
             config["title"] = json!(title);
         }
+        if let Some(mode_id) = request.mode_id {
+            config["modeId"] = json!(mode_id);
+        }
+        if let Some(thinking_option_id) = request.thinking_option_id {
+            config["thinkingOptionId"] = json!(thinking_option_id);
+        }
         let mut message = json!({
             "type":"agent.create.request",
             "requestId":next_request_id(),
@@ -165,7 +199,32 @@ impl PaseoSession {
         if let Some(initial_prompt) = request.initial_prompt {
             message["initialPrompt"] = json!(initial_prompt);
         }
-        let payload = self.request(message, "agent.create.response", true).await?;
+        if !request.images.is_empty() {
+            message["images"] = image_payloads(request.images);
+        }
+        if !request.attachments.is_empty() {
+            message["attachments"] = Value::Array(request.attachments);
+        }
+        if let Some(worktree) = request.worktree {
+            if worktree.new_branch.trim().is_empty() {
+                bail!("worktree branch name must not be empty");
+            }
+            let mut target = json!({"mode":"branch-off", "newBranch":worktree.new_branch});
+            if let Some(base) = worktree.base {
+                target["base"] = json!(base);
+            }
+            message["worktree"] = target;
+        }
+        // Creating a worktree runs `git worktree add` and setup scripts, which can outlast the
+        // usual request timeout.
+        let timeout = if message.get("worktree").is_some() {
+            GIT_ACTION_TIMEOUT
+        } else {
+            REQUEST_TIMEOUT
+        };
+        let payload = self
+            .request_with_timeout(message, "agent.create.response", true, timeout)
+            .await?;
         protocol::parse_agent(
             payload
                 .get("agent")
@@ -175,20 +234,34 @@ impl PaseoSession {
     }
 
     pub async fn send(&self, id: &str, text: &str, message_id: &str) -> Result<()> {
-        if message_id.is_empty() {
+        self.send_message(SendMessage {
+            agent_id: id.to_owned(),
+            text: text.to_owned(),
+            message_id: message_id.to_owned(),
+            behavior: None,
+            images: Vec::new(),
+        })
+        .await
+    }
+
+    pub async fn send_message(&self, message: SendMessage) -> Result<()> {
+        if message.message_id.is_empty() {
             bail!("message ID must not be empty");
         }
-        let payload = self.request(json!({"type":"send_agent_message_request", "requestId":next_request_id(), "agentId":id, "text":text, "messageId":message_id}), "send_agent_message_response", false).await?;
-        if payload.get("accepted").and_then(Value::as_bool) != Some(true) {
-            bail!(
-                "Paseo did not accept the message: {}",
-                payload
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown reason")
-            );
+        let mut request = json!({"type":"send_agent_message_request", "requestId":next_request_id(), "agentId":message.agent_id, "text":message.text, "messageId":message.message_id});
+        if let Some(behavior) = message.behavior {
+            request["activeTurnBehavior"] = json!(match behavior {
+                ActiveTurnBehavior::Interrupt => "interrupt",
+                ActiveTurnBehavior::Steer => "steer",
+            });
         }
-        Ok(())
+        if !message.images.is_empty() {
+            request["images"] = image_payloads(message.images);
+        }
+        let payload = self
+            .request(request, "send_agent_message_response", false)
+            .await?;
+        require_accepted(&payload, "the message")
     }
 
     pub async fn cancel(&self, id: &str) -> Result<()> {
@@ -202,9 +275,1125 @@ impl PaseoSession {
     }
 
     pub async fn answer_permission(&self, request_id: &str, allow: bool) -> Result<()> {
-        let payload = self.request(json!({"type":"agent_permission_response", "requestId":request_id, "response":{"behavior":if allow {"allow"} else {"deny"}}}), "agent_permission_resolved", false).await?;
+        let response = if allow {
+            PermissionResponse::Allow {
+                selected_action_id: None,
+                updated_input: None,
+            }
+        } else {
+            PermissionResponse::Deny {
+                selected_action_id: None,
+                message: None,
+            }
+        };
+        self.respond_permission(request_id, response).await
+    }
+
+    pub async fn respond_permission(
+        &self,
+        request_id: &str,
+        response: PermissionResponse,
+    ) -> Result<()> {
+        let response = match response {
+            PermissionResponse::Allow {
+                selected_action_id,
+                updated_input,
+            } => {
+                let mut response = json!({"behavior":"allow"});
+                if let Some(selected_action_id) = selected_action_id {
+                    response["selectedActionId"] = json!(selected_action_id);
+                }
+                if let Some(updated_input) = updated_input {
+                    if !updated_input.is_object() {
+                        bail!("permission input must be a JSON object");
+                    }
+                    response["updatedInput"] = updated_input;
+                }
+                response
+            }
+            PermissionResponse::Deny {
+                selected_action_id,
+                message,
+            } => {
+                let mut response = json!({"behavior":"deny"});
+                if let Some(selected_action_id) = selected_action_id {
+                    response["selectedActionId"] = json!(selected_action_id);
+                }
+                if let Some(message) = message {
+                    response["message"] = json!(message);
+                }
+                response
+            }
+        };
+        let payload = self.request(json!({"type":"agent_permission_response", "requestId":request_id, "response":response}), "agent_permission_resolved", false).await?;
         if payload.get("requestId").and_then(Value::as_str) != Some(request_id) {
             bail!("permission acknowledgement mismatch");
+        }
+        Ok(())
+    }
+
+    pub async fn archive(&self, agent_id: &str) -> Result<()> {
+        self.request(
+            json!({"type":"archive_agent_request", "requestId":next_request_id(), "agentId":agent_id}),
+            "agent_archived",
+            false,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn unarchive(&self, agent_id: &str) -> Result<()> {
+        let payload = self
+            .request(
+                json!({"type":"refresh_agent_request", "requestId":next_request_id(), "agentId":agent_id}),
+                "status",
+                false,
+            )
+            .await?;
+        if payload.get("status").and_then(Value::as_str) != Some("agent_refreshed") {
+            bail!("unexpected Paseo unarchive reply");
+        }
+        Ok(())
+    }
+
+    pub async fn delete(&self, agent_id: &str) -> Result<()> {
+        self.request(
+            json!({"type":"delete_agent_request", "requestId":next_request_id(), "agentId":agent_id}),
+            "agent_deleted",
+            false,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// The agent's conversation as a chat-history attachment for starting a forked agent.
+    pub async fn fork_context(&self, agent_id: &str) -> Result<Value> {
+        let payload = self
+            .request(
+                json!({"type":"agent.fork_context.request", "requestId":next_request_id(), "agentId":agent_id}),
+                "agent.fork_context.response",
+                false,
+            )
+            .await?;
+        if let Some(error) = payload.get("error").and_then(Value::as_str) {
+            bail!("Paseo could not fork the agent: {error}");
+        }
+        payload
+            .get("attachment")
+            .filter(|attachment| attachment.is_object())
+            .cloned()
+            .context("Paseo returned no conversation to fork")
+    }
+
+    pub async fn rename(&self, agent_id: &str, name: &str) -> Result<()> {
+        let payload = self
+            .request(
+                json!({"type":"update_agent_request", "requestId":next_request_id(), "agentId":agent_id, "name":name}),
+                "update_agent_response",
+                false,
+            )
+            .await?;
+        require_accepted(&payload, "the rename")
+    }
+
+    pub async fn set_mode(&self, agent_id: &str, mode_id: &str) -> Result<()> {
+        let payload = self
+            .request(
+                json!({"type":"set_agent_mode_request", "requestId":next_request_id(), "agentId":agent_id, "modeId":mode_id}),
+                "set_agent_mode_response",
+                false,
+            )
+            .await?;
+        require_accepted(&payload, "the mode change")
+    }
+
+    pub async fn set_model(&self, agent_id: &str, model_id: Option<&str>) -> Result<()> {
+        let payload = self
+            .request(
+                json!({"type":"set_agent_model_request", "requestId":next_request_id(), "agentId":agent_id, "modelId":model_id}),
+                "set_agent_model_response",
+                false,
+            )
+            .await?;
+        require_accepted(&payload, "the model change")
+    }
+
+    pub async fn set_thinking(&self, agent_id: &str, option_id: Option<&str>) -> Result<()> {
+        let payload = self
+            .request(
+                json!({"type":"set_agent_thinking_request", "requestId":next_request_id(), "agentId":agent_id, "thinkingOptionId":option_id}),
+                "set_agent_thinking_response",
+                false,
+            )
+            .await?;
+        require_accepted(&payload, "the thinking change")
+    }
+
+    pub async fn clear_attention(&self, agent_ids: Vec<String>) -> Result<()> {
+        self.request(
+            json!({"type":"clear_agent_attention", "requestId":next_request_id(), "agentId":agent_ids}),
+            "clear_agent_attention_response",
+            false,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Lists slash commands for an existing agent or, with `draft`, for an agent not yet created.
+    pub async fn list_commands(
+        &self,
+        agent_id: Option<&str>,
+        draft: Option<DraftConfig>,
+    ) -> Result<Vec<AgentCommand>> {
+        if agent_id.is_none() && draft.is_none() {
+            bail!("listing commands needs an agent or a draft configuration");
+        }
+        let request_id = next_request_id();
+        // The daemon requires an agent ID and falls back to the draft configuration when no
+        // agent has that ID, so drafts use an ID no agent can have.
+        let agent_id = agent_id.map_or_else(|| format!("draft:{request_id}"), str::to_owned);
+        let mut message =
+            json!({"type":"list_commands_request", "requestId":request_id, "agentId":agent_id});
+        if let Some(draft) = draft {
+            let cwd = draft.cwd.to_str().context("draft directory is not UTF-8")?;
+            let mut config = json!({"provider":draft.provider, "cwd":cwd});
+            if let Some(mode_id) = draft.mode_id {
+                config["modeId"] = json!(mode_id);
+            }
+            if let Some(model) = draft.model {
+                config["model"] = json!(model);
+            }
+            if let Some(thinking_option_id) = draft.thinking_option_id {
+                config["thinkingOptionId"] = json!(thinking_option_id);
+            }
+            message["draftConfig"] = config;
+        }
+        let payload = self
+            .request(message, "list_commands_response", false)
+            .await?;
+        protocol::parse_commands(&payload)
+    }
+
+    pub async fn directory_suggestions(
+        &self,
+        query: &str,
+        cwd: Option<&str>,
+        include_files: bool,
+        include_directories: bool,
+        limit: usize,
+    ) -> Result<Vec<DirectorySuggestion>> {
+        if !(1..=DIRECTORY_SUGGESTION_LIMIT).contains(&limit) {
+            bail!("directory suggestion limit must be between 1 and {DIRECTORY_SUGGESTION_LIMIT}");
+        }
+        let mut message = json!({"type":"directory_suggestions_request", "requestId":next_request_id(), "query":query, "includeFiles":include_files, "includeDirectories":include_directories, "limit":limit});
+        if let Some(cwd) = cwd {
+            message["cwd"] = json!(cwd);
+        }
+        let payload = self
+            .request(message, "directory_suggestions_response", false)
+            .await?;
+        protocol::parse_directory_suggestions(&payload)
+    }
+
+    /// Returns archived agents, most recently updated first.
+    pub async fn archived_agents(&self) -> Result<Vec<AgentSummary>> {
+        let mut agents = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        loop {
+            let mut page = json!({"limit":200});
+            if let Some(cursor) = cursor.as_deref() {
+                page["cursor"] = json!(cursor);
+            }
+            let payload = self
+                .request(
+                    json!({"type":"fetch_agent_history_request", "requestId":next_request_id(), "filter":{"includeArchived":true}, "sort":[{"key":"updated_at","direction":"desc"}], "page":page}),
+                    "fetch_agent_history_response",
+                    false,
+                )
+                .await?;
+            agents.extend(
+                protocol::parse_agents(&payload)?
+                    .into_iter()
+                    .filter(|agent| agent.extra["archivedAt"].is_string()),
+            );
+            cursor = next_agents_cursor(&payload)?;
+            if cursor.is_none() {
+                return Ok(agents);
+            }
+            if !seen_cursors.insert(cursor.clone().unwrap_or_default()) {
+                bail!("Paseo history returned a repeated page cursor");
+            }
+        }
+    }
+
+    async fn notify(&self, message: Value) -> Result<()> {
+        self.commands
+            .send(Command::Notify(message))
+            .await
+            .context("Paseo connection closed")
+    }
+
+    /// Restores the agent to just before the user message with `message_id`.
+    pub async fn rewind(&self, agent_id: &str, message_id: &str, mode: RewindMode) -> Result<()> {
+        let payload = self
+            .request(
+                json!({"type":"agent.rewind.request", "requestId":next_request_id(), "agentId":agent_id, "messageId":message_id, "mode":mode.as_str()}),
+                "agent.rewind.response",
+                false,
+            )
+            .await?;
+        if payload.get("ok").and_then(Value::as_bool) != Some(true) {
+            bail!(
+                "Paseo could not rewind the agent: {}",
+                payload
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Failed to rewind agent")
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn subagents(&self, parent_agent_id: &str) -> Result<Vec<ProviderSubagent>> {
+        let payload = self
+            .request(
+                json!({"type":"agent.provider_subagents.list.request", "requestId":next_request_id(), "parentAgentId":parent_agent_id}),
+                "agent.provider_subagents.list.response",
+                false,
+            )
+            .await?;
+        protocol::parse_subagents(&payload)
+    }
+
+    /// The subagent's latest timeline page, or the page before `cursor`.
+    pub async fn subagent_timeline(
+        &self,
+        parent_agent_id: &str,
+        subagent_id: &str,
+        before: Option<&TimelineCursor>,
+    ) -> Result<TimelinePage> {
+        let mut message = json!({"type":"agent.provider_subagents.timeline.get.request", "requestId":next_request_id(), "parentAgentId":parent_agent_id, "subagentId":subagent_id, "direction":"tail", "limit":TIMELINE_PAGE_SIZE});
+        if let Some(cursor) = before {
+            message["direction"] = json!("before");
+            message["cursor"] = json!({"epoch":cursor.epoch, "seq":cursor.sequence});
+        }
+        let payload = self
+            .request(
+                message,
+                "agent.provider_subagents.timeline.get.response",
+                false,
+            )
+            .await?;
+        protocol::parse_subagent_timeline_page(&payload)
+    }
+
+    pub async fn provider_usage(&self) -> Result<Vec<ProviderUsage>> {
+        let payload = self
+            .request(
+                json!({"type":"provider.usage.list.request", "requestId":next_request_id()}),
+                "provider.usage.list.response",
+                false,
+            )
+            .await?;
+        protocol::parse_provider_usage(&payload)
+    }
+
+    pub async fn terminals(&self, cwd: &str) -> Result<Vec<TerminalInfo>> {
+        let payload = self
+            .request(
+                json!({"type":"list_terminals_request", "requestId":next_request_id(), "cwd":cwd}),
+                "list_terminals_response",
+                false,
+            )
+            .await?;
+        protocol::parse_terminals(&payload)
+    }
+
+    /// Starts a shell in `cwd`. Current daemons reject agent-backed terminals, so terminals are
+    /// scoped to a directory only.
+    pub async fn create_terminal(&self, cwd: &str, rows: u16, cols: u16) -> Result<TerminalInfo> {
+        let message = json!({"type":"create_terminal_request", "requestId":next_request_id(), "cwd":cwd, "size":{"rows":rows.max(1), "cols":cols.max(1)}});
+        let payload = self
+            .request(message, "create_terminal_response", false)
+            .await?;
+        if let Some(error) = payload.get("error").and_then(Value::as_str) {
+            bail!("Paseo could not create a terminal: {error}");
+        }
+        protocol::parse_terminal(
+            payload
+                .get("terminal")
+                .filter(|terminal| terminal.is_object())
+                .context("Paseo returned no terminal")?,
+        )
+    }
+
+    /// Streams the terminal's screen and output as `PaseoEvent::TerminalOutput`, starting with a
+    /// restore of what is currently visible.
+    /// Returns the daemon's subscription ID, which `release_terminal` needs.
+    pub async fn subscribe_terminal(
+        &self,
+        terminal_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Option<String>> {
+        let payload = self
+            .request(
+                json!({"type":"subscribe_terminal_request", "requestId":next_request_id(), "terminalId":terminal_id, "restore":{"mode":"visible-snapshot", "scrollbackLines":TERMINAL_RESTORE_SCROLLBACK, "size":{"rows":rows.max(1), "cols":cols.max(1)}}}),
+                "subscribe_terminal_response",
+                false,
+            )
+            .await?;
+        if let Some(error) = payload.get("error").and_then(Value::as_str) {
+            bail!("Paseo could not open the terminal: {error}");
+        }
+        Ok(payload
+            .get("subscriptionId")
+            .and_then(Value::as_str)
+            .map(str::to_owned))
+    }
+
+    /// Streams the terminal list for `cwd` as `PaseoEvent::TerminalsChanged`, starting now. The
+    /// daemon only opens an owned subscription, and so only sends updates, for requests with an ID.
+    pub async fn watch_terminals(&self, cwd: &str) -> Result<()> {
+        self.notify(
+            json!({"type":"subscribe_terminals_request", "requestId":next_request_id(), "cwd":cwd}),
+        )
+        .await
+    }
+
+    /// Stops a terminal's output stream. Daemons that track owned subscriptions only release by
+    /// subscription ID; the terminal ID form is for daemons that sent none.
+    pub async fn release_terminal(
+        &self,
+        terminal_id: &str,
+        subscription_id: Option<&str>,
+    ) -> Result<()> {
+        match subscription_id {
+            Some(subscription_id) => self
+                .commands
+                .send(Command::ReleaseTerminal {
+                    terminal_id: terminal_id.to_owned(),
+                    subscription_id: subscription_id.to_owned(),
+                })
+                .await
+                .context("Paseo connection closed"),
+            None => {
+                self.notify(
+                    json!({"type":"unsubscribe_terminal_request", "terminalId":terminal_id}),
+                )
+                .await
+            }
+        }
+    }
+
+    pub async fn release_subscription(&self, subscription_id: &str) -> Result<()> {
+        self.notify(json!({"type":"subscription.release.request", "requestId":next_request_id(), "subscriptionId":subscription_id}))
+            .await
+    }
+
+    pub async fn terminal_input(&self, terminal_id: &str, data: String) -> Result<()> {
+        self.notify(json!({"type":"terminal_input", "terminalId":terminal_id, "message":{"type":"input", "data":data}}))
+            .await
+    }
+
+    pub async fn resize_terminal(&self, terminal_id: &str, rows: u16, cols: u16) -> Result<()> {
+        self.notify(json!({"type":"terminal_input", "terminalId":terminal_id, "message":{"type":"resize", "rows":rows.max(1), "cols":cols.max(1), "intent":"claim"}}))
+            .await
+    }
+
+    pub async fn kill_terminal(&self, terminal_id: &str) -> Result<()> {
+        let payload = self
+            .request(
+                json!({"type":"kill_terminal_request", "requestId":next_request_id(), "terminalId":terminal_id}),
+                "kill_terminal_response",
+                false,
+            )
+            .await?;
+        if payload.get("success").and_then(Value::as_bool) != Some(true) {
+            bail!("Paseo could not close the terminal");
+        }
+        Ok(())
+    }
+
+    pub async fn rename_terminal(&self, terminal_id: &str, title: &str) -> Result<()> {
+        let payload = self
+            .request(
+                json!({"type":"terminal.rename.request", "requestId":next_request_id(), "terminalId":terminal_id, "title":title}),
+                "terminal.rename.response",
+                false,
+            )
+            .await?;
+        if payload.get("success").and_then(Value::as_bool) != Some(true) {
+            bail!(
+                "Paseo could not rename the terminal: {}",
+                payload
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown reason")
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn start_dictation(&self, dictation_id: &str) -> Result<()> {
+        self.notify(json!({"type":"dictation_stream_start", "dictationId":dictation_id, "format":DICTATION_FORMAT}))
+            .await
+    }
+
+    /// Sends one chunk of 16 kHz mono PCM16 audio; `sequence` starts at zero.
+    pub async fn dictation_chunk(
+        &self,
+        dictation_id: &str,
+        sequence: u64,
+        samples: &[i16],
+    ) -> Result<()> {
+        use base64::Engine as _;
+        let bytes: Vec<u8> = samples
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect();
+        let audio = base64::engine::general_purpose::STANDARD.encode(bytes);
+        self.notify(json!({"type":"dictation_stream_chunk", "dictationId":dictation_id, "seq":sequence, "audio":audio, "format":DICTATION_FORMAT}))
+            .await
+    }
+
+    /// Ends the audio; the transcript arrives as `PaseoEvent::DictationFinal`.
+    pub async fn finish_dictation(&self, dictation_id: &str, final_sequence: u64) -> Result<()> {
+        self.notify(json!({"type":"dictation_stream_finish", "dictationId":dictation_id, "finalSeq":final_sequence}))
+            .await
+    }
+
+    pub async fn cancel_dictation(&self, dictation_id: &str) -> Result<()> {
+        self.notify(json!({"type":"dictation_stream_cancel", "dictationId":dictation_id}))
+            .await
+    }
+
+    pub async fn checkout_status(&self, cwd: &str) -> Result<CheckoutStatus> {
+        let payload = self
+            .request(
+                json!({"type":"checkout_status_request", "requestId":next_request_id(), "cwd":cwd}),
+                "checkout_status_response",
+                false,
+            )
+            .await?;
+        protocol::parse_checkout_status(&payload)
+    }
+
+    /// Reads a file by absolute path on the daemon's host, the way Paseo loads images that
+    /// agents produce.
+    pub async fn read_file(&self, path: &str) -> Result<FileContent> {
+        let Some(relative) = path.strip_prefix('/') else {
+            bail!("Paseo file paths must be absolute: {path}");
+        };
+        let payload = self
+            .request(
+                json!({"type":"file_explorer_request", "requestId":next_request_id(), "cwd":"/", "path":relative, "mode":"file"}),
+                "file_explorer_response",
+                false,
+            )
+            .await?;
+        protocol::parse_file_content(&payload)
+    }
+
+    pub async fn branch_suggestions(
+        &self,
+        cwd: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<BranchSuggestion>> {
+        let mut message = json!({"type":"branch_suggestions_request", "requestId":next_request_id(), "cwd":cwd, "limit":limit});
+        if !query.trim().is_empty() {
+            message["query"] = json!(query.trim());
+        }
+        let payload = self
+            .request(message, "branch_suggestions_response", false)
+            .await?;
+        protocol::parse_branch_suggestions(&payload)
+    }
+
+    pub async fn checkout_diff(&self, cwd: &str, compare: DiffCompare) -> Result<CheckoutDiff> {
+        let mode = match compare {
+            DiffCompare::Uncommitted => "uncommitted",
+            DiffCompare::Base => "base",
+        };
+        let payload = self
+            .request(
+                json!({"type":"checkout.diff.get.request", "requestId":next_request_id(), "cwd":cwd, "compare":{"mode":mode}}),
+                "checkout.diff.get.response",
+                false,
+            )
+            .await?;
+        protocol::parse_checkout_diff(&payload)
+    }
+
+    /// Commits every change; the daemon writes the message when `message` is empty.
+    pub async fn commit(&self, cwd: &str, message: &str) -> Result<()> {
+        let mut request = json!({"type":"checkout_commit_request", "requestId":next_request_id(), "cwd":cwd, "addAll":true});
+        if !message.trim().is_empty() {
+            request["message"] = json!(message.trim());
+        }
+        self.checkout_action(request, "checkout_commit_response", "commit")
+            .await
+    }
+
+    pub async fn pull(&self, cwd: &str) -> Result<()> {
+        self.checkout_action(
+            json!({"type":"checkout_pull_request", "requestId":next_request_id(), "cwd":cwd}),
+            "checkout_pull_response",
+            "pull",
+        )
+        .await
+    }
+
+    pub async fn push(&self, cwd: &str) -> Result<()> {
+        self.checkout_action(
+            json!({"type":"checkout_push_request", "requestId":next_request_id(), "cwd":cwd}),
+            "checkout_push_response",
+            "push",
+        )
+        .await
+    }
+
+    /// Permanently discards uncommitted changes to `paths`, including untracked files.
+    pub async fn discard_changes(&self, cwd: &str, paths: Vec<String>) -> Result<()> {
+        if paths.is_empty() {
+            bail!("no files to discard");
+        }
+        self.checkout_action(
+            json!({"type":"checkout.discard_changes.request", "requestId":next_request_id(), "cwd":cwd, "paths":paths}),
+            "checkout.discard_changes.response",
+            "discard the changes",
+        )
+        .await
+    }
+
+    /// Opens a pull request for the current branch and returns its URL.
+    pub async fn create_pull_request(&self, cwd: &str) -> Result<Option<String>> {
+        let payload = self
+            .request_with_timeout(
+                json!({"type":"checkout_pr_create_request", "requestId":next_request_id(), "cwd":cwd}),
+                "checkout_pr_create_response",
+                false,
+                GIT_ACTION_TIMEOUT,
+            )
+            .await?;
+        protocol::checkout_error(&payload, "create the pull request")?;
+        Ok(payload
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::to_owned))
+    }
+
+    /// The workspaces page after `cursor`, with projects that have no workspaces on the first page.
+    pub async fn workspaces_page(
+        &self,
+        cursor: Option<&str>,
+    ) -> Result<(
+        Vec<WorkspaceDescriptor>,
+        Vec<ProjectDescriptor>,
+        Option<String>,
+    )> {
+        let mut page = json!({"limit":WORKSPACE_PAGE_SIZE});
+        if let Some(cursor) = cursor {
+            page["cursor"] = json!(cursor);
+        }
+        let payload = self
+            .request(
+                json!({"type":"fetch_workspaces_request", "requestId":next_request_id(), "page":page}),
+                "fetch_workspaces_response",
+                false,
+            )
+            .await?;
+        protocol::parse_workspace_page(&payload)
+    }
+
+    pub async fn projects(&self) -> Result<Vec<ProjectDescriptor>> {
+        let payload = self
+            .request(
+                json!({"type":"project.list.request", "requestId":next_request_id()}),
+                "project.list.response",
+                false,
+            )
+            .await?;
+        protocol::parse_projects(&payload)
+    }
+
+    /// Sets the workspace's title, or reverts to its derived name with `None`.
+    pub async fn set_workspace_title(&self, workspace_id: &str, title: Option<&str>) -> Result<()> {
+        let payload = self
+            .request(
+                json!({"type":"workspace.title.set.request", "requestId":next_request_id(), "workspaceId":workspace_id, "title":title}),
+                "workspace.title.set.response",
+                false,
+            )
+            .await?;
+        require_accepted(&payload, "the workspace rename")
+    }
+
+    pub async fn set_workspace_pinned(&self, workspace_id: &str, pinned: bool) -> Result<()> {
+        let payload = self
+            .request(
+                json!({"type":"workspace.pin.set.request", "requestId":next_request_id(), "workspaceId":workspace_id, "pinned":pinned}),
+                "workspace.pin.set.response",
+                false,
+            )
+            .await?;
+        require_accepted(&payload, "the workspace pin")
+    }
+
+    /// Archives the workspace and its agents. A Paseo worktree it used is removed once no active
+    /// workspace uses it, which can take as long as a git action.
+    pub async fn archive_workspace(&self, workspace_id: &str) -> Result<()> {
+        self.request_with_timeout(
+            json!({"type":"archive_workspace_request", "requestId":next_request_id(), "workspaceId":workspace_id}),
+            "archive_workspace_response",
+            false,
+            GIT_ACTION_TIMEOUT,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Marks the workspace's most recent finished agent as needing attention.
+    pub async fn mark_workspace_unread(&self, workspace_id: &str) -> Result<()> {
+        let payload = self
+            .request(
+                json!({"type":"workspace.mark_unread.request", "requestId":next_request_id(), "workspaceId":workspace_id}),
+                "workspace.mark_unread.response",
+                false,
+            )
+            .await?;
+        require_success(&payload, "mark the workspace unread")
+    }
+
+    /// Clears attention on the workspaces' agents, except agents waiting on a permission.
+    pub async fn clear_workspace_attention(&self, workspace_ids: Vec<String>) -> Result<()> {
+        let payload = self
+            .request(
+                json!({"type":"workspace.clear_attention.request", "requestId":next_request_id(), "workspaceId":workspace_ids}),
+                "workspace.clear_attention.response",
+                false,
+            )
+            .await?;
+        require_success(&payload, "mark the workspace read")
+    }
+
+    /// Creates a workspace with no agent. Retrying with the same `idempotency_key` cannot
+    /// create a second one.
+    pub async fn create_workspace(
+        &self,
+        source: &WorkspaceSource,
+        title: Option<&str>,
+        idempotency_key: &str,
+    ) -> Result<WorkspaceDescriptor> {
+        let mut message = json!({"type":"workspace.create.request", "requestId":next_request_id(), "idempotencyKey":idempotency_key, "source":workspace_source_value(source)});
+        if let Some(title) = title.filter(|title| !title.trim().is_empty()) {
+            message["title"] = json!(title);
+        }
+        let payload = self
+            .request_with_timeout(
+                message,
+                "workspace.create.response",
+                true,
+                GIT_ACTION_TIMEOUT,
+            )
+            .await?;
+        protocol::parse_workspace(
+            payload
+                .get("workspace")
+                .filter(|workspace| workspace.is_object())
+                .context("Paseo did not create the workspace")?,
+        )
+    }
+
+    pub async fn workspace_recovery(&self, workspace_id: &str) -> Result<RecoveryState> {
+        let payload = self
+            .request(
+                json!({"type":"workspace.recovery.inspect.request", "requestId":next_request_id(), "workspaceId":workspace_id}),
+                "workspace.recovery.inspect.response",
+                false,
+            )
+            .await?;
+        protocol::parse_recovery_state(&payload)
+    }
+
+    pub async fn restore_workspace(&self, workspace_id: &str) -> Result<()> {
+        let payload = self
+            .request(
+                json!({"type":"workspace.recovery.restore.request", "requestId":next_request_id(), "workspaceId":workspace_id}),
+                "workspace.recovery.restore.response",
+                false,
+            )
+            .await?;
+        require_accepted(&payload, "the workspace restore")
+    }
+
+    pub async fn workspace_setup_status(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<SetupSnapshot>> {
+        let payload = self
+            .request(
+                json!({"type":"workspace_setup_status_request", "requestId":next_request_id(), "workspaceId":workspace_id}),
+                "workspace_setup_status_response",
+                false,
+            )
+            .await?;
+        payload
+            .get("snapshot")
+            .filter(|snapshot| snapshot.is_object())
+            .map(protocol::parse_setup_snapshot)
+            .transpose()
+    }
+
+    pub async fn run_workspace_setup(&self, workspace_id: &str) -> Result<()> {
+        let payload = self
+            .request(
+                json!({"type":"workspace.setup.run.request", "requestId":next_request_id(), "workspaceId":workspace_id}),
+                "workspace.setup.run.response",
+                false,
+            )
+            .await?;
+        if payload.get("started").and_then(Value::as_bool) != Some(true) {
+            bail!("Paseo did not start the workspace setup");
+        }
+        Ok(())
+    }
+
+    /// Starts or stops one of the workspace's scripts.
+    pub async fn set_workspace_script_running(
+        &self,
+        workspace_id: &str,
+        script_name: &str,
+        running: bool,
+    ) -> Result<()> {
+        let (request_type, response_type) = if running {
+            (
+                "workspace.script.start.request",
+                "workspace.script.start.response",
+            )
+        } else {
+            (
+                "workspace.script.stop.request",
+                "workspace.script.stop.response",
+            )
+        };
+        self.request(
+            json!({"type":request_type, "requestId":next_request_id(), "workspaceId":workspace_id, "scriptName":script_name}),
+            response_type,
+            false,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Adds the label to the workspace, or removes it, and returns the workspace's labels.
+    pub async fn set_workspace_label(
+        &self,
+        workspace_id: &str,
+        label: &WorkspaceLabel,
+        assigned: bool,
+    ) -> Result<Vec<String>> {
+        let payload = self
+            .request(
+                json!({"type":"workspace.label.assignment.set.request", "requestId":next_request_id(), "workspaceId":workspace_id, "label":{"name":label.name, "color":label.color}, "assigned":assigned}),
+                "workspace.label.assignment.set.response",
+                false,
+            )
+            .await?;
+        Ok(payload
+            .get("workspaceLabels")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|label| label.as_str().map(str::to_owned))
+            .collect())
+    }
+
+    pub async fn update_label(
+        &self,
+        name: &str,
+        new_name: Option<&str>,
+        color: Option<&str>,
+    ) -> Result<WorkspaceLabel> {
+        let mut message = json!({"type":"workspace.label.update.request", "requestId":next_request_id(), "name":name});
+        if let Some(new_name) = new_name {
+            message["newName"] = json!(new_name);
+        }
+        if let Some(color) = color {
+            message["color"] = json!(color);
+        }
+        let payload = self
+            .request(message, "workspace.label.update.response", false)
+            .await?;
+        protocol::parse_label(payload.get("label").context("missing label")?)
+    }
+
+    /// How many workspaces deleting the label would unlabel, without deleting it.
+    pub async fn label_usage(&self, name: &str) -> Result<u64> {
+        let payload = self
+            .request(
+                json!({"type":"workspace.label.delete.inspect.request", "requestId":next_request_id(), "name":name}),
+                "workspace.label.delete.inspect.response",
+                false,
+            )
+            .await?;
+        Ok(payload
+            .get("affectedWorkspaceCount")
+            .and_then(Value::as_u64)
+            .unwrap_or_default())
+    }
+
+    pub async fn delete_label(&self, name: &str) -> Result<()> {
+        self.request(
+            json!({"type":"workspace.label.delete.request", "requestId":next_request_id(), "name":name}),
+            "workspace.label.delete.response",
+            false,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn add_project(&self, cwd: &str) -> Result<ProjectDescriptor> {
+        let payload = self
+            .request(
+                json!({"type":"project.add.request", "requestId":next_request_id(), "cwd":cwd}),
+                "project.add.response",
+                false,
+            )
+            .await?;
+        protocol::parse_project(
+            payload
+                .get("project")
+                .filter(|project| project.is_object())
+                .context("Paseo did not add the project")?,
+        )
+    }
+
+    /// Removes the project and its workspaces from Paseo. Files on disk are not changed.
+    pub async fn remove_project(&self, project_id: &str) -> Result<()> {
+        let payload = self
+            .request(
+                json!({"type":"project.remove.request", "requestId":next_request_id(), "projectId":project_id}),
+                "project.remove.response",
+                false,
+            )
+            .await?;
+        require_accepted(&payload, "the project removal")
+    }
+
+    /// Sets the project's name, or reverts to its derived name with `None`.
+    pub async fn rename_project(&self, project_id: &str, name: Option<&str>) -> Result<()> {
+        let payload = self
+            .request(
+                json!({"type":"project.rename.request", "requestId":next_request_id(), "projectId":project_id, "customName":name}),
+                "project.rename.response",
+                false,
+            )
+            .await?;
+        require_accepted(&payload, "the project rename")
+    }
+
+    /// The project's icon bytes and MIME type, when it has one.
+    pub async fn project_icon(&self, project_id: &str) -> Result<Option<(Vec<u8>, String)>> {
+        use base64::Engine as _;
+        let payload = self
+            .request(
+                json!({"type":"project.icon.get.request", "requestId":next_request_id(), "projectId":project_id}),
+                "project.icon.get.response",
+                false,
+            )
+            .await?;
+        let Some(icon) = payload.get("icon").filter(|icon| icon.is_object()) else {
+            return Ok(None);
+        };
+        let data = icon
+            .get("data")
+            .and_then(Value::as_str)
+            .context("missing icon data")?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .context("invalid project icon data")?;
+        let mime_type = icon
+            .get("mimeType")
+            .and_then(Value::as_str)
+            .unwrap_or("image/png")
+            .to_owned();
+        Ok(Some((bytes, mime_type)))
+    }
+
+    /// Uploads an icon image for the project, or reverts to the automatic icon with `None`.
+    pub async fn set_project_icon(&self, project_id: &str, image: Option<&[u8]>) -> Result<()> {
+        use base64::Engine as _;
+        let source = match image {
+            Some(bytes) => {
+                json!({"type":"upload", "data":base64::engine::general_purpose::STANDARD.encode(bytes)})
+            }
+            None => json!({"type":"automatic"}),
+        };
+        let payload = self
+            .request(
+                json!({"type":"project.icon.set.request", "requestId":next_request_id(), "projectId":project_id, "source":source}),
+                "project.icon.set.response",
+                false,
+            )
+            .await?;
+        require_accepted(&payload, "the project icon")
+    }
+
+    /// Creates `name` inside `parent_path` on the host and adds it as a project.
+    pub async fn create_project_directory(
+        &self,
+        parent_path: &str,
+        name: &str,
+    ) -> Result<ProjectDescriptor> {
+        let payload = self
+            .request(
+                json!({"type":"project.create_directory.request", "requestId":next_request_id(), "parentPath":parent_path, "name":name}),
+                "project.create_directory.response",
+                false,
+            )
+            .await?;
+        protocol::parse_project(
+            payload
+                .get("project")
+                .filter(|project| project.is_object())
+                .context("Paseo did not create the directory")?,
+        )
+    }
+
+    pub async fn daemon_status(&self) -> Result<DaemonStatus> {
+        let payload = self
+            .request(
+                json!({"type":"daemon.get_status.request", "requestId":next_request_id()}),
+                "daemon.get_status.response",
+                false,
+            )
+            .await?;
+        protocol::parse_daemon_status(&payload)
+    }
+
+    pub async fn available_providers(&self) -> Result<Vec<ProviderAvailability>> {
+        let payload = self
+            .request(
+                json!({"type":"list_available_providers_request", "requestId":next_request_id()}),
+                "list_available_providers_response",
+                false,
+            )
+            .await?;
+        protocol::parse_provider_availability(&payload)
+    }
+
+    /// Asks the daemon to recheck its providers; the new list arrives as `ProvidersChanged`.
+    pub async fn refresh_providers(&self) -> Result<()> {
+        self.request_with_timeout(
+            json!({"type":"refresh_providers_snapshot_request", "requestId":next_request_id()}),
+            "refresh_providers_snapshot_response",
+            false,
+            PROVIDER_REFRESH_TIMEOUT,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Runs the provider's health check on the host and returns its report.
+    pub async fn provider_diagnostic(&self, provider: &str) -> Result<String> {
+        let payload = self
+            .request_with_timeout(
+                json!({"type":"provider_diagnostic_request", "requestId":next_request_id(), "provider":provider}),
+                "provider_diagnostic_response",
+                false,
+                PROVIDER_DIAGNOSTIC_TIMEOUT,
+            )
+            .await?;
+        Ok(payload
+            .get("diagnostic")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned())
+    }
+
+    /// Restarts the daemon process. Agents keep running, and the session reconnects.
+    pub async fn restart_daemon(&self) -> Result<()> {
+        let payload = self
+            .request(
+                json!({"type":"restart_server_request", "requestId":next_request_id(), "reason":"Restarted from Zaseo"}),
+                "status",
+                false,
+            )
+            .await?;
+        if payload.get("status").and_then(Value::as_str) != Some("restart_requested") {
+            bail!("Paseo did not accept the restart");
+        }
+        Ok(())
+    }
+
+    /// Updates the daemon to the latest version and restarts it. Progress arrives as
+    /// `DaemonUpdateProgress` events.
+    pub async fn update_daemon(&self) -> Result<DaemonUpdate> {
+        let payload = self
+            .request_with_timeout(
+                json!({"type":"daemon.update.request", "requestId":next_request_id()}),
+                "daemon.update.response",
+                false,
+                DAEMON_UPDATE_TIMEOUT,
+            )
+            .await?;
+        protocol::parse_daemon_update(&payload)
+    }
+
+    /// The Paseo-created worktrees of the repository at `repo_root`.
+    pub async fn paseo_worktrees(&self, repo_root: &str) -> Result<Vec<PaseoWorktree>> {
+        let payload = self
+            .request(
+                json!({"type":"paseo_worktree_list_request", "requestId":next_request_id(), "repoRoot":repo_root}),
+                "paseo_worktree_list_response",
+                false,
+            )
+            .await?;
+        protocol::parse_paseo_worktrees(&payload)
+    }
+
+    /// Archives a Paseo worktree: archives its agents and workspace, then removes the worktree
+    /// from disk once no active workspace uses it. The branch is kept. Returns the archived
+    /// agents.
+    pub async fn archive_paseo_worktree(&self, worktree_path: &str) -> Result<Vec<String>> {
+        let payload = self
+            .request_with_timeout(
+                json!({"type":"paseo_worktree_archive_request", "requestId":next_request_id(), "worktreePath":worktree_path, "scope":"worktree"}),
+                "paseo_worktree_archive_response",
+                false,
+                GIT_ACTION_TIMEOUT,
+            )
+            .await?;
+        if let Some(error) = protocol::error_text(payload.get("error")) {
+            bail!("Paseo could not archive the worktree: {error}");
+        }
+        if payload.get("success").and_then(Value::as_bool) != Some(true) {
+            bail!("Paseo could not archive the worktree");
+        }
+        Ok(payload
+            .get("removedAgents")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|agent| agent.as_str().map(str::to_owned))
+            .collect())
+    }
+
+    async fn checkout_action(
+        &self,
+        message: Value,
+        response_type: &'static str,
+        action: &str,
+    ) -> Result<()> {
+        let payload = self
+            .request_with_timeout(message, response_type, false, GIT_ACTION_TIMEOUT)
+            .await?;
+        protocol::checkout_error(&payload, action)?;
+        if payload.get("success").and_then(Value::as_bool) != Some(true) {
+            bail!("Paseo could not {action}");
         }
         Ok(())
     }
@@ -225,10 +1414,215 @@ fn deliver<T>(sender: oneshot::Sender<T>, value: T) {
     }
 }
 
+fn emit_subagent_update(payload: &Value, events: &Sender<PaseoEvent>) {
+    let event = match payload["kind"].as_str() {
+        Some("upsert") => match protocol::parse_subagent(&payload["subagent"]) {
+            Ok(subagent) => PaseoEvent::SubagentUpserted(subagent),
+            Err(error) => {
+                log::warn!("Paseo sent an unreadable subagent: {error:#}");
+                return;
+            }
+        },
+        Some("remove") => {
+            let (Some(parent_agent_id), Some(subagent_id)) = (
+                payload["parentAgentId"].as_str(),
+                payload["subagentId"].as_str(),
+            ) else {
+                return;
+            };
+            PaseoEvent::SubagentRemoved {
+                parent_agent_id: parent_agent_id.to_owned(),
+                subagent_id: subagent_id.to_owned(),
+            }
+        }
+        Some("timeline") => {
+            let (
+                Some(parent_agent_id),
+                Some(subagent_id),
+                Some(epoch),
+                Some(sequence),
+                Some(timestamp),
+                Some(item),
+            ) = (
+                payload["parentAgentId"].as_str(),
+                payload["subagentId"].as_str(),
+                payload["epoch"].as_str(),
+                payload["seq"].as_u64(),
+                payload["timestamp"].as_str(),
+                payload["item"].as_object(),
+            )
+            else {
+                return;
+            };
+            PaseoEvent::TimelineEntry(TimelineEntry {
+                agent_id: subagent_timeline_id(parent_agent_id, subagent_id),
+                epoch: epoch.to_owned(),
+                sequence,
+                timestamp: timestamp.to_owned(),
+                payload: protocol::timeline_payload(Value::Object(item.clone())),
+                extra: payload.clone(),
+            })
+        }
+        _ => return,
+    };
+    emit_event(events, event);
+}
+
+fn emit_workspace_update(payload: &Value, events: &Sender<PaseoEvent>) {
+    let event = match payload["kind"].as_str() {
+        Some("upsert") => match protocol::parse_workspace(&payload["workspace"]) {
+            Ok(workspace) => PaseoEvent::WorkspaceUpserted(workspace),
+            Err(error) => {
+                log::warn!("invalid Paseo workspace update: {error:#}");
+                return;
+            }
+        },
+        Some("remove") => {
+            let Some(workspace_id) = payload["id"].as_str() else {
+                return;
+            };
+            PaseoEvent::WorkspaceRemoved {
+                workspace_id: workspace_id.to_owned(),
+                removed_project_id: payload["removedProjectId"].as_str().map(str::to_owned),
+            }
+        }
+        _ => return,
+    };
+    emit_event(events, event);
+}
+
+fn emit_project_update(payload: &Value, events: &Sender<PaseoEvent>) {
+    let event = match payload["kind"].as_str() {
+        Some("upsert") => match protocol::parse_project(&payload["project"]) {
+            Ok(project) => PaseoEvent::ProjectUpserted(project),
+            Err(error) => {
+                log::warn!("invalid Paseo project update: {error:#}");
+                return;
+            }
+        },
+        Some("remove") => {
+            let Some(project_id) = payload["projectId"].as_str() else {
+                return;
+            };
+            PaseoEvent::ProjectRemoved {
+                project_id: project_id.to_owned(),
+            }
+        }
+        _ => return,
+    };
+    emit_event(events, event);
+}
+
+fn emit_label_update(payload: &Value, events: &Sender<PaseoEvent>) {
+    let event = match payload["kind"].as_str() {
+        Some("upsert") => match protocol::parse_label(&payload["label"]) {
+            Ok(label) => PaseoEvent::LabelUpserted {
+                label,
+                previous_name: payload["previousName"].as_str().map(str::to_owned),
+            },
+            Err(error) => {
+                log::warn!("invalid Paseo label update: {error:#}");
+                return;
+            }
+        },
+        Some("remove") => {
+            let Some(name) = payload["name"].as_str() else {
+                return;
+            };
+            PaseoEvent::LabelRemoved {
+                name: name.to_owned(),
+            }
+        }
+        _ => return,
+    };
+    emit_event(events, event);
+}
+
 fn emit_event(events: &Sender<PaseoEvent>, event: PaseoEvent) {
     if events.try_send(event).is_err() {
         log::debug!("Paseo event receiver closed");
     }
+}
+
+/// Terminal frames are `[opcode][slot][payload]`; only output and screen restores carry bytes
+/// for the screen.
+fn emit_terminal_frame(data: &[u8], slots: &HashMap<u8, String>, events: &Sender<PaseoEvent>) {
+    const OUTPUT: u8 = 0x01;
+    const RESTORE: u8 = 0x05;
+    let [opcode, slot, bytes @ ..] = data else {
+        return;
+    };
+    let restore = match *opcode {
+        OUTPUT => false,
+        RESTORE => true,
+        _ => return,
+    };
+    if let Some(terminal_id) = slots.get(slot) {
+        emit_event(
+            events,
+            PaseoEvent::TerminalOutput {
+                terminal_id: terminal_id.clone(),
+                bytes: bytes.to_vec(),
+                restore,
+            },
+        );
+    }
+}
+
+fn image_payloads(images: Vec<ImageAttachment>) -> Value {
+    images
+        .into_iter()
+        .map(|image| json!({"data":image.data_base64, "mimeType":image.mime_type}))
+        .collect()
+}
+
+/// A `workspace.create` source. Unset fields are left out: the daemon accepts a missing field
+/// but rejects `null`.
+fn workspace_source_value(source: &WorkspaceSource) -> Value {
+    let (mut value, project_id, base_ref) = match source {
+        WorkspaceSource::Directory { path, project_id } => {
+            (json!({"kind":"directory", "path":path}), project_id, &None)
+        }
+        WorkspaceSource::Worktree {
+            cwd,
+            project_id,
+            base_ref,
+        } => (
+            json!({"kind":"worktree", "cwd":cwd, "action":"branch-off"}),
+            project_id,
+            base_ref,
+        ),
+    };
+    if let Some(project_id) = project_id {
+        value["projectId"] = json!(project_id);
+    }
+    if let Some(base_ref) = base_ref.as_deref().filter(|base| !base.is_empty()) {
+        value["refName"] = json!(base_ref);
+    }
+    value
+}
+
+fn require_success(payload: &Value, action: &str) -> Result<()> {
+    if payload.get("success").and_then(Value::as_bool) != Some(true) {
+        bail!(
+            "Paseo could not {action}: {}",
+            protocol::error_text(payload.get("error")).unwrap_or_else(|| "unknown reason".into())
+        );
+    }
+    Ok(())
+}
+
+fn require_accepted(payload: &Value, action: &str) -> Result<()> {
+    if payload.get("accepted").and_then(Value::as_bool) != Some(true) {
+        bail!(
+            "Paseo did not accept {action}: {}",
+            payload
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown reason")
+        );
+    }
+    Ok(())
 }
 
 fn next_request_id() -> String {
@@ -272,12 +1666,17 @@ async fn connect_with_ssh_executable(
     if client_id.trim().is_empty() {
         bail!("client ID must not be empty");
     }
-    let mut socket = open_socket(&target, password.as_ref(), &client_id, &ssh_executable).await?;
-    subscribe(&mut socket, None, None)
+    let (mut socket, server_info) =
+        open_socket(&target, password.as_ref(), &client_id, &ssh_executable).await?;
+    subscribe(&mut socket, &TimelineSubscriptions::default())
         .await
         .context("Paseo initial subscription failed")?;
     let (commands, command_receiver) = mpsc::channel(64);
     let (events, event_receiver) = async_channel::unbounded();
+    events
+        .send(PaseoEvent::ServerInfo(server_info))
+        .await
+        .context("event receiver closed")?;
     events
         .send(PaseoEvent::Connected)
         .await
@@ -299,7 +1698,7 @@ async fn open_socket(
     password: Option<&RuntimePassword>,
     client_id: &str,
     ssh_executable: &Path,
-) -> Result<Socket> {
+) -> Result<(Socket, ServerInfo)> {
     let websocket_url = transport::websocket_url(target)?;
     let mut request = websocket_url
         .as_str()
@@ -324,7 +1723,7 @@ async fn open_socket(
             bail!("Paseo daemon did not accept password authentication");
         }
     }
-    socket.send(Message::Text(json!({"type":"hello", "clientId":client_id, "clientType":"cli", "protocolVersion":1, "capabilities":{"owned_subscriptions":true, "explicit_event_subscriptions":true, "selective_agent_timeline":true, "all_providers":true, "timeline_replacement_invalidation":true}}).to_string().into())).await.context("Paseo hello failed")?;
+    socket.send(Message::Text(json!({"type":"hello", "clientId":client_id, "clientType":"cli", "protocolVersion":1, "capabilities":{"owned_subscriptions":true, "explicit_event_subscriptions":true, "selective_agent_timeline":true, "all_providers":true, "timeline_replacement_invalidation":true, "timeline_notifications":true, "reasoning_merge_enum":true, "terminal-restore-modes":true, "provider_subagents":true, "projected_subagent_timeline":true, "project_updates":true}}).to_string().into())).await.context("Paseo hello failed")?;
     let message = tokio::time::timeout(Duration::from_secs(10), socket.next())
         .await
         .context("Paseo hello timed out")?
@@ -349,7 +1748,12 @@ async fn open_socket(
             bail!("incompatible Paseo daemon: missing {feature}");
         }
     }
-    Ok(socket)
+    let server_info = ServerInfo {
+        features: features.clone(),
+        capabilities: info["payload"]["capabilities"].clone(),
+        desktop_managed: info["payload"]["desktopManaged"] == true,
+    };
+    Ok((socket, server_info))
 }
 
 async fn send_message(socket: &mut Socket, message: Value) -> Result<()> {
@@ -363,20 +1767,60 @@ async fn send_message(socket: &mut Socket, message: Value) -> Result<()> {
         .context("Paseo WebSocket send failed")
 }
 
-async fn subscribe(
-    socket: &mut Socket,
-    selected_agent: Option<&str>,
-    cursor: Option<(&str, u64)>,
-) -> Result<()> {
-    send_message(socket, json!({"type":"session.events.set_subscription.request", "requestId":next_request_id(), "events":["agent_permission_request", "agent_permission_resolved"]})).await?;
-    send_message(socket, json!({"type":"fetch_agents_request", "requestId":next_request_id(), "scope":"active", "subscribe":{}})).await?;
-    if let Some(id) = selected_agent {
-        send_message(socket, json!({"type":"agent.timeline.set_subscription.request", "requestId":next_request_id(), "agentIds":[id]})).await?;
-        let mut history = json!({"type":"fetch_agent_timeline_request", "requestId":next_request_id(), "agentId":id, "direction":"tail", "limit":TIMELINE_PAGE_SIZE, "projection":"projected"});
-        if let Some((epoch, sequence)) = cursor {
-            history["direction"] = json!("after");
-            history["cursor"] = json!({"epoch":epoch, "seq":sequence});
+/// Agents whose live timeline is streamed, with the last timeline position seen for each so a
+/// reconnect can fetch only what was missed. Cursor keys are always subscribed agents.
+#[derive(Default)]
+struct TimelineSubscriptions {
+    agent_ids: Vec<String>,
+    cursors: HashMap<String, (String, u64)>,
+}
+
+impl TimelineSubscriptions {
+    fn replace(&mut self, agent_ids: Vec<String>) {
+        let mut seen = HashSet::new();
+        self.agent_ids = agent_ids
+            .into_iter()
+            .filter(|agent_id| seen.insert(agent_id.clone()))
+            .collect();
+        self.cursors.retain(|agent_id, _| seen.contains(agent_id));
+    }
+
+    fn contains(&self, agent_id: &str) -> bool {
+        self.agent_ids
+            .iter()
+            .any(|subscribed| subscribed == agent_id)
+    }
+
+    fn advance(&mut self, agent_id: &str, epoch: &str, sequence: u64) {
+        if self.contains(agent_id) {
+            self.cursors
+                .insert(agent_id.to_owned(), (epoch.to_owned(), sequence));
         }
+    }
+}
+
+fn timeline_tail_request(agent_id: &str) -> Value {
+    json!({"type":"fetch_agent_timeline_request", "requestId":next_request_id(), "agentId":agent_id, "direction":"tail", "limit":TIMELINE_PAGE_SIZE, "projection":"projected"})
+}
+
+fn timeline_after_request(agent_id: &str, epoch: &str, sequence: u64) -> Value {
+    json!({"type":"fetch_agent_timeline_request", "requestId":next_request_id(), "agentId":agent_id, "direction":"after", "cursor":{"epoch":epoch, "seq":sequence}, "limit":TIMELINE_PAGE_SIZE, "projection":"projected"})
+}
+
+async fn subscribe(socket: &mut Socket, timeline: &TimelineSubscriptions) -> Result<()> {
+    send_message(socket, json!({"type":"session.events.set_subscription.request", "requestId":next_request_id(), "events":["agent_permission_request", "agent_permission_resolved", "providers_snapshot_update", "agent.provider_subagents.update", "project.update", "script_status_update", "workspace_setup_progress"]})).await?;
+    send_message(socket, json!({"type":"fetch_agents_request", "requestId":next_request_id(), "scope":"active", "subscribe":{}})).await?;
+    send_message(socket, json!({"type":"fetch_workspaces_request", "requestId":next_request_id(), "page":{"limit":WORKSPACE_PAGE_SIZE}, "subscribe":{}})).await?;
+    send_message(socket, json!({"type":"workspace.label.list.request", "requestId":next_request_id(), "subscribe":{}})).await?;
+    if timeline.agent_ids.is_empty() {
+        return Ok(());
+    }
+    send_message(socket, json!({"type":"agent.timeline.set_subscription.request", "requestId":next_request_id(), "agentIds":timeline.agent_ids})).await?;
+    for agent_id in &timeline.agent_ids {
+        let history = match timeline.cursors.get(agent_id) {
+            Some((epoch, sequence)) => timeline_after_request(agent_id, epoch, *sequence),
+            None => timeline_tail_request(agent_id),
+        };
         send_message(socket, history).await?;
     }
     Ok(())
@@ -395,8 +1839,8 @@ async fn run(
     let mut agents: HashMap<String, AgentSummary> = HashMap::new();
     let mut permissions: HashMap<String, String> = HashMap::new();
     let mut subscriptions: HashMap<&'static str, String> = HashMap::new();
-    let mut selected_agent: Option<String> = None;
-    let mut cursor: Option<(String, u64)> = None;
+    let mut timeline = TimelineSubscriptions::default();
+    let mut terminal_slots: HashMap<u8, String> = HashMap::new();
     let mut ping_pending = false;
     let mut ping_timer =
         tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
@@ -405,7 +1849,7 @@ async fn run(
             _ = ping_timer.tick() => {
                 pending.retain(|_, request| !request.reply.is_closed());
                 if ping_pending || socket.send(Message::Text(json!({"type":"ping"}).to_string().into())).await.is_err() {
-                    if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, selected_agent.as_deref(), cursor.as_ref(), &mut ping_pending).await { break; }
+                    if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
                 } else {
                     ping_pending = true;
                 }
@@ -417,8 +1861,21 @@ async fn run(
                         continue;
                     };
                     if message["type"] == "agent.timeline.set_subscription.request" {
-                        selected_agent = message["agentIds"][0].as_str().map(str::to_owned);
-                        cursor = None;
+                        timeline.replace(
+                            message["agentIds"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect(),
+                        );
+                    }
+                    if message["type"] == "fetch_agent_timeline_request"
+                        && message["direction"] == "tail"
+                        && let Some(agent_id) = message["agentId"].as_str()
+                    {
+                        timeline.cursors.remove(agent_id);
                     }
                     if message["type"] == "agent_permission_response" {
                         if let Some(agent_id) = permissions.get(&request_id) {
@@ -426,7 +1883,7 @@ async fn run(
                             message["agentId"] = json!(agent_id);
                             if send_message(&mut socket, message.clone()).await.is_err() {
                                 deliver(reply, Err(anyhow!("Paseo connection lost; permission outcome unknown")));
-                                if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, selected_agent.as_deref(), cursor.as_ref(), &mut ping_pending).await { break; }
+                                if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
                             } else {
                                 pending.insert(request_id, Pending { message, response_type, retry_creation, reply });
                             }
@@ -438,9 +1895,23 @@ async fn run(
                     if send_message(&mut socket, message.clone()).await.is_err() {
                         if retry_creation { pending.insert(request_id, Pending { message, response_type, retry_creation, reply }); }
                         else { deliver(reply, Err(anyhow!("Paseo connection lost; request outcome unknown"))); }
-                        if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, selected_agent.as_deref(), cursor.as_ref(), &mut ping_pending).await { break; }
+                        if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
                     } else {
                         pending.insert(request_id, Pending { message, response_type, retry_creation, reply });
+                    }
+                }
+                Some(Command::ReleaseTerminal { terminal_id, subscription_id }) => {
+                    terminal_slots.retain(|_, subscribed| *subscribed != terminal_id);
+                    if send_message(&mut socket, json!({"type":"subscription.release.request", "requestId":next_request_id(), "subscriptionId":subscription_id})).await.is_err() {
+                        if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
+                    }
+                }
+                Some(Command::Notify(message)) => {
+                    if message["type"] == "unsubscribe_terminal_request" {
+                        terminal_slots.retain(|_, terminal_id| message["terminalId"] != terminal_id.as_str());
+                    }
+                    if send_message(&mut socket, message).await.is_err() {
+                        if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
                     }
                 }
                 Some(Command::Close(reply)) => {
@@ -456,52 +1927,65 @@ async fn run(
                     if let Ok(value) = serde_json::from_str::<Value>(&text) {
                         if value["type"] == "session" {
                             let message = &value["message"];
-                            let replacement_for_selected = message["type"] == "agent.timeline.replacement" && message["payload"]["agentId"].as_str() == selected_agent.as_deref();
-                            let refresh = replacement_for_selected || (message["type"] == "fetch_agent_timeline_response" && (message["payload"]["staleCursor"] == true || message["payload"]["reset"] == true));
+                            let timeline_agent = message["payload"]["agentId"].as_str().filter(|agent_id| timeline.contains(agent_id)).map(str::to_owned);
+                            let timeline_response = message["type"] == "fetch_agent_timeline_response";
+                            let refresh = message["type"] == "agent.timeline.replacement" || (timeline_response && (message["payload"]["staleCursor"] == true || message["payload"]["reset"] == true));
                             let directory_page = message["type"] == "fetch_agents_response"
                                 && message["payload"]["requestId"].as_str().is_some_and(|request_id| !pending.contains_key(request_id));
                             let next_directory_cursor = if directory_page { next_agents_cursor(&message["payload"]).ok().flatten() } else { None };
-                            let previous_cursor = cursor.clone();
+                            let previous_cursor = timeline_agent.as_ref().and_then(|agent_id| timeline.cursors.get(agent_id).cloned());
                             let old_subscription = update_subscription(message, &mut subscriptions);
-                            handle_message(message, &mut pending, &mut agents, &mut permissions, &events, selected_agent.as_deref(), &mut cursor);
+                            if message["type"] == "subscribe_terminal_response"
+                                && let (Some(slot), Some(terminal_id)) = (
+                                    message["payload"]["slot"].as_u64().and_then(|slot| u8::try_from(slot).ok()),
+                                    message["payload"]["terminalId"].as_str(),
+                                )
+                            {
+                                terminal_slots.insert(slot, terminal_id.to_owned());
+                            }
+                            handle_message(message, &mut pending, &mut agents, &mut permissions, &events, &mut timeline);
                             if let Some(page_cursor) = next_directory_cursor {
                                 if send_message(&mut socket, json!({"type":"fetch_agents_request", "requestId":next_request_id(), "scope":"active", "page":{"limit":200,"cursor":page_cursor}})).await.is_err() {
-                                    if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, selected_agent.as_deref(), cursor.as_ref(), &mut ping_pending).await { break; }
+                                    if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
                                 }
                             }
                             if let Some(subscription_id) = old_subscription {
                                 if send_message(&mut socket, json!({"type":"subscription.release.request", "requestId":next_request_id(), "subscriptionId":subscription_id})).await.is_err() {
-                                    if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, selected_agent.as_deref(), cursor.as_ref(), &mut ping_pending).await { break; }
+                                    if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
                                 }
                             }
-                            if refresh {
-                                cursor = None;
-                                if let Some(agent_id) = selected_agent.as_deref() {
-                                    if send_message(&mut socket, json!({"type":"fetch_agent_timeline_request", "requestId":next_request_id(), "agentId":agent_id, "direction":"tail", "limit":TIMELINE_PAGE_SIZE, "projection":"projected"})).await.is_err() {
-                                        if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, selected_agent.as_deref(), cursor.as_ref(), &mut ping_pending).await { break; }
-                                    }
+                            let follow_up = timeline_agent.and_then(|agent_id| {
+                                if refresh {
+                                    timeline.cursors.remove(&agent_id);
+                                    Some(timeline_tail_request(&agent_id))
+                                } else if timeline_response
+                                    && message["payload"]["direction"] == "after"
+                                    && message["payload"]["hasNewer"] == true
+                                {
+                                    timeline.cursors.get(&agent_id)
+                                        .filter(|cursor| previous_cursor.as_ref() != Some(*cursor))
+                                        .map(|(epoch, sequence)| timeline_after_request(&agent_id, epoch, *sequence))
+                                } else {
+                                    None
                                 }
-                            } else if message["type"] == "fetch_agent_timeline_response"
-                                && message["payload"]["direction"] == "after"
-                                && message["payload"]["hasNewer"] == true
-                                && cursor != previous_cursor
-                            {
-                                if let (Some(agent_id), Some((epoch, sequence))) = (selected_agent.as_deref(), cursor.as_ref()) {
-                                    if send_message(&mut socket, json!({"type":"fetch_agent_timeline_request", "requestId":next_request_id(), "agentId":agent_id, "direction":"after", "cursor":{"epoch":epoch,"seq":sequence}, "limit":TIMELINE_PAGE_SIZE, "projection":"projected"})).await.is_err() {
-                                        if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, selected_agent.as_deref(), cursor.as_ref(), &mut ping_pending).await { break; }
-                                    }
+                            });
+                            if let Some(request) = follow_up {
+                                if send_message(&mut socket, request).await.is_err() {
+                                    if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
                                 }
                             }
                         } else if value["type"] == "pong" {
                             ping_pending = false;
                         } else if value["type"] == "ping" {
                             if socket.send(Message::Text(json!({"type":"pong"}).to_string().into())).await.is_err() {
-                                if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, selected_agent.as_deref(), cursor.as_ref(), &mut ping_pending).await { break; }
+                                if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
                             }
                         }
                     }
+                } else if let Some(Message::Binary(data)) = result {
+                    emit_terminal_frame(&data, &terminal_slots, &events);
                 } else if result.is_none() {
-                    if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, selected_agent.as_deref(), cursor.as_ref(), &mut ping_pending).await { break; }
+                    if !reconnect(&mut socket, &target, &ssh_executable, password.as_ref(), &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
                 }
             }
         }
@@ -519,6 +2003,8 @@ fn update_subscription(
         Some("session.events.set_subscription.response") => "events",
         Some("fetch_agents_response") => "agents",
         Some("agent.timeline.set_subscription.response") => "timeline",
+        Some("fetch_workspaces_response") => "workspaces",
+        Some("workspace.label.list.response") => "labels",
         _ => return None,
     };
     let new_id = message["payload"]["subscriptionId"].as_str()?;
@@ -532,8 +2018,7 @@ fn handle_message(
     agents: &mut HashMap<String, AgentSummary>,
     permissions: &mut HashMap<String, String>,
     events: &Sender<PaseoEvent>,
-    selected_agent: Option<&str>,
-    cursor: &mut Option<(String, u64)>,
+    timeline: &mut TimelineSubscriptions,
 ) {
     let message_type = message["type"].as_str().unwrap_or("");
     let payload = &message["payload"];
@@ -552,7 +2037,7 @@ fn handle_message(
                 };
                 if let Ok(payload) = &result {
                     if message_type == "fetch_agent_timeline_response" {
-                        emit_timeline(payload, events, cursor);
+                        emit_timeline(payload, events, timeline);
                     }
                     if message_type == "agent_permission_resolved" {
                         permissions.remove(request_id);
@@ -572,9 +2057,9 @@ fn handle_message(
     match message_type {
         "fetch_agents_response" => update_agents(payload, agents, permissions, events),
         "agent.timeline.replacement" => {
-            if payload["agentId"].as_str() == selected_agent
-                && let (Some(agent_id), Some(epoch)) =
-                    (payload["agentId"].as_str(), payload["epoch"].as_str())
+            if let (Some(agent_id), Some(epoch)) =
+                (payload["agentId"].as_str(), payload["epoch"].as_str())
+                && timeline.contains(agent_id)
             {
                 emit_event(
                     events,
@@ -588,7 +2073,10 @@ fn handle_message(
         "agent_update" => {
             match payload["kind"].as_str() {
                 Some("upsert") => {
-                    if let Ok(agent) = protocol::parse_agent(&payload["agent"]) {
+                    if let Ok(agent) = protocol::parse_agent_with_project(
+                        &payload["agent"],
+                        payload.get("project"),
+                    ) {
                         agents.insert(agent.id.clone(), agent);
                     }
                 }
@@ -604,11 +2092,71 @@ fn handle_message(
                 PaseoEvent::AgentsChanged(agents.values().cloned().collect()),
             );
         }
-        "fetch_agent_timeline_response" => emit_timeline(payload, events, cursor),
-        "agent_stream" => {
-            if payload["agentId"].as_str() != selected_agent {
-                return;
+        "fetch_agent_timeline_response" => emit_timeline(payload, events, timeline),
+        "agent.provider_subagents.update" => emit_subagent_update(payload, events),
+        "fetch_workspaces_response" => match protocol::parse_workspace_page(payload) {
+            Ok((workspaces, empty_projects, next_cursor)) => emit_event(
+                events,
+                PaseoEvent::WorkspacesSnapshot {
+                    workspaces,
+                    empty_projects,
+                    next_cursor,
+                },
+            ),
+            Err(error) => log::warn!("invalid Paseo workspaces snapshot: {error:#}"),
+        },
+        "workspace_update" => emit_workspace_update(payload, events),
+        "project.update" => emit_project_update(payload, events),
+        "workspace.label.list.response" => match protocol::parse_labels(payload) {
+            Ok(labels) => emit_event(events, PaseoEvent::LabelsSnapshot(labels)),
+            Err(error) => log::warn!("invalid Paseo labels snapshot: {error:#}"),
+        },
+        "workspace.label.update" => emit_label_update(payload, events),
+        "script_status_update" => {
+            if let (Some(workspace_id), Ok(scripts)) = (
+                payload["workspaceId"].as_str(),
+                protocol::parse_workspace_scripts(payload),
+            ) {
+                emit_event(
+                    events,
+                    PaseoEvent::ScriptsChanged {
+                        workspace_id: workspace_id.to_owned(),
+                        scripts,
+                    },
+                );
             }
+        }
+        "workspace_setup_progress" => {
+            if let (Some(workspace_id), Ok(snapshot)) = (
+                payload["workspaceId"].as_str(),
+                protocol::parse_setup_snapshot(payload),
+            ) {
+                emit_event(
+                    events,
+                    PaseoEvent::SetupProgress {
+                        workspace_id: workspace_id.to_owned(),
+                        snapshot,
+                    },
+                );
+            }
+        }
+        "daemon.update.progress" => {
+            if let Some(phase) = payload["phase"].as_str() {
+                emit_event(
+                    events,
+                    PaseoEvent::DaemonUpdateProgress {
+                        phase: phase.to_owned(),
+                    },
+                );
+            }
+        }
+        "agent_stream" => {
+            let Some(agent_id) = payload["agentId"]
+                .as_str()
+                .filter(|agent_id| timeline.contains(agent_id))
+            else {
+                return;
+            };
             if let (Some(epoch), Some(sequence), Some(timestamp), Some(item)) = (
                 payload["epoch"].as_str(),
                 payload["seq"].as_u64(),
@@ -616,15 +2164,25 @@ fn handle_message(
                 payload["event"]["item"].as_object(),
             ) {
                 let entry = TimelineEntry {
-                    agent_id: selected_agent.unwrap_or_default().to_owned(),
+                    agent_id: agent_id.to_owned(),
                     epoch: epoch.to_owned(),
                     sequence,
                     timestamp: timestamp.to_owned(),
                     payload: protocol::timeline_payload(Value::Object(item.clone())),
                     extra: payload.clone(),
                 };
-                *cursor = Some((epoch.to_owned(), sequence));
+                timeline.advance(agent_id, epoch, sequence);
                 emit_event(events, PaseoEvent::TimelineEntry(entry));
+            }
+        }
+        "providers_snapshot_update" => {
+            // Project-scoped snapshots answer a caller's `providers(Some(cwd))`; only the global
+            // snapshot replaces the provider list.
+            if payload.get("cwd").is_none_or(Value::is_null) {
+                match protocol::parse_providers(payload) {
+                    Ok(providers) => emit_event(events, PaseoEvent::ProvidersChanged(providers)),
+                    Err(error) => log::warn!("invalid Paseo provider snapshot update: {error:#}"),
+                }
             }
         }
         "agent_permission_request" => {
@@ -632,6 +2190,49 @@ fn handle_message(
                 permissions.insert(permission.request_id.clone(), permission.agent_id.clone());
                 emit_event(events, PaseoEvent::PermissionRequested(permission));
             }
+        }
+        "terminals_changed" => {
+            if let (Some(cwd), Ok(terminals)) =
+                (payload["cwd"].as_str(), protocol::parse_terminals(payload))
+            {
+                emit_event(
+                    events,
+                    PaseoEvent::TerminalsChanged {
+                        cwd: cwd.to_owned(),
+                        subscription_id: payload["subscriptionId"].as_str().map(str::to_owned),
+                        terminals,
+                    },
+                );
+            }
+        }
+        "terminal_stream_exit" => {
+            if let Some(terminal_id) = payload["terminalId"].as_str() {
+                emit_event(
+                    events,
+                    PaseoEvent::TerminalExited {
+                        terminal_id: terminal_id.to_owned(),
+                        error: payload["error"].as_str().map(str::to_owned),
+                    },
+                );
+            }
+        }
+        "dictation_stream_partial" | "dictation_stream_final" | "dictation_stream_error" => {
+            let Some(dictation_id) = payload["dictationId"].as_str().map(str::to_owned) else {
+                return;
+            };
+            let text = payload["text"].as_str().unwrap_or_default().to_owned();
+            let event = match message_type {
+                "dictation_stream_partial" => PaseoEvent::DictationPartial { dictation_id, text },
+                "dictation_stream_final" => PaseoEvent::DictationFinal { dictation_id, text },
+                _ => PaseoEvent::DictationFailed {
+                    dictation_id,
+                    error: payload["error"]
+                        .as_str()
+                        .unwrap_or("dictation failed")
+                        .to_owned(),
+                },
+            };
+            emit_event(events, event);
         }
         "agent_permission_resolved" => {
             if let Some(request_id) = payload["requestId"].as_str() {
@@ -675,25 +2276,31 @@ fn update_agents(
     }
 }
 
-fn emit_timeline(payload: &Value, events: &Sender<PaseoEvent>, cursor: &mut Option<(String, u64)>) {
+fn emit_timeline(
+    payload: &Value,
+    events: &Sender<PaseoEvent>,
+    timeline: &mut TimelineSubscriptions,
+) {
     if let Ok(entries) = protocol::parse_timeline(payload) {
         let advance_cursor = payload["direction"] != "before";
         for entry in entries {
             if advance_cursor {
-                *cursor = Some((
-                    entry.epoch.clone(),
+                timeline.advance(
+                    &entry.agent_id,
+                    &entry.epoch,
                     entry.extra["seqEnd"].as_u64().unwrap_or(entry.sequence),
-                ));
+                );
             }
             emit_event(events, PaseoEvent::TimelineEntry(entry));
         }
         if advance_cursor
-            && let (Some(epoch), Some(sequence)) = (
+            && let (Some(agent_id), Some(epoch), Some(sequence)) = (
+                payload["agentId"].as_str(),
                 payload["endCursor"]["epoch"].as_str(),
                 payload["endCursor"]["seq"].as_u64(),
             )
         {
-            *cursor = Some((epoch.to_owned(), sequence));
+            timeline.advance(agent_id, epoch, sequence);
         }
     }
 }
@@ -707,8 +2314,7 @@ async fn reconnect(
     events: &Sender<PaseoEvent>,
     pending: &mut HashMap<String, Pending>,
     commands: &mut mpsc::Receiver<Command>,
-    selected_agent: Option<&str>,
-    cursor: Option<&(String, u64)>,
+    timeline: &TimelineSubscriptions,
     ping_pending: &mut bool,
 ) -> bool {
     emit_event(
@@ -745,6 +2351,7 @@ async fn reconnect(
                     deliver(reply, Err(anyhow!("Paseo is reconnecting")));
                     continue;
                 }
+                Some(Command::Notify(_) | Command::ReleaseTerminal { .. }) => continue,
                 Some(Command::Close(reply)) => {
                     deliver(reply, Ok(()));
                     return false;
@@ -752,13 +2359,10 @@ async fn reconnect(
                 None => return false,
             }
         }
-        if let Ok(mut replacement) = open_socket(target, password, client_id, ssh_executable).await
+        if let Ok((mut replacement, server_info)) =
+            open_socket(target, password, client_id, ssh_executable).await
         {
-            let cursor = cursor.map(|(epoch, sequence)| (epoch.as_str(), *sequence));
-            if subscribe(&mut replacement, selected_agent, cursor)
-                .await
-                .is_err()
-            {
+            if subscribe(&mut replacement, timeline).await.is_err() {
                 continue;
             }
             let mut replay_failed = false;
@@ -776,6 +2380,7 @@ async fn reconnect(
             }
             *socket = replacement;
             *ping_pending = false;
+            emit_event(events, PaseoEvent::ServerInfo(server_info));
             emit_event(events, PaseoEvent::Connected);
             return true;
         }
@@ -797,6 +2402,9 @@ mod tests {
         assert_eq!(hello["type"], "hello");
         assert_eq!(hello["protocolVersion"], 1);
         assert_eq!(hello["capabilities"]["selective_agent_timeline"], true);
+        assert_eq!(hello["capabilities"]["projected_subagent_timeline"], true);
+        assert_eq!(hello["capabilities"]["timeline_notifications"], true);
+        assert_eq!(hello["capabilities"]["reasoning_merge_enum"], true);
         send_json(&mut socket, json!({"type":"session", "message":{"type":"status", "payload":{"status":"server_info", "serverId":"mock", "features":{"ownedSubscriptions":true,"providersSnapshot":true,"creationLifecycle":true}}}})).await;
         socket
     }
@@ -1074,7 +2682,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept client");
             let mut socket = server_socket(stream).await;
-            let _directory = next_request(&mut socket, "fetch_agents_request").await;
+            let _labels = next_request(&mut socket, "workspace.label.list.request").await;
             let frame = tokio::time::timeout(PING_INTERVAL + Duration::from_secs(2), socket.next())
                 .await
                 .expect("application ping timed out")
@@ -1208,6 +2816,8 @@ while True:
             assert_eq!(creation["idempotencyKey"], "stable-key");
             assert_eq!(creation["config"]["cwd"], "C:\\Users\\agent\\project");
             assert_eq!(creation["config"]["model"], "gpt-5.5");
+            assert_eq!(creation["config"]["modeId"], "plan");
+            assert_eq!(creation["config"]["thinkingOptionId"], "high");
             assert!(creation["config"].get("title").is_none());
             assert!(creation.get("initialPrompt").is_none());
             drop(first);
@@ -1222,7 +2832,7 @@ while True:
             drop(second);
             let (third_stream, _) = listener.accept().await.expect("second reconnection");
             let mut third = server_socket(third_stream).await;
-            let _ = next_request(&mut third, "fetch_agents_request").await;
+            let _ = next_request(&mut third, "workspace.label.list.request").await;
             assert!(
                 tokio::time::timeout(Duration::from_millis(200), third.next())
                     .await
@@ -1239,6 +2849,11 @@ while True:
                 directory: "C:\\Users\\agent\\project".into(),
                 title: None,
                 initial_prompt: None,
+                mode_id: Some("plan".into()),
+                thinking_option_id: Some("high".into()),
+                images: Vec::new(),
+                attachments: Vec::new(),
+                worktree: None,
                 idempotency_key: "stable-key".into(),
             })
             .await
@@ -1267,7 +2882,11 @@ while True:
         let mut agents = HashMap::new();
         let mut permissions = HashMap::new();
         let (events, event_receiver) = async_channel::unbounded();
-        let mut cursor = Some(("epoch-1".to_string(), 100));
+        let mut timeline = TimelineSubscriptions::default();
+        timeline.replace(vec!["agent-1".into()]);
+        timeline
+            .cursors
+            .insert("agent-1".into(), ("epoch-1".into(), 100));
         handle_message(
             &json!({
                 "type":"fetch_agent_timeline_response",
@@ -1289,10 +2908,12 @@ while True:
             &mut agents,
             &mut permissions,
             &events,
-            Some("agent-1"),
-            &mut cursor,
+            &mut timeline,
         );
-        assert_eq!(cursor, Some(("epoch-1".to_string(), 100)));
+        assert_eq!(
+            timeline.cursors.get("agent-1"),
+            Some(&("epoch-1".to_string(), 100))
+        );
         assert!(matches!(
             event_receiver.try_recv(),
             Ok(PaseoEvent::TimelineEntry(_))
@@ -1318,8 +2939,7 @@ while True:
             &mut HashMap::new(),
             &mut HashMap::new(),
             &events,
-            None,
-            &mut None,
+            &mut TimelineSubscriptions::default(),
         );
         assert!(
             response
@@ -1402,7 +3022,7 @@ while True:
         let (events, _) = async_channel::unbounded();
         let mut agents = HashMap::new();
         let mut permissions = HashMap::new();
-        let mut cursor = None;
+        let mut timeline = TimelineSubscriptions::default();
         handle_message(
             &json!({"type":"fetch_agents_response", "payload":{
                 "requestId":"subscription", "subscriptionId":"owned", "entries":[{"agent":agent()}],
@@ -1412,8 +3032,7 @@ while True:
             &mut agents,
             &mut permissions,
             &events,
-            None,
-            &mut cursor,
+            &mut timeline,
         );
         handle_message(
             &json!({"type":"agent_update", "payload":{"kind":"upsert", "agent":{
@@ -1423,8 +3042,7 @@ while True:
             &mut agents,
             &mut permissions,
             &events,
-            None,
-            &mut cursor,
+            &mut timeline,
         );
         handle_message(
             &json!({"type":"fetch_agents_response", "payload":{
@@ -1436,8 +3054,7 @@ while True:
             &mut agents,
             &mut permissions,
             &events,
-            None,
-            &mut cursor,
+            &mut timeline,
         );
         assert_eq!(agents.len(), 3);
         assert_eq!(agents["live-agent"].status, "running");
@@ -1453,8 +3070,7 @@ while True:
             &mut HashMap::new(),
             &mut HashMap::new(),
             &events,
-            Some("other"),
-            &mut None,
+            &mut subscriptions(&["other"]),
         );
         assert!(receiver.try_recv().is_err());
         handle_message(
@@ -1463,11 +3079,1339 @@ while True:
             &mut HashMap::new(),
             &mut HashMap::new(),
             &events,
-            Some("agent-1"),
-            &mut None,
+            &mut subscriptions(&["other", "agent-1"]),
         );
         assert!(
             matches!(receiver.try_recv(), Ok(PaseoEvent::TimelineReplaced { agent_id, epoch }) if agent_id == "agent-1" && epoch == "epoch-2")
         );
+    }
+
+    fn subscriptions(agent_ids: &[&str]) -> TimelineSubscriptions {
+        let mut timeline = TimelineSubscriptions::default();
+        timeline.replace(agent_ids.iter().map(|id| id.to_string()).collect());
+        timeline
+    }
+
+    fn timeline_response(
+        request_id: &Value,
+        agent_id: &str,
+        direction: &str,
+        sequence: u64,
+        has_newer: bool,
+    ) -> Value {
+        json!({"type":"session", "message":{"type":"fetch_agent_timeline_response", "payload":{"requestId":request_id,"agentId":agent_id,"direction":direction,"epoch":"epoch-1","reset":false,"staleCursor":false,"startCursor":{"epoch":"epoch-1","seq":sequence},"endCursor":{"epoch":"epoch-1","seq":sequence},"hasOlder":false,"hasNewer":has_newer,"entries":[{"seqStart":sequence,"seqEnd":sequence,"timestamp":"now","item":{"type":"assistant_message","text":agent_id}}],"error":null}}})
+    }
+
+    fn stream_entry(agent_id: &str, sequence: u64) -> Value {
+        json!({"type":"session", "message":{"type":"agent_stream", "payload":{"agentId":agent_id,"epoch":"epoch-1","seq":sequence,"timestamp":"now","event":{"type":"timeline","item":{"type":"assistant_message","text":"chunk"}}}}})
+    }
+
+    async fn next_timeline_entry(events: &Receiver<PaseoEvent>) -> TimelineEntry {
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("timeline event timed out")
+                .expect("event receiver closed");
+            if let PaseoEvent::TimelineEntry(entry) = event {
+                return entry;
+            }
+        }
+    }
+
+    async fn answer_subscription<S>(socket: &mut WebSocketStream<S>, expected: Value)
+    where
+        S: futures::AsyncRead + futures::AsyncWrite + Unpin,
+    {
+        let request = next_request(socket, "agent.timeline.set_subscription.request").await;
+        assert_eq!(request["agentIds"], expected);
+        send_json(socket, json!({"type":"session", "message":{"type":"agent.timeline.set_subscription.response", "payload":{"requestId":request["requestId"],"agentIds":expected}}})).await;
+    }
+
+    #[tokio::test]
+    async fn every_subscribed_agent_receives_stream_entries() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock daemon");
+        let port = listener.local_addr().expect("mock address").port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let mut socket = server_socket(stream).await;
+            let session_events =
+                next_request(&mut socket, "session.events.set_subscription.request").await;
+            assert!(
+                session_events["events"]
+                    .as_array()
+                    .expect("event list")
+                    .contains(&json!("providers_snapshot_update"))
+            );
+            assert!(
+                session_events["events"]
+                    .as_array()
+                    .expect("event list")
+                    .contains(&json!("agent.provider_subagents.update"))
+            );
+            answer_subscription(&mut socket, json!(["agent-1", "agent-2"])).await;
+            send_json(&mut socket, stream_entry("agent-3", 1)).await;
+            send_json(&mut socket, stream_entry("agent-2", 5)).await;
+            send_json(&mut socket, stream_entry("agent-1", 9)).await;
+            send_json(&mut socket, json!({"type":"session", "message":{"type":"providers_snapshot_update", "payload":{"cwd":"/tmp/project","entries":[{"provider":"scoped","status":"ready"}],"generatedAt":"now"}}})).await;
+            send_json(&mut socket, json!({"type":"session", "message":{"type":"providers_snapshot_update", "payload":{"entries":[{"provider":"codex","status":"ready"}],"generatedAt":"now"}}})).await;
+            answer_subscription(&mut socket, json!([])).await;
+        });
+        let (session, events) = connect(target(port), None, "test-client".into())
+            .await
+            .expect("connect");
+        session
+            .set_timeline_subscriptions(vec!["agent-1".into(), "agent-2".into()])
+            .await
+            .expect("subscribe to two agents");
+        let first = next_timeline_entry(&events).await;
+        assert_eq!((first.agent_id.as_str(), first.sequence), ("agent-2", 5));
+        let second = next_timeline_entry(&events).await;
+        assert_eq!((second.agent_id.as_str(), second.sequence), ("agent-1", 9));
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("provider event timed out")
+                .expect("event receiver closed");
+            match event {
+                PaseoEvent::ProvidersChanged(providers) => {
+                    assert_eq!(providers[0].id, "codex");
+                    break;
+                }
+                PaseoEvent::TimelineEntry(entry) => panic!("unexpected entry {entry:?}"),
+                _ => {}
+            }
+        }
+        session
+            .set_timeline_subscriptions(Vec::new())
+            .await
+            .expect("clear subscriptions");
+        server.await.expect("mock daemon task");
+    }
+
+    #[tokio::test]
+    async fn reconnect_renews_every_subscription_and_catches_up_each_agent() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock daemon");
+        let port = listener.local_addr().expect("mock address").port();
+        let server = tokio::spawn(async move {
+            let (first_stream, _) = listener.accept().await.expect("first connection");
+            let mut first = server_socket(first_stream).await;
+            answer_subscription(&mut first, json!(["agent-1", "agent-2"])).await;
+            for (agent_id, sequence) in [("agent-1", 3), ("agent-2", 7)] {
+                let tail = next_request(&mut first, "fetch_agent_timeline_request").await;
+                assert_eq!(tail["agentId"], agent_id);
+                assert_eq!(tail["direction"], "tail");
+                send_json(
+                    &mut first,
+                    timeline_response(&tail["requestId"], agent_id, "tail", sequence, false),
+                )
+                .await;
+            }
+            send_json(&mut first, stream_entry("agent-2", 8)).await;
+            answer_subscription(&mut first, json!(["agent-1", "agent-2"])).await;
+            drop(first);
+            let (second_stream, _) = listener.accept().await.expect("second connection");
+            let mut second = server_socket(second_stream).await;
+            let renewed =
+                next_request(&mut second, "agent.timeline.set_subscription.request").await;
+            assert_eq!(renewed["agentIds"], json!(["agent-1", "agent-2"]));
+            let mut catch_up = HashMap::new();
+            for _ in 0..2 {
+                let request = next_request(&mut second, "fetch_agent_timeline_request").await;
+                assert_eq!(request["direction"], "after");
+                assert_eq!(request["limit"], TIMELINE_PAGE_SIZE);
+                catch_up.insert(
+                    request["agentId"].as_str().expect("agent ID").to_owned(),
+                    request["cursor"].clone(),
+                );
+            }
+            assert_eq!(catch_up["agent-1"], json!({"epoch":"epoch-1","seq":3}));
+            assert_eq!(catch_up["agent-2"], json!({"epoch":"epoch-1","seq":8}));
+        });
+        let (session, events) = connect(target(port), None, "test-client".into())
+            .await
+            .expect("connect");
+        session
+            .set_timeline_subscriptions(vec!["agent-1".into(), "agent-2".into()])
+            .await
+            .expect("subscribe");
+        for agent_id in ["agent-1", "agent-2"] {
+            let page = session.timeline_tail(agent_id).await.expect("tail page");
+            assert_eq!(page.entries[0].agent_id, agent_id);
+        }
+        loop {
+            let entry = next_timeline_entry(&events).await;
+            if entry.agent_id == "agent-2" && entry.sequence == 8 {
+                break;
+            }
+        }
+        session
+            .set_timeline_subscriptions(vec!["agent-1".into(), "agent-2".into()])
+            .await
+            .expect("resubscribe keeps cursors");
+        server.await.expect("mock daemon task");
+    }
+
+    #[tokio::test]
+    async fn replacement_and_reset_refetch_the_affected_agent_and_after_pages_continue() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock daemon");
+        let port = listener.local_addr().expect("mock address").port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let mut socket = server_socket(stream).await;
+            answer_subscription(&mut socket, json!(["agent-1", "agent-2"])).await;
+            send_json(&mut socket, json!({"type":"session", "message":{"type":"agent.timeline.replacement", "payload":{"agentId":"agent-2","epoch":"epoch-2"}}})).await;
+            let refetch = next_request(&mut socket, "fetch_agent_timeline_request").await;
+            assert_eq!(refetch["agentId"], "agent-2");
+            assert_eq!(refetch["direction"], "tail");
+            assert!(refetch.get("cursor").is_none());
+            send_json(&mut socket, json!({"type":"session", "message":{"type":"fetch_agent_timeline_response", "payload":{"requestId":"unrelated","agentId":"agent-1","direction":"after","epoch":"epoch-9","reset":true,"staleCursor":true,"startCursor":null,"endCursor":null,"hasOlder":false,"hasNewer":false,"entries":[],"error":null}}})).await;
+            let reset = next_request(&mut socket, "fetch_agent_timeline_request").await;
+            assert_eq!(reset["agentId"], "agent-1");
+            assert_eq!(reset["direction"], "tail");
+            send_json(
+                &mut socket,
+                timeline_response(&json!("unrelated"), "agent-2", "after", 4, true),
+            )
+            .await;
+            let next_page = next_request(&mut socket, "fetch_agent_timeline_request").await;
+            assert_eq!(next_page["agentId"], "agent-2");
+            assert_eq!(next_page["direction"], "after");
+            assert_eq!(next_page["cursor"], json!({"epoch":"epoch-1","seq":4}));
+        });
+        let (session, events) = connect(target(port), None, "test-client".into())
+            .await
+            .expect("connect");
+        session
+            .set_timeline_subscriptions(vec!["agent-1".into(), "agent-2".into()])
+            .await
+            .expect("subscribe");
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("replacement event timed out")
+                .expect("event receiver closed");
+            if let PaseoEvent::TimelineReplaced { agent_id, epoch } = event {
+                assert_eq!((agent_id.as_str(), epoch.as_str()), ("agent-2", "epoch-2"));
+                break;
+            }
+        }
+        server.await.expect("mock daemon task");
+    }
+
+    fn mock_daemon(
+        replies: Vec<(&'static str, Value)>,
+    ) -> (PaseoSession, tokio::task::JoinHandle<Vec<Value>>) {
+        let (commands, mut receiver) = mpsc::channel(4);
+        let daemon = tokio::spawn(async move {
+            let mut messages = Vec::new();
+            for (expected_response_type, reply_payload) in replies {
+                let Some(Command::Request {
+                    message,
+                    response_type,
+                    reply,
+                    ..
+                }) = receiver.recv().await
+                else {
+                    panic!("expected a request for {expected_response_type}")
+                };
+                assert_eq!(response_type, expected_response_type);
+                assert!(message["requestId"].as_str().is_some());
+                deliver(reply, Ok(reply_payload));
+                messages.push(message);
+            }
+            messages
+        });
+        (PaseoSession { commands }, daemon)
+    }
+
+    fn subagent_value(status: &str) -> Value {
+        json!({"id":"task-1","parentAgentId":"agent-1","parentSubagentId":null,"provider":"claude","title":"sr-reviewer-deep","description":"Review the diff","status":status,"createdAt":"2026-09-28T10:00:00Z","updatedAt":"2026-09-28T10:01:00Z","toolCallId":"toolu_1","cwd":"/repo","subtitle":"sr-reviewer-deep · Opus 5.5 · 12k tokens"})
+    }
+
+    #[tokio::test]
+    async fn subagent_requests_use_daemon_shapes() {
+        let (session, daemon) = mock_daemon(vec![
+            (
+                "agent.provider_subagents.list.response",
+                json!({"parentAgentId":"agent-1","subagents":[subagent_value("running")],"error":null}),
+            ),
+            (
+                "agent.provider_subagents.timeline.get.response",
+                json!({"parentAgentId":"agent-1","subagentId":"task-1","provider":"claude","direction":"tail","epoch":"epoch-1","startCursor":{"epoch":"epoch-1","seq":3},"endCursor":{"epoch":"epoch-1","seq":4},"reset":false,"staleCursor":false,"gap":false,"window":{"minSeq":1,"maxSeq":4,"nextSeq":5},"hasOlder":true,"hasNewer":false,"rows":[{"item":{"type":"assistant_message","text":"Reading"},"timestamp":"2026-09-28T10:00:30Z","seq":4,"seqStart":3}],"error":null}),
+            ),
+            (
+                "agent.provider_subagents.timeline.get.response",
+                json!({"parentAgentId":"agent-1","subagentId":"task-1","provider":"claude","direction":"before","epoch":"epoch-1","reset":false,"staleCursor":false,"gap":false,"window":{"minSeq":1,"maxSeq":4,"nextSeq":5},"hasOlder":false,"hasNewer":true,"rows":[],"error":"unknown subagent"}),
+            ),
+        ]);
+        let subagents = session.subagents("agent-1").await.expect("subagents");
+        assert_eq!(subagents[0].status, "running");
+        assert_eq!(subagents[0].tool_call_id.as_deref(), Some("toolu_1"));
+        let page = session
+            .subagent_timeline("agent-1", "task-1", None)
+            .await
+            .expect("subagent timeline");
+        assert_eq!(
+            page.entries[0].agent_id,
+            subagent_timeline_id("agent-1", "task-1")
+        );
+        assert_eq!(page.entries[0].sequence, 3);
+        assert_eq!(page.entries[0].extra["seqEnd"], 4);
+        assert!(page.has_older);
+        let cursor = page.start_cursor.expect("start cursor");
+        let error = session
+            .subagent_timeline("agent-1", "task-1", Some(&cursor))
+            .await
+            .expect_err("daemon error");
+        assert!(error.to_string().contains("unknown subagent"));
+        let messages = daemon.await.expect("daemon task");
+        assert_eq!(messages[0]["parentAgentId"], "agent-1");
+        assert_eq!(messages[1]["direction"], "tail");
+        assert_eq!(messages[2]["direction"], "before");
+        assert_eq!(messages[2]["cursor"], json!({"epoch":"epoch-1","seq":3}));
+    }
+
+    fn workspace_value(id: &str) -> Value {
+        json!({"id":id,"projectId":"prj_658731eeb474c372","projectDisplayName":"axon-monorepo","projectRootPath":"/home/sr/projects/work/axon-monorepo","workspaceDirectory":"/home/sr/.paseo/worktrees/3r36fnq4/prolific-snake","worktreeSlug":"prolific-snake","projectKind":"git","workspaceKind":"worktree","name":"Verify instinct-machine","title":"Verify instinct-machine","pinnedAt":null,"archivingAt":null,"status":"done","activityAt":null,"diffStat":{"additions":1386,"deletions":12},"scripts":[],"gitRuntime":{"currentBranch":"saanu-instinct-machine-tla","isPaseoOwnedWorktree":true}})
+    }
+
+    fn project_value() -> Value {
+        json!({"projectId":"prj_f1eff855e1aa39ba","projectKey":"remote:github.com/saanuregh/dotfiles","projectDisplayName":"dotfiles","projectCustomName":null,"projectCustomIconRevision":null,"projectIconRevision":"automatic:none:v1","projectRootPath":"/home/sr/projects/personal/dotfiles","projectKind":"git"})
+    }
+
+    #[test]
+    fn parse_workspace_descriptor_keeps_ids() {
+        let workspace =
+            protocol::parse_workspace(&workspace_value("wks_274c64ad64c5c640")).expect("workspace");
+        assert_eq!(workspace.id, "wks_274c64ad64c5c640");
+        assert_eq!(workspace.project_id, "prj_658731eeb474c372");
+        assert_eq!(
+            workspace.directory,
+            PathBuf::from("/home/sr/.paseo/worktrees/3r36fnq4/prolific-snake")
+        );
+        assert_eq!(workspace.kind, "worktree");
+        assert!(workspace.is_paseo_worktree);
+        assert_eq!(
+            workspace.current_branch.as_deref(),
+            Some("saanu-instinct-machine-tla")
+        );
+        assert_eq!(
+            workspace.diff_stat,
+            Some(DiffStat {
+                additions: 1386,
+                deletions: 12
+            })
+        );
+        assert!(workspace.labels.is_empty(), "labels are optional");
+
+        let mut without_directory = workspace_value("wks_1");
+        without_directory
+            .as_object_mut()
+            .expect("object")
+            .remove("workspaceDirectory");
+        assert_eq!(
+            protocol::parse_workspace(&without_directory)
+                .expect("workspace")
+                .directory,
+            PathBuf::from("/home/sr/projects/work/axon-monorepo"),
+            "a workspace without its own directory runs in the project root"
+        );
+
+        let project = protocol::parse_project(&project_value()).expect("project");
+        assert_eq!(project.id, "prj_f1eff855e1aa39ba");
+        assert_eq!(project.display_name, "dotfiles");
+        assert_eq!(project.icon_revision.as_deref(), Some("automatic:none:v1"));
+    }
+
+    #[tokio::test]
+    async fn workspace_requests_use_daemon_shapes() {
+        let (session, daemon) = mock_daemon(vec![
+            (
+                "fetch_workspaces_response",
+                json!({"entries":[workspace_value("wks_1")],"emptyProjects":[project_value()],"pageInfo":{"nextCursor":"next","prevCursor":null,"hasMore":true}}),
+            ),
+            (
+                "workspace.title.set.response",
+                json!({"workspaceId":"wks_1","accepted":true,"title":"New name","error":null}),
+            ),
+            (
+                "workspace.pin.set.response",
+                json!({"workspaceId":"wks_1","accepted":true,"pinnedAt":"now","error":null}),
+            ),
+            (
+                "workspace.mark_unread.response",
+                json!({"workspaceId":"wks_1","markedAgentId":null,"success":false,"error":null}),
+            ),
+            (
+                "workspace.clear_attention.response",
+                json!({"workspaceId":["wks_1"],"clearedAgentIds":["agent-1"],"results":[],"success":true,"error":null}),
+            ),
+            (
+                "workspace.create.response",
+                json!({"workspace":workspace_value("wks_2"),"setupTerminalId":null,"error":null}),
+            ),
+            (
+                "project.rename.response",
+                json!({"projectId":"prj_1","accepted":true,"customName":null,"error":null}),
+            ),
+            (
+                "project.icon.set.response",
+                json!({"projectId":"prj_1","accepted":true,"error":null}),
+            ),
+        ]);
+        let (workspaces, empty_projects, next_cursor) =
+            session.workspaces_page(None).await.expect("workspaces");
+        assert_eq!(workspaces[0].id, "wks_1");
+        assert_eq!(empty_projects[0].id, "prj_f1eff855e1aa39ba");
+        assert_eq!(next_cursor.as_deref(), Some("next"));
+        session
+            .set_workspace_title("wks_1", Some("New name"))
+            .await
+            .expect("title");
+        session
+            .set_workspace_pinned("wks_1", true)
+            .await
+            .expect("pin");
+        let error = session
+            .mark_workspace_unread("wks_1")
+            .await
+            .expect_err("nothing to mark");
+        assert!(error.to_string().contains("mark the workspace unread"));
+        session
+            .clear_workspace_attention(vec!["wks_1".into()])
+            .await
+            .expect("clear");
+        let created = session
+            .create_workspace(
+                &WorkspaceSource::Worktree {
+                    cwd: "/repo".into(),
+                    project_id: Some("prj_1".into()),
+                    base_ref: Some("main".into()),
+                },
+                Some("Scratch"),
+                "key-1",
+            )
+            .await
+            .expect("create");
+        assert_eq!(created.id, "wks_2");
+        session.rename_project("prj_1", None).await.expect("rename");
+        session
+            .set_project_icon("prj_1", Some(b"png"))
+            .await
+            .expect("icon");
+
+        let messages = daemon.await.expect("daemon task");
+        assert_eq!(messages[0]["page"]["limit"], WORKSPACE_PAGE_SIZE);
+        assert!(
+            messages[0].get("subscribe").is_none(),
+            "a page request never subscribes"
+        );
+        assert_eq!(messages[1]["title"], "New name");
+        assert_eq!(messages[2]["pinned"], true);
+        assert_eq!(messages[3]["workspaceId"], "wks_1");
+        assert_eq!(messages[4]["workspaceId"], json!(["wks_1"]));
+        assert_eq!(
+            messages[5]["source"],
+            json!({"kind":"worktree","cwd":"/repo","projectId":"prj_1","action":"branch-off","refName":"main"})
+        );
+        assert_eq!(messages[5]["title"], "Scratch");
+        assert_eq!(messages[5]["idempotencyKey"], "key-1");
+        assert_eq!(messages[6]["customName"], Value::Null);
+        assert_eq!(
+            messages[7]["source"],
+            json!({"type":"upload","data":"cG5n"})
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_requests_use_daemon_shapes() {
+        let (session, daemon) = mock_daemon(vec![
+            (
+                "daemon.get_status.response",
+                json!({"serverId":"srv-1","version":"0.9.2","pid":2795698,"nodePath":"/bin/node","startedAt":"2026-09-28T08:00:00Z","listen":"127.0.0.1:6767","relay":{"enabled":false,"endpoint":"relay.paseo.sh:443","publicEndpoint":null,"useTls":true,"publicUseTls":true},"providers":[{"provider":"claude","available":true,"error":null},{"provider":"pi","available":false,"error":"not installed"}]}),
+            ),
+            (
+                "status",
+                json!({"status":"restart_requested","clientId":"zaseo","reason":"Restarted from Zaseo"}),
+            ),
+            (
+                "daemon.update.response",
+                json!({"success":false,"error":"Update Paseo Desktop on the host.","previousVersion":null,"newVersion":null}),
+            ),
+            (
+                "paseo_worktree_list_response",
+                json!({"worktrees":[{"worktreePath":"/home/sr/.paseo/worktrees/3r36fnq4/prolific-snake","createdAt":"2026-09-23T12:01:55.734Z","branchName":"saanu-instinct-machine-tla","head":"46d836fd"}],"error":null}),
+            ),
+            (
+                "paseo_worktree_archive_response",
+                json!({"success":false,"error":{"code":"NOT_ALLOWED","message":"Only Paseo worktrees can be archived"}}),
+            ),
+        ]);
+        let status = session.daemon_status().await.expect("status");
+        assert_eq!(status.version.as_deref(), Some("0.9.2"));
+        assert_eq!(status.listen.as_deref(), Some("127.0.0.1:6767"));
+        assert_eq!(
+            status.relay.as_ref().map(|relay| relay.enabled),
+            Some(false)
+        );
+        assert_eq!(status.providers.len(), 2);
+        assert!(!status.providers[1].available);
+        session.restart_daemon().await.expect("restart");
+        let error = session.update_daemon().await.expect_err("desktop managed");
+        assert!(error.to_string().contains("Update Paseo Desktop"));
+        let worktrees = session.paseo_worktrees("/repo").await.expect("worktrees");
+        assert_eq!(
+            worktrees[0].branch.as_deref(),
+            Some("saanu-instinct-machine-tla")
+        );
+        let error = session
+            .archive_paseo_worktree("/repo")
+            .await
+            .expect_err("not a Paseo worktree");
+        assert!(error.to_string().contains("Only Paseo worktrees"));
+
+        let messages = daemon.await.expect("daemon task");
+        assert_eq!(messages[0]["type"], "daemon.get_status.request");
+        assert_eq!(messages[1]["type"], "restart_server_request");
+        assert_eq!(messages[3]["repoRoot"], "/repo");
+        assert_eq!(messages[4]["scope"], "worktree");
+        assert_eq!(messages[4]["worktreePath"], "/repo");
+    }
+
+    #[test]
+    fn new_workspace_request_uses_directory_or_worktree_source() {
+        assert_eq!(
+            workspace_source_value(&WorkspaceSource::Directory {
+                path: "/repo".into(),
+                project_id: Some("prj_1".into()),
+            }),
+            json!({"kind":"directory","path":"/repo","projectId":"prj_1"})
+        );
+        assert_eq!(
+            workspace_source_value(&WorkspaceSource::Worktree {
+                cwd: "/repo".into(),
+                project_id: None,
+                base_ref: None,
+            }),
+            json!({"kind":"worktree","cwd":"/repo","action":"branch-off"}),
+            "an unset base lets the daemon use the repository's default branch"
+        );
+    }
+
+    #[test]
+    fn workspace_events_become_events() {
+        let (events, receiver) = async_channel::unbounded();
+        emit_workspace_update(
+            &json!({"kind":"upsert","workspace":workspace_value("wks_1")}),
+            &events,
+        );
+        emit_workspace_update(
+            &json!({"kind":"remove","id":"wks_1","removedProjectId":"prj_1"}),
+            &events,
+        );
+        emit_project_update(&json!({"kind":"upsert","project":project_value()}), &events);
+        emit_project_update(&json!({"kind":"remove","projectId":"prj_1"}), &events);
+        emit_label_update(
+            &json!({"kind":"upsert","label":{"name":"review","color":"sky"},"previousName":"todo","generation":"g","seq":2}),
+            &events,
+        );
+        emit_label_update(
+            &json!({"kind":"remove","name":"review","generation":"g","seq":3}),
+            &events,
+        );
+        emit_workspace_update(
+            &json!({"kind":"upsert","workspace":{"id":"broken"}}),
+            &events,
+        );
+        assert!(matches!(
+            receiver.try_recv().expect("workspace upsert"),
+            PaseoEvent::WorkspaceUpserted(workspace) if workspace.id == "wks_1"
+        ));
+        assert!(matches!(
+            receiver.try_recv().expect("workspace remove"),
+            PaseoEvent::WorkspaceRemoved { workspace_id, removed_project_id }
+                if workspace_id == "wks_1" && removed_project_id.as_deref() == Some("prj_1")
+        ));
+        assert!(matches!(
+            receiver.try_recv().expect("project upsert"),
+            PaseoEvent::ProjectUpserted(project) if project.display_name == "dotfiles"
+        ));
+        assert!(matches!(
+            receiver.try_recv().expect("project remove"),
+            PaseoEvent::ProjectRemoved { project_id } if project_id == "prj_1"
+        ));
+        assert!(matches!(
+            receiver.try_recv().expect("label upsert"),
+            PaseoEvent::LabelUpserted { label, previous_name }
+                if label.color == "sky" && previous_name.as_deref() == Some("todo")
+        ));
+        assert!(matches!(
+            receiver.try_recv().expect("label remove"),
+            PaseoEvent::LabelRemoved { name } if name == "review"
+        ));
+        assert!(
+            receiver.try_recv().is_err(),
+            "an unreadable workspace emits nothing"
+        );
+    }
+
+    #[test]
+    fn subagent_updates_become_events() {
+        let (events, receiver) = async_channel::unbounded();
+        emit_subagent_update(
+            &json!({"kind":"upsert","subagent":subagent_value("completed")}),
+            &events,
+        );
+        emit_subagent_update(
+            &json!({"kind":"timeline","parentAgentId":"agent-1","subagentId":"task-1","provider":"claude","item":{"type":"assistant_message","text":"Done"},"timestamp":"now","seq":7,"epoch":"epoch-1"}),
+            &events,
+        );
+        emit_subagent_update(
+            &json!({"kind":"remove","parentAgentId":"agent-1","subagentId":"task-1"}),
+            &events,
+        );
+        emit_subagent_update(
+            &json!({"kind":"upsert","subagent":{"id":"broken"}}),
+            &events,
+        );
+        match receiver.try_recv().expect("upsert") {
+            PaseoEvent::SubagentUpserted(subagent) => assert_eq!(subagent.status, "completed"),
+            other => panic!("expected an upsert, got {other:?}"),
+        }
+        match receiver.try_recv().expect("timeline") {
+            PaseoEvent::TimelineEntry(entry) => {
+                assert_eq!(entry.agent_id, subagent_timeline_id("agent-1", "task-1"));
+                assert_eq!(entry.sequence, 7);
+            }
+            other => panic!("expected a timeline entry, got {other:?}"),
+        }
+        assert!(matches!(
+            receiver.try_recv().expect("remove"),
+            PaseoEvent::SubagentRemoved { subagent_id, .. } if subagent_id == "task-1"
+        ));
+        assert!(
+            receiver.try_recv().is_err(),
+            "an unreadable subagent emits nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_context_and_creation_attachments_use_daemon_shapes() {
+        let (session, daemon) = mock_daemon(vec![
+            (
+                "agent.fork_context.response",
+                json!({"agentId":"agent-1","attachment":{"type":"text","mimeType":"text/plain","contextKind":"chat_history","title":"Task","text":"history"},"itemCount":3,"boundaryMessageId":null,"error":null}),
+            ),
+            (
+                "agent.fork_context.response",
+                json!({"agentId":"agent-1","attachment":null,"itemCount":0,"boundaryMessageId":null,"error":"nothing to fork"}),
+            ),
+            (
+                "agent.create.response",
+                json!({"agent":agent(),"error":null}),
+            ),
+        ]);
+        let attachment = session.fork_context("agent-1").await.expect("fork context");
+        assert_eq!(attachment["contextKind"], "chat_history");
+        let error = session
+            .fork_context("agent-1")
+            .await
+            .expect_err("fork failure");
+        assert!(error.to_string().contains("nothing to fork"));
+        session
+            .create(CreateAgent {
+                provider: "codex".into(),
+                model: None,
+                directory: "/tmp/project".into(),
+                title: None,
+                initial_prompt: Some("continue".into()),
+                mode_id: None,
+                thinking_option_id: None,
+                images: vec![ImageAttachment {
+                    data_base64: "aGk=".into(),
+                    mime_type: "image/png".into(),
+                }],
+                attachments: vec![attachment],
+                worktree: None,
+                idempotency_key: "key".into(),
+            })
+            .await
+            .expect("create");
+        let messages = daemon.await.expect("daemon task");
+        assert_eq!(messages[0]["type"], "agent.fork_context.request");
+        assert_eq!(messages[0]["agentId"], "agent-1");
+        assert_eq!(messages[2]["attachments"][0]["text"], "history");
+        assert_eq!(
+            messages[2]["images"],
+            json!([{"data":"aGk=","mimeType":"image/png"}])
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_requests_use_daemon_shapes() {
+        let (session, daemon) = mock_daemon(vec![
+            (
+                "agent_archived",
+                json!({"agentId":"agent-1","archivedAt":"now"}),
+            ),
+            (
+                "status",
+                json!({"status":"agent_refreshed","agentId":"agent-1"}),
+            ),
+            ("agent_deleted", json!({"agentId":"agent-1"})),
+            (
+                "update_agent_response",
+                json!({"agentId":"agent-1","accepted":true,"error":null}),
+            ),
+            (
+                "update_agent_response",
+                json!({"agentId":"agent-1","accepted":false,"error":"title too long"}),
+            ),
+            (
+                "clear_agent_attention_response",
+                json!({"agentId":["agent-1","agent-2"],"agents":[]}),
+            ),
+            (
+                "status",
+                json!({"status":"agent_resumed","agentId":"agent-1"}),
+            ),
+        ]);
+        session.archive("agent-1").await.expect("archive");
+        session.unarchive("agent-1").await.expect("unarchive");
+        session.delete("agent-1").await.expect("delete");
+        session.rename("agent-1", "New name").await.expect("rename");
+        let error = session
+            .rename("agent-1", "Too long")
+            .await
+            .expect_err("rejected rename");
+        assert!(error.to_string().contains("title too long"));
+        session
+            .clear_attention(vec!["agent-1".into(), "agent-2".into()])
+            .await
+            .expect("clear attention");
+        session
+            .unarchive("agent-1")
+            .await
+            .expect_err("unexpected status");
+        let messages = daemon.await.expect("daemon task");
+        assert_eq!(messages[0]["type"], "archive_agent_request");
+        assert_eq!(messages[0]["agentId"], "agent-1");
+        assert_eq!(messages[1]["type"], "refresh_agent_request");
+        assert_eq!(messages[1]["agentId"], "agent-1");
+        assert_eq!(messages[2]["type"], "delete_agent_request");
+        assert_eq!(messages[3]["type"], "update_agent_request");
+        assert_eq!(messages[3]["name"], "New name");
+        assert_eq!(messages[5]["type"], "clear_agent_attention");
+        assert_eq!(messages[5]["agentId"], json!(["agent-1", "agent-2"]));
+    }
+
+    #[tokio::test]
+    async fn runtime_config_requests_surface_rejections() {
+        let accepted = json!({"agentId":"agent-1","accepted":true,"error":null});
+        let (session, daemon) = mock_daemon(vec![
+            ("set_agent_mode_response", accepted.clone()),
+            ("set_agent_model_response", accepted.clone()),
+            ("set_agent_thinking_response", accepted.clone()),
+            (
+                "set_agent_thinking_response",
+                json!({"agentId":"agent-1","accepted":false,"error":"unsupported option"}),
+            ),
+        ]);
+        session.set_mode("agent-1", "plan").await.expect("mode");
+        session.set_model("agent-1", None).await.expect("model");
+        session
+            .set_thinking("agent-1", Some("high"))
+            .await
+            .expect("thinking");
+        let error = session
+            .set_thinking("agent-1", Some("max"))
+            .await
+            .expect_err("rejected thinking");
+        assert!(error.to_string().contains("unsupported option"));
+        let messages = daemon.await.expect("daemon task");
+        assert_eq!(messages[0]["type"], "set_agent_mode_request");
+        assert_eq!(messages[0]["modeId"], "plan");
+        assert_eq!(messages[1]["type"], "set_agent_model_request");
+        assert!(messages[1]["modelId"].is_null());
+        assert!(messages[1].get("modelId").is_some());
+        assert_eq!(messages[2]["type"], "set_agent_thinking_request");
+        assert_eq!(messages[2]["thinkingOptionId"], "high");
+    }
+
+    #[tokio::test]
+    async fn permission_responses_carry_allow_and_deny_details() {
+        let (session, daemon) = mock_daemon(vec![
+            (
+                "agent_permission_resolved",
+                json!({"requestId":"permission-1"}),
+            ),
+            (
+                "agent_permission_resolved",
+                json!({"requestId":"permission-2"}),
+            ),
+            (
+                "agent_permission_resolved",
+                json!({"requestId":"permission-3"}),
+            ),
+        ]);
+        session
+            .respond_permission(
+                "permission-1",
+                PermissionResponse::Allow {
+                    selected_action_id: Some("implement".into()),
+                    updated_input: Some(json!({"answers":{"Color":"Blue"}})),
+                },
+            )
+            .await
+            .expect("allow");
+        session
+            .respond_permission(
+                "permission-2",
+                PermissionResponse::Deny {
+                    selected_action_id: None,
+                    message: Some("Dismissed by user".into()),
+                },
+            )
+            .await
+            .expect("deny");
+        session
+            .answer_permission("permission-3", false)
+            .await
+            .expect("plain deny");
+        let messages = daemon.await.expect("daemon task");
+        assert_eq!(messages[0]["type"], "agent_permission_response");
+        assert_eq!(messages[0]["requestId"], "permission-1");
+        assert_eq!(
+            messages[0]["response"],
+            json!({"behavior":"allow","selectedActionId":"implement","updatedInput":{"answers":{"Color":"Blue"}}})
+        );
+        assert_eq!(
+            messages[1]["response"],
+            json!({"behavior":"deny","message":"Dismissed by user"})
+        );
+        assert_eq!(messages[2]["response"], json!({"behavior":"deny"}));
+    }
+
+    #[tokio::test]
+    async fn commands_are_listed_for_agents_and_drafts() {
+        let (session, daemon) = mock_daemon(vec![
+            (
+                "list_commands_response",
+                json!({"agentId":"agent-1","commands":[{"name":"review","description":"Review code","argumentHint":"","kind":"skill"}],"error":null}),
+            ),
+            (
+                "list_commands_response",
+                json!({"agentId":"draft","commands":[{"name":"init","description":"Initialize","argumentHint":"<path>"}],"error":null}),
+            ),
+        ]);
+        let commands = session
+            .list_commands(Some("agent-1"), None)
+            .await
+            .expect("agent commands");
+        assert_eq!(
+            commands,
+            vec![AgentCommand {
+                name: "review".into(),
+                description: "Review code".into(),
+                argument_hint: None,
+                kind: Some("skill".into()),
+            }]
+        );
+        let draft_commands = session
+            .list_commands(
+                None,
+                Some(DraftConfig {
+                    provider: "codex".into(),
+                    cwd: "/tmp/project".into(),
+                    mode_id: Some("plan".into()),
+                    model: None,
+                    thinking_option_id: Some("high".into()),
+                }),
+            )
+            .await
+            .expect("draft commands");
+        assert_eq!(draft_commands[0].argument_hint.as_deref(), Some("<path>"));
+        assert!(session.list_commands(None, None).await.is_err());
+        let messages = daemon.await.expect("daemon task");
+        assert_eq!(messages[0]["type"], "list_commands_request");
+        assert_eq!(messages[0]["agentId"], "agent-1");
+        assert!(messages[0].get("draftConfig").is_none());
+        assert!(
+            messages[1]["agentId"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
+        assert_eq!(
+            messages[1]["draftConfig"],
+            json!({"provider":"codex","cwd":"/tmp/project","modeId":"plan","thinkingOptionId":"high"})
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_suggestions_use_entries_or_legacy_directories() {
+        let (session, daemon) = mock_daemon(vec![
+            (
+                "directory_suggestions_response",
+                json!({"directories":["src"],"entries":[{"path":"src","kind":"directory"},{"path":"src/main.rs","kind":"file"}],"error":null}),
+            ),
+            (
+                "directory_suggestions_response",
+                json!({"directories":["/home/user/project"],"error":null}),
+            ),
+        ]);
+        let suggestions = session
+            .directory_suggestions("src", Some("/tmp/project"), true, true, 20)
+            .await
+            .expect("suggestions");
+        assert_eq!(
+            suggestions,
+            vec![
+                DirectorySuggestion {
+                    path: "src".into(),
+                    is_directory: true
+                },
+                DirectorySuggestion {
+                    path: "src/main.rs".into(),
+                    is_directory: false
+                },
+            ]
+        );
+        let legacy = session
+            .directory_suggestions("proj", None, false, true, 10)
+            .await
+            .expect("legacy suggestions");
+        assert_eq!(legacy[0].path, "/home/user/project");
+        assert!(legacy[0].is_directory);
+        assert!(
+            session
+                .directory_suggestions("x", None, false, true, 0)
+                .await
+                .is_err()
+        );
+        let messages = daemon.await.expect("daemon task");
+        assert_eq!(
+            messages[0],
+            json!({"type":"directory_suggestions_request","requestId":messages[0]["requestId"],"query":"src","cwd":"/tmp/project","includeFiles":true,"includeDirectories":true,"limit":20})
+        );
+        assert!(messages[1].get("cwd").is_none());
+    }
+
+    #[tokio::test]
+    async fn archived_agents_page_through_history_and_skip_active_agents() {
+        let archived = json!({"id":"archived-1", "status":"closed", "cwd":"/tmp/project", "archivedAt":"2026-09-01T00:00:00Z"});
+        let (session, daemon) = mock_daemon(vec![
+            (
+                "fetch_agent_history_response",
+                json!({"entries":[{"agent":agent(),"project":null},{"agent":archived,"project":{"projectKey":"p","projectName":"Project"}}],"pageInfo":{"hasMore":true,"nextCursor":"next","prevCursor":null}}),
+            ),
+            (
+                "fetch_agent_history_response",
+                json!({"entries":[{"agent":{"id":"archived-2","status":"idle","cwd":"/tmp/project","archivedAt":"2026-08-01T00:00:00Z"}}],"pageInfo":{"hasMore":false,"nextCursor":null,"prevCursor":null}}),
+            ),
+        ]);
+        let agents = session.archived_agents().await.expect("archived agents");
+        assert_eq!(
+            agents
+                .iter()
+                .map(|agent| agent.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["archived-1", "archived-2"]
+        );
+        assert_eq!(
+            agents[0].project.as_ref().expect("project")["projectName"],
+            "Project"
+        );
+        assert_eq!(agents[1].project, None);
+        let messages = daemon.await.expect("daemon task");
+        assert_eq!(messages[0]["type"], "fetch_agent_history_request");
+        assert_eq!(messages[0]["filter"], json!({"includeArchived":true}));
+        assert_eq!(
+            messages[0]["sort"],
+            json!([{"key":"updated_at","direction":"desc"}])
+        );
+        assert_eq!(messages[0]["page"], json!({"limit":200}));
+        assert_eq!(messages[1]["page"], json!({"limit":200,"cursor":"next"}));
+    }
+
+    #[tokio::test]
+    async fn send_message_can_steer_with_images() {
+        let (session, daemon) = mock_daemon(vec![
+            (
+                "send_agent_message_response",
+                json!({"agentId":"agent-1","accepted":true,"error":null}),
+            ),
+            (
+                "send_agent_message_response",
+                json!({"agentId":"agent-1","accepted":true,"error":null}),
+            ),
+        ]);
+        session
+            .send_message(SendMessage {
+                agent_id: "agent-1".into(),
+                text: "also check tests".into(),
+                message_id: "message-2".into(),
+                behavior: Some(ActiveTurnBehavior::Steer),
+                images: vec![ImageAttachment {
+                    data_base64: "aGVsbG8=".into(),
+                    mime_type: "image/png".into(),
+                }],
+            })
+            .await
+            .expect("steer");
+        session
+            .send("agent-1", "plain", "message-3")
+            .await
+            .expect("plain send");
+        let messages = daemon.await.expect("daemon task");
+        assert_eq!(messages[0]["type"], "send_agent_message_request");
+        assert_eq!(messages[0]["messageId"], "message-2");
+        assert_eq!(messages[0]["activeTurnBehavior"], "steer");
+        assert_eq!(
+            messages[0]["images"],
+            json!([{"data":"aGVsbG8=","mimeType":"image/png"}])
+        );
+        assert!(messages[1].get("activeTurnBehavior").is_none());
+        assert!(messages[1].get("images").is_none());
+    }
+
+    #[tokio::test]
+    async fn status_reply_completes_matching_request_only() {
+        let (reply, response) = oneshot::channel();
+        let mut pending = HashMap::from([(
+            "refresh-1".to_string(),
+            Pending {
+                message: json!({"type":"refresh_agent_request", "requestId":"refresh-1"}),
+                response_type: "status",
+                retry_creation: false,
+                reply,
+            },
+        )]);
+        let (events, _) = async_channel::unbounded();
+        handle_message(
+            &json!({"type":"status", "payload":{"status":"agent_refreshed", "agentId":"agent-1", "requestId":"refresh-1", "timelineSize":3}}),
+            &mut pending,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &events,
+            &mut TimelineSubscriptions::default(),
+        );
+        let payload = response.await.expect("reply").expect("status payload");
+        assert_eq!(payload["status"], "agent_refreshed");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn agent_updates_carry_project_placement() {
+        let (events, receiver) = async_channel::unbounded();
+        let mut agents = HashMap::new();
+        handle_message(
+            &json!({"type":"agent_update", "payload":{"kind":"upsert", "agent":agent(), "project":{"projectKey":"p","projectName":"Project"}}}),
+            &mut HashMap::new(),
+            &mut agents,
+            &mut HashMap::new(),
+            &events,
+            &mut TimelineSubscriptions::default(),
+        );
+        assert_eq!(
+            agents["agent-1"].project.as_ref().expect("project")["projectName"],
+            "Project"
+        );
+        handle_message(
+            &json!({"type":"agent_update", "payload":{"kind":"upsert", "agent":agent(), "project":null}}),
+            &mut HashMap::new(),
+            &mut agents,
+            &mut HashMap::new(),
+            &events,
+            &mut TimelineSubscriptions::default(),
+        );
+        assert_eq!(agents["agent-1"].project, None);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(PaseoEvent::AgentsChanged(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_frames_route_by_subscription_slot() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock daemon");
+        let port = listener.local_addr().expect("mock address").port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let mut socket = server_socket(stream).await;
+            let subscribe = next_request(&mut socket, "subscribe_terminal_request").await;
+            assert_eq!(subscribe["restore"]["mode"], "visible-snapshot");
+            assert_eq!(subscribe["restore"]["size"], json!({"rows":24,"cols":80}));
+            send_json(&mut socket, json!({"type":"session", "message":{"type":"subscribe_terminal_response", "payload":{"requestId":subscribe["requestId"],"terminalId":"terminal-1","slot":3,"subscriptionId":"subscription-1","error":null}}})).await;
+            socket
+                .send(Message::Binary(vec![0x05, 3, b'h', b'i'].into()))
+                .await
+                .expect("send restore");
+            socket
+                .send(Message::Binary(vec![0x01, 9, b'x'].into()))
+                .await
+                .expect("send unknown slot");
+            socket
+                .send(Message::Binary(vec![0x01, 3, b'\n'].into()))
+                .await
+                .expect("send output");
+            let input = next_request(&mut socket, "terminal_input").await;
+            assert_eq!(input["message"], json!({"type":"input","data":"ls\r"}));
+            assert!(input.get("requestId").is_none());
+            let release = next_request(&mut socket, "subscription.release.request").await;
+            assert_eq!(release["subscriptionId"], "subscription-1");
+            socket
+                .send(Message::Binary(vec![0x01, 3, b'z'].into()))
+                .await
+                .expect("send output after release");
+            send_json(&mut socket, json!({"type":"session", "message":{"type":"terminal_stream_exit", "payload":{"terminalId":"terminal-1"}}})).await;
+        });
+        let (session, events) = connect(target(port), None, "test-client".into())
+            .await
+            .expect("connect");
+        let subscription = session
+            .subscribe_terminal("terminal-1", 24, 80)
+            .await
+            .expect("subscribe terminal");
+        assert_eq!(subscription.as_deref(), Some("subscription-1"));
+        let mut outputs = Vec::new();
+        while outputs.len() < 2 {
+            let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("terminal output timed out")
+                .expect("event receiver closed");
+            if let PaseoEvent::TerminalOutput {
+                terminal_id,
+                bytes,
+                restore,
+            } = event
+            {
+                outputs.push((terminal_id, bytes, restore));
+            }
+        }
+        assert_eq!(
+            outputs,
+            vec![
+                ("terminal-1".to_owned(), b"hi".to_vec(), true),
+                ("terminal-1".to_owned(), b"\n".to_vec(), false),
+            ]
+        );
+        session
+            .terminal_input("terminal-1", "ls\r".into())
+            .await
+            .expect("terminal input");
+        session
+            .release_terminal("terminal-1", subscription.as_deref())
+            .await
+            .expect("release terminal");
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("terminal exit timed out")
+                .expect("event receiver closed");
+            match event {
+                PaseoEvent::TerminalExited { terminal_id, error } => {
+                    assert_eq!((terminal_id.as_str(), error), ("terminal-1", None));
+                    break;
+                }
+                PaseoEvent::TerminalOutput { .. } => panic!("output routed after release"),
+                _ => {}
+            }
+        }
+        server.await.expect("mock daemon task");
+    }
+
+    #[tokio::test]
+    async fn usage_rewind_and_checkout_requests_use_daemon_shapes() {
+        let (session, daemon) = mock_daemon(vec![
+            (
+                "provider.usage.list.response",
+                json!({"fetchedAt":"2026-09-26T10:00:00Z","providers":[{"providerId":"claude","displayName":"Claude","status":"available","planLabel":"Max","windows":[{"id":"5h","label":"5-hour","usedPct":42,"resetsAt":"2026-09-26T12:00:00Z"},{"id":"week","label":"Weekly","remainingPct":75}],"balances":[{"id":"credits","label":"Credits","remaining":12.5,"unit":"usd"}],"details":[{"id":"org","label":"Org","value":"Acme"}]}]}),
+            ),
+            (
+                "agent.rewind.response",
+                json!({"agentId":"agent-1","ok":false,"error":"Cannot rewind before the provider acknowledges the submitted prompt"}),
+            ),
+            (
+                "checkout_status_response",
+                json!({"cwd":"/tmp/project","isGit":true,"isPaseoOwnedWorktree":false,"repoRoot":"/tmp/project","currentBranch":"main","isDirty":true,"baseRef":"origin/main","aheadBehind":{"ahead":2,"behind":1},"aheadOfOrigin":2,"behindOfOrigin":0,"hasRemote":true,"remoteUrl":null,"error":null}),
+            ),
+            (
+                "checkout.diff.get.response",
+                json!({"cwd":"/tmp/project","files":[{"path":"src/main.rs","isNew":false,"isDeleted":false,"additions":1,"deletions":1,"hunks":[{"oldStart":1,"oldCount":1,"newStart":1,"newCount":1,"lines":[{"type":"remove","content":"old"},{"type":"add","content":"new"}]}]},{"path":"logo.png","isNew":true,"isDeleted":false,"additions":0,"deletions":0,"hunks":[],"status":"binary"}],"error":null}),
+            ),
+            (
+                "checkout_commit_response",
+                json!({"cwd":"/tmp/project","success":false,"error":{"code":"UNKNOWN","message":"nothing to commit"}}),
+            ),
+        ]);
+        let usage = session.provider_usage().await.expect("usage");
+        assert_eq!(usage[0].plan_label.as_deref(), Some("Max"));
+        assert_eq!(usage[0].windows[0].used_percent, Some(42.0));
+        assert_eq!(usage[0].windows[1].used_percent, Some(25.0));
+        assert_eq!(usage[0].balances[0].remaining, Some(12.5));
+        assert_eq!(usage[0].details[0].value, "Acme");
+        let rewind = session
+            .rewind("agent-1", "message-1", RewindMode::Both)
+            .await
+            .expect_err("rewind refused");
+        assert!(rewind.to_string().contains("acknowledges"));
+        let status = session
+            .checkout_status("/tmp/project")
+            .await
+            .expect("status");
+        assert_eq!(
+            (
+                status.current_branch.as_deref(),
+                status.ahead_of_base,
+                status.behind_base
+            ),
+            (Some("main"), 2, 1)
+        );
+        let diff = session
+            .checkout_diff("/tmp/project", DiffCompare::Base)
+            .await
+            .expect("diff");
+        assert_eq!(diff.files[0].hunks[0].lines[1].kind, DiffLineKind::Added);
+        assert_eq!(diff.files[1].status.as_deref(), Some("binary"));
+        let commit = session
+            .commit("/tmp/project", "  ")
+            .await
+            .expect_err("commit refused");
+        assert!(commit.to_string().contains("nothing to commit"));
+        let messages = daemon.await.expect("daemon task");
+        assert_eq!(messages[1]["messageId"], "message-1");
+        assert_eq!(messages[1]["mode"], "both");
+        assert_eq!(messages[3]["compare"], json!({"mode":"base"}));
+        assert_eq!(messages[4]["addAll"], true);
+        assert!(messages[4].get("message").is_none());
+    }
+
+    #[tokio::test]
+    async fn worktree_creation_branches_off() {
+        let (session, daemon) = mock_daemon(vec![(
+            "agent.create.response",
+            json!({"agent":agent(),"error":null}),
+        )]);
+        session
+            .create(CreateAgent {
+                provider: "codex".into(),
+                model: None,
+                directory: "/tmp/project".into(),
+                title: None,
+                initial_prompt: Some("go".into()),
+                mode_id: None,
+                thinking_option_id: None,
+                images: Vec::new(),
+                attachments: Vec::new(),
+                worktree: Some(WorktreeTarget {
+                    new_branch: "fix-login".into(),
+                    base: Some("refs/remotes/origin/main".into()),
+                }),
+                idempotency_key: "key".into(),
+            })
+            .await
+            .expect("create");
+        let messages = daemon.await.expect("daemon task");
+        assert_eq!(
+            messages[0]["worktree"],
+            json!({"mode":"branch-off","newBranch":"fix-login","base":"refs/remotes/origin/main"})
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_decodes_base64_from_the_filesystem_root() {
+        let (session, daemon) = mock_daemon(vec![
+            (
+                "file_explorer_response",
+                json!({"cwd":"/","path":"tmp/a.png","mode":"file","directory":null,"file":{"path":"tmp/a.png","kind":"image","encoding":"base64","content":"iVBORw==","mimeType":"image/png","size":4},"error":null}),
+            ),
+            (
+                "file_explorer_response",
+                json!({"cwd":"/","path":"tmp/gone.png","mode":"file","directory":null,"file":null,"error":"File not found"}),
+            ),
+        ]);
+        let file = session.read_file("/tmp/a.png").await.expect("file");
+        assert_eq!(
+            file,
+            FileContent {
+                bytes: vec![0x89, b'P', b'N', b'G'],
+                mime_type: "image/png".into(),
+            }
+        );
+        let missing = session
+            .read_file("/tmp/gone.png")
+            .await
+            .expect_err("missing file");
+        assert!(missing.to_string().contains("File not found"));
+        assert!(session.read_file("relative.png").await.is_err());
+        let messages = daemon.await.expect("daemon task");
+        assert_eq!(
+            (
+                &messages[0]["cwd"],
+                &messages[0]["path"],
+                &messages[0]["mode"]
+            ),
+            (&json!("/"), &json!("tmp/a.png"), &json!("file"))
+        );
+        assert!(messages[0].get("acceptBinary").is_none());
+    }
+
+    #[tokio::test]
+    async fn branch_suggestions_read_details_and_fall_back_to_names() {
+        let (session, daemon) = mock_daemon(vec![
+            (
+                "branch_suggestions_response",
+                json!({"branches":["main"],"branchDetails":[{"name":"main","committerDate":1790537870,"hasLocal":true,"hasRemote":true,"localAhead":0,"localBehind":9}],"error":null}),
+            ),
+            (
+                "branch_suggestions_response",
+                json!({"branches":["legacy"],"error":null}),
+            ),
+            (
+                "checkout_status_response",
+                json!({"cwd":"/tmp/project","isGit":true,"currentBranch":"feature","upstreamRef":"refs/remotes/upstream/feature","error":null}),
+            ),
+        ]);
+        let detailed = session
+            .branch_suggestions("/tmp/project", "  ", 20)
+            .await
+            .expect("suggestions");
+        assert_eq!(
+            detailed,
+            vec![BranchSuggestion {
+                name: "main".into(),
+                committer_date: Some(1790537870),
+                has_local: Some(true),
+                has_remote: Some(true),
+                local_ahead: Some(0),
+                local_behind: Some(9),
+            }]
+        );
+        let legacy = session
+            .branch_suggestions("/tmp/project", "leg", 20)
+            .await
+            .expect("legacy suggestions");
+        assert_eq!(legacy[0].name, "legacy");
+        assert_eq!(legacy[0].has_remote, None);
+        let status = session
+            .checkout_status("/tmp/project")
+            .await
+            .expect("status");
+        assert_eq!(
+            status.upstream_ref.as_deref(),
+            Some("refs/remotes/upstream/feature")
+        );
+        let messages = daemon.await.expect("daemon task");
+        assert!(messages[0].get("query").is_none());
+        assert_eq!(messages[0]["limit"], 20);
+        assert_eq!(messages[1]["query"], "leg");
     }
 }

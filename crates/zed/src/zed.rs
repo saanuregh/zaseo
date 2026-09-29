@@ -78,7 +78,6 @@ use settings::{
     SettingsFile, SettingsStore, VIM_KEYMAP_PATH, initial_local_debug_tasks_content,
     initial_project_settings_content, initial_tasks_content, update_settings_file,
 };
-use sidebar::Sidebar;
 #[cfg(debug_assertions)]
 use workspace::workspace_error::{ErrorAction, ErrorSeverity, WorkspaceError};
 
@@ -501,7 +500,6 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                 .unwrap_or(true)
         });
 
-        let window_handle = window.window_handle();
         let multi_workspace_handle = cx.entity();
         cx.subscribe_in(
             &multi_workspace_handle,
@@ -534,18 +532,6 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             },
         )
         .detach();
-
-        cx.defer(move |cx| {
-            window_handle
-                .update(cx, |_, window, cx| {
-                    let sidebar =
-                        cx.new(|cx| Sidebar::new(multi_workspace_handle.clone(), window, cx));
-                    multi_workspace_handle.update(cx, |multi_workspace, cx| {
-                        multi_workspace.register_sidebar(sidebar, cx);
-                    });
-                })
-                .ok();
-        });
     })
     .detach();
 
@@ -615,6 +601,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let pending_keystrokes_indicator =
             cx.new(|cx| which_key::PendingKeystrokesIndicator::new(window, cx));
         let image_info = cx.new(|_cx| ImageInfo::new(workspace));
+        let paseo_usage = cx.new(paseo_ui::UsageStatusItem::new);
 
         let lsp_button_menu_handle = PopoverMenuHandle::default();
         let lsp_button =
@@ -640,6 +627,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_left_item(git_blame_status, window, cx);
             status_bar.add_left_item(merge_conflict_indicator, window, cx);
             status_bar.add_left_item(activity_indicator, window, cx);
+            status_bar.add_right_item(paseo_usage, window, cx);
             status_bar.add_right_item(edit_prediction_ui, window, cx);
             status_bar.add_right_item(active_buffer_encoding, window, cx);
             status_bar.add_right_item(active_buffer_language, window, cx);
@@ -782,8 +770,6 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         let outline_panel = OutlinePanel::load(workspace_handle.clone(), cx.clone());
         let terminal_panel = TerminalPanel::load(workspace_handle.clone(), cx.clone());
         let git_panel = GitPanel::load(workspace_handle.clone(), cx.clone());
-        let channels_panel =
-            collab_ui::collab_panel::CollabPanel::load(workspace_handle.clone(), cx.clone());
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
 
         async fn add_panel_when_ready(
@@ -807,7 +793,6 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             add_panel_when_ready(outline_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(terminal_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
             initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
         );
@@ -1328,14 +1313,6 @@ fn register_actions(
         )
         .register_action(
             |workspace: &mut Workspace,
-             _: &collab_ui::collab_panel::ToggleFocus,
-             window: &mut Window,
-             cx: &mut Context<Workspace>| {
-                workspace.toggle_panel_focus::<collab_ui::collab_panel::CollabPanel>(window, cx);
-            },
-        )
-        .register_action(
-            |workspace: &mut Workspace,
              _: &terminal_panel::ToggleFocus,
              window: &mut Window,
              cx: &mut Context<Workspace>| {
@@ -1528,6 +1505,8 @@ fn initialize_pane(
             toolbar.add_item(commit_view_toolbar, window, cx);
             let agent_diff_toolbar = cx.new(AgentDiffToolbar::new);
             toolbar.add_item(agent_diff_toolbar, window, cx);
+            let paseo_edits_toolbar = cx.new(paseo_ui::AgentEditsToolbar::new);
+            toolbar.add_item(paseo_edits_toolbar, window, cx);
             let basedpyright_banner = cx.new(|cx| BasedPyrightBanner::new(workspace, cx));
             toolbar.add_item(basedpyright_banner, window, cx);
             let image_view_toolbar = cx.new(|_| image_viewer::ImageViewToolbarControls::new());
@@ -2531,51 +2510,153 @@ fn open_paseo_workspace(
             return;
         }
     };
-    let target = match paseo_editor_target(&selected.target, &selected.directory) {
-        Ok(target) => target,
+    match paseo_editor_target(&selected.target, &selected.directory) {
+        Ok(PaseoEditorTarget::NoEditorMapping) => {
+            workspace.show_error(
+                "Add an editor SSH mapping to open this remote Paseo workspace",
+                cx,
+            );
+            return;
+        }
+        Ok(_) => {}
         Err(error) => {
             workspace.show_error(error, cx);
             return;
         }
+    }
+    let switch = switch_paseo_project(selected, None, workspace, window, cx);
+    cx.spawn_in(window, async move |workspace, cx| {
+        if let Err(error) = switch.await {
+            workspace.update(cx, |workspace, cx| workspace.show_error(error, cx))?;
+        }
+        anyhow::Ok(())
+    })
+    .detach_and_log_err(cx);
+}
+
+/// Hides actions that open projects by hand or reach Zed's own services from the command
+/// palette, because Zaseo opens projects from agents and has no Zed account.
+pub fn hide_zed_only_actions(cx: &mut App) {
+    let hidden = [
+        std::any::TypeId::of::<workspace::Open>(),
+        std::any::TypeId::of::<workspace::OpenFiles>(),
+        std::any::TypeId::of::<workspace::AddFolderToProject>(),
+        std::any::TypeId::of::<zed_actions::OpenRecent>(),
+        std::any::TypeId::of::<zed_actions::OpenRemote>(),
+        std::any::TypeId::of::<git::Clone>(),
+        std::any::TypeId::of::<zed_actions::feedback::FileBugReport>(),
+        std::any::TypeId::of::<zed_actions::feedback::RequestFeature>(),
+        std::any::TypeId::of::<zed_actions::feedback::EmailZed>(),
+        std::any::TypeId::of::<feedback::OpenZedRepo>(),
+        std::any::TypeId::of::<workspace::ToggleWorkspaceSidebar>(),
+        std::any::TypeId::of::<workspace::FocusWorkspaceSidebar>(),
+    ];
+    command_palette_hooks::CommandPaletteFilter::update_global(cx, |filter, _| {
+        filter.hide_action_types(&hidden);
+    });
+}
+
+/// Whether a workspace's project already covers `directory` on the same host, so an agent
+/// working there needs no project switch.
+fn workspace_holds_directory(
+    workspace: &Workspace,
+    directory: &Path,
+    host: Option<&remote::RemoteConnectionOptions>,
+    cx: &App,
+) -> bool {
+    workspace.project_group_key(cx).host().as_ref() == host
+        && workspace
+            .root_paths(cx)
+            .iter()
+            .any(|root| directory.starts_with(root))
+}
+
+/// Activates the window's project for a Paseo agent's directory, opening it when no open
+/// project covers it. Resolves to `None` when the current project already does, or when a
+/// remote agent has no editor SSH mapping to open.
+pub fn switch_paseo_project(
+    selected: paseo_ui::SelectedWorkspace,
+    mut init: Option<paseo_ui::WorkspaceInit>,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Task<anyhow::Result<Option<Entity<Workspace>>>> {
+    let host = match paseo_editor_target(&selected.target, &selected.directory) {
+        Ok(PaseoEditorTarget::Local) => None,
+        Ok(PaseoEditorTarget::Ssh {
+            host,
+            username,
+            port,
+        }) => Some(remote::RemoteConnectionOptions::Ssh(
+            RemoteSettings::get_global(cx).connection_options_for(host, port, username),
+        )),
+        Ok(PaseoEditorTarget::NoEditorMapping) => return Task::ready(Ok(None)),
+        Err(error) => return Task::ready(Err(error)),
     };
-    if target == PaseoEditorTarget::NoEditorMapping {
-        workspace.show_error(
-            "Add an editor SSH mapping to open this remote Paseo workspace",
-            cx,
-        );
-        return;
+    if workspace_holds_directory(workspace, &selected.directory, host.as_ref(), cx) {
+        return Task::ready(Ok(None));
     }
     let Some(window_handle) = window.window_handle().downcast::<MultiWorkspace>() else {
-        workspace.show_error("Paseo needs a workspace window to open files", cx);
-        return;
+        return Task::ready(Ok(None));
     };
     let app_state = workspace.app_state().clone();
-    cx.spawn_in(window, async move |workspace, cx| {
-        let result = match target {
-            PaseoEditorTarget::Local => {
-                match window_handle.update(cx, |multi_workspace, window, cx| {
-                    multi_workspace.open_project(
-                        vec![selected.directory],
-                        workspace::OpenMode::Activate,
-                        window,
-                        cx,
-                    )
-                }) {
-                    Ok(task) => task.await.map(|_| ()),
-                    Err(error) => Err(error),
+    let directory = selected.directory;
+    cx.spawn_in(window, async move |_, cx| {
+        let existing = window_handle.update(cx, |multi_workspace, _window, cx| {
+            multi_workspace
+                .workspaces()
+                .find(|workspace| {
+                    workspace_holds_directory(workspace.read(cx), &directory, host.as_ref(), cx)
+                })
+                .cloned()
+        })?;
+        if let Some(existing) = existing {
+            window_handle.update(cx, |multi_workspace, window, cx| {
+                if let Some(init) = init.take() {
+                    existing.update(cx, |workspace, cx| init(workspace, window, cx));
                 }
+                multi_workspace.activate(existing.clone(), None, window, cx);
+            })?;
+            return Ok(Some(existing));
+        }
+        match host {
+            None => {
+                let open = window_handle.update(cx, |multi_workspace, window, cx| {
+                    let current_is_empty = multi_workspace
+                        .workspace()
+                        .read(cx)
+                        .project()
+                        .read(cx)
+                        .visible_worktrees(cx)
+                        .next()
+                        .is_none();
+                    // `open_project` replaces an empty starting workspace, prompting to save
+                    // its buffers, so it stays in charge of that case.
+                    if current_is_empty {
+                        multi_workspace.open_project(
+                            vec![directory],
+                            workspace::OpenMode::Activate,
+                            window,
+                            cx,
+                        )
+                    } else {
+                        multi_workspace.find_or_create_local_workspace(
+                            workspace::PathList::new(&[directory]),
+                            None,
+                            init.take(),
+                            workspace::OpenMode::Activate,
+                            None,
+                            window,
+                            cx,
+                        )
+                    }
+                })?;
+                Ok(Some(open.await?))
             }
-            PaseoEditorTarget::Ssh {
-                host,
-                username,
-                port,
-            } => {
-                let connection = remote::RemoteConnectionOptions::Ssh(cx.update(|_, cx| {
-                    RemoteSettings::get_global(cx).connection_options_for(host, port, username)
-                })?);
+            Some(connection) => {
                 open_remote_project(
                     connection,
-                    vec![selected.directory],
+                    vec![directory],
                     app_state,
                     workspace::OpenOptions {
                         requesting_window: Some(window_handle),
@@ -2584,17 +2665,13 @@ fn open_paseo_workspace(
                     },
                     cx,
                 )
-                .await
-                .map(|_| ())
+                .await?;
+                let active = window_handle
+                    .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())?;
+                Ok(Some(active))
             }
-            PaseoEditorTarget::NoEditorMapping => Ok(()),
-        };
-        if let Err(error) = result {
-            workspace.update(cx, |workspace, cx| workspace.show_error(error, cx))?;
         }
-        anyhow::Ok(())
     })
-    .detach_and_log_err(cx);
 }
 
 #[cfg(test)]
@@ -5045,7 +5122,8 @@ mod tests {
             .unwrap();
         let cx = &mut VisualTestContext::from_window(*window, cx);
 
-        let mouse_position = point(px(250.), px(250.));
+        // Past the Paseo agents panel, which starts open in the left dock.
+        let mouse_position = point(px(1000.), px(300.));
 
         let event_modifiers = {
             #[cfg(target_os = "macos")]
@@ -5788,6 +5866,44 @@ mod tests {
 
     /// The unbind above only targets `workspace::NewFile` / `file_finder::Toggle`, so the narrower
     /// `ctrl-n` and `ctrl-p` bindings still win where they apply.
+    /// Like Paseo's desktop app, Enter in the composer sends (steering a running agent) and
+    /// Ctrl-Enter queues the message until the agent finishes.
+    #[gpui::test]
+    fn test_paseo_composer_enter_sends_and_ctrl_enter_queues(cx: &mut TestAppContext) {
+        init_keymap_test(cx);
+        cx.update(|cx| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                "keymaps/default-linux.json",
+                cx,
+            )
+            .unwrap();
+            let keymap = gpui::Keymap::new(bindings);
+            let contexts = [
+                "Workspace",
+                "Pane",
+                "PaseoAgentView",
+                "PaseoComposer",
+                "Editor mode=auto_height",
+            ]
+            .map(|context| gpui::KeyContext::parse(context).unwrap());
+            let first_action = |keystroke: &str| {
+                keymap
+                    .bindings_for_input(&[gpui::Keystroke::parse(keystroke).unwrap()], &contexts)
+                    .0
+                    .first()
+                    .map(|binding| binding.action().name().to_string())
+            };
+            assert_eq!(
+                first_action("enter").as_deref(),
+                Some("paseo_ui::SendMessage")
+            );
+            assert_eq!(
+                first_action("ctrl-enter").as_deref(),
+                Some("paseo_ui::QueueMessage")
+            );
+        });
+    }
+
     #[gpui::test]
     fn test_emacs_cursor_keys_keep_narrower_bindings(cx: &mut TestAppContext) {
         init_keymap_test(cx);
@@ -6164,6 +6280,7 @@ mod tests {
                 "outline",
                 "outline_panel",
                 "pane",
+                "paseo_ui",
                 "picker",
                 "project_panel",
                 "project_search",
@@ -6477,7 +6594,7 @@ mod tests {
         let first = cx.read(|cx| {
             workspace
                 .read(cx)
-                .item_of_type::<paseo_ui::PaseoTab>(cx)
+                .item_of_type::<paseo_ui::AgentTab>(cx)
                 .expect("Paseo tab")
                 .entity_id()
         });
@@ -6486,7 +6603,7 @@ mod tests {
         let second = cx.read(|cx| {
             workspace
                 .read(cx)
-                .item_of_type::<paseo_ui::PaseoTab>(cx)
+                .item_of_type::<paseo_ui::AgentTab>(cx)
                 .expect("Paseo tab after repeated action")
                 .entity_id()
         });
@@ -6499,6 +6616,402 @@ mod tests {
                 .read(cx)
                 .has_notification(&NotificationId::unique::<&'static str>())
         }));
+    }
+
+    /// A window whose project holds `/root/main.rs`, opened in an editor.
+    async fn paseo_window_with_main_rs(
+        cx: &mut TestAppContext,
+    ) -> (
+        WindowHandle<MultiWorkspace>,
+        Entity<Workspace>,
+        Entity<Editor>,
+    ) {
+        let app_state = init_test(cx);
+        cx.update(init);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/root"),
+                json!({"main.rs": "fn main() {\n    let count: u32 = \"one\";\n}\n"}),
+            )
+            .await;
+        let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        cx.run_until_parked();
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("workspace window");
+        let editor = open_main_rs(window, &workspace, cx).await;
+        (window, workspace, editor)
+    }
+
+    async fn open_main_rs(
+        window: WindowHandle<MultiWorkspace>,
+        workspace: &Entity<Workspace>,
+        cx: &mut TestAppContext,
+    ) -> Entity<Editor> {
+        let open = window
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.open_abs_path(
+                        PathBuf::from(path!("/root/main.rs")),
+                        OpenOptions::default(),
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .expect("workspace window");
+        open.await
+            .expect("opens main.rs")
+            .downcast::<Editor>()
+            .expect("an editor")
+    }
+
+    #[gpui::test]
+    async fn paseo_selection_goes_to_the_agent_tab_used_last(cx: &mut TestAppContext) {
+        let (window, workspace, _) = paseo_window_with_main_rs(cx).await;
+        cx.dispatch_action(window.into(), paseo_ui::NewAgent);
+        cx.run_until_parked();
+        let editor = open_main_rs(window, &workspace, cx).await;
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+                        s.select_display_ranges([DisplayPoint::new(DisplayRow(0), 0)
+                            ..DisplayPoint::new(DisplayRow(1), 5)])
+                    });
+                });
+                editor.focus_handle(cx).dispatch_action(
+                    &zed_actions::paseo::AddSelectionToAgent,
+                    window,
+                    cx,
+                );
+            })
+            .expect("workspace window");
+        cx.run_until_parked();
+
+        let (tab_count, text) = cx.read(|cx| {
+            let workspace = workspace.read(cx);
+            let tab = workspace
+                .item_of_type::<paseo_ui::AgentTab>(cx)
+                .expect("the agent draft tab");
+            (
+                workspace.items_of_type::<paseo_ui::AgentTab>(cx).count(),
+                tab.read(cx).composer_text(cx),
+            )
+        });
+        assert_eq!(tab_count, 1, "the open draft takes the text, not a new one");
+        assert!(
+            text.contains("main.rs:1-2\n"),
+            "unexpected composer text: {text}"
+        );
+        assert!(
+            text.contains("fn main() {\n    l\n"),
+            "unexpected composer text: {text}"
+        );
+    }
+
+    fn agent_edit_hunk_count(editor: &Entity<Editor>, cx: &mut TestAppContext) -> usize {
+        cx.update(|cx| {
+            editor
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .diff_hunks()
+                .count()
+        })
+    }
+
+    async fn paseo_window_with_agent_edit(
+        cx: &mut TestAppContext,
+    ) -> (WindowHandle<MultiWorkspace>, Entity<Editor>) {
+        let (window, _, editor) = paseo_window_with_main_rs(cx).await;
+        cx.update(|cx| {
+            paseo_ui::test_add_agent_edit(
+                "agent-1",
+                Path::new(path!("/root")),
+                Path::new(path!("/root/main.rs")),
+                "    let total = 0;",
+                "    let count: u32 = \"one\";",
+                cx,
+            )
+        });
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        (window, editor)
+    }
+
+    #[gpui::test]
+    async fn paseo_focusing_an_agent_tab_records_the_focused_agent(cx: &mut TestAppContext) {
+        let (window, _) = paseo_window_with_agent_edit(cx).await;
+        window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    paseo_ui::open_agent(workspace, "agent-1", false, window, cx)
+                })
+            })
+            .expect("workspace window");
+        cx.run_until_parked();
+        window
+            .update(cx, |multi_workspace, window, cx| {
+                let tab = multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .item_of_type::<paseo_ui::AgentTab>(cx)
+                    .expect("the agent tab");
+                let composer = tab.read(cx).composer_focus_handle(cx);
+                window.focus(&composer, cx);
+            })
+            .expect("workspace window");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read(paseo_ui::test_focused_agent),
+            Some("agent-1".to_owned())
+        );
+    }
+
+    #[gpui::test]
+    async fn paseo_agent_edits_highlight_until_kept(cx: &mut TestAppContext) {
+        let (window, editor) = paseo_window_with_agent_edit(cx).await;
+        assert_eq!(
+            agent_edit_hunk_count(&editor, cx),
+            1,
+            "the agent's edit shows as a hunk"
+        );
+
+        window
+            .update(cx, |_, window, cx| {
+                let focus = editor.focus_handle(cx);
+                window.focus(&focus, cx);
+                focus.dispatch_action(&paseo_ui::KeepAllEdits, window, cx);
+            })
+            .expect("workspace window");
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(
+            agent_edit_hunk_count(&editor, cx),
+            0,
+            "keeping clears the highlight"
+        );
+        cx.update(|cx| {
+            assert_eq!(
+                editor.read(cx).buffer().read(cx).snapshot(cx).text(),
+                "fn main() {\n    let count: u32 = \"one\";\n}\n",
+                "keeping leaves the agent's text"
+            )
+        });
+    }
+
+    #[gpui::test]
+    async fn paseo_user_edits_after_an_agent_edit_are_not_highlighted(cx: &mut TestAppContext) {
+        let (window, editor) = paseo_window_with_agent_edit(cx).await;
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+                        s.select_display_ranges([DisplayPoint::new(DisplayRow(0), 0)
+                            ..DisplayPoint::new(DisplayRow(0), 0)])
+                    });
+                    editor.insert("// typed by the user\n", window, cx);
+                });
+            })
+            .expect("workspace window");
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(
+            agent_edit_hunk_count(&editor, cx),
+            1,
+            "only the agent's line is highlighted"
+        );
+    }
+
+    #[gpui::test]
+    async fn paseo_keeping_a_mid_line_agent_edit_from_its_line(cx: &mut TestAppContext) {
+        let (window, _, editor) = paseo_window_with_main_rs(cx).await;
+        cx.update(|cx| {
+            paseo_ui::test_add_agent_edit(
+                "agent-1",
+                Path::new(path!("/root")),
+                Path::new(path!("/root/main.rs")),
+                "\"two\"",
+                "\"one\"",
+                cx,
+            )
+        });
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(agent_edit_hunk_count(&editor, cx), 1);
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+                        s.select_display_ranges([DisplayPoint::new(DisplayRow(1), 0)
+                            ..DisplayPoint::new(DisplayRow(1), 0)])
+                    });
+                });
+                let focus = editor.focus_handle(cx);
+                window.focus(&focus, cx);
+                focus.dispatch_action(&paseo_ui::KeepEdit, window, cx);
+            })
+            .expect("workspace window");
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(
+            agent_edit_hunk_count(&editor, cx),
+            0,
+            "a hunk covers whole lines, so the cursor anywhere on them keeps its edits"
+        );
+    }
+
+    #[gpui::test]
+    async fn paseo_an_agent_edit_undone_by_hand_stays_gone(cx: &mut TestAppContext) {
+        let (window, editor) = paseo_window_with_agent_edit(cx).await;
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.set_text("fn main() {\n    let total = 0;\n}\n", window, cx)
+                });
+            })
+            .expect("workspace window");
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(agent_edit_hunk_count(&editor, cx), 0);
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.set_text(
+                        "fn main() {\n    let total = 0;\n    let count: u32 = \"one\";\n}\n",
+                        window,
+                        cx,
+                    )
+                });
+            })
+            .expect("workspace window");
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(
+            agent_edit_hunk_count(&editor, cx),
+            0,
+            "the undone edit doesn't attach to the same text typed elsewhere"
+        );
+    }
+
+    #[gpui::test]
+    async fn paseo_rejecting_an_agent_edit_restores_the_old_text(cx: &mut TestAppContext) {
+        let (window, editor) = paseo_window_with_agent_edit(cx).await;
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+                        s.select_display_ranges([DisplayPoint::new(DisplayRow(1), 6)
+                            ..DisplayPoint::new(DisplayRow(1), 6)])
+                    });
+                });
+                let focus = editor.focus_handle(cx);
+                window.focus(&focus, cx);
+                focus.dispatch_action(&paseo_ui::RejectEdit, window, cx);
+            })
+            .expect("workspace window");
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(
+                editor.read(cx).buffer().read(cx).snapshot(cx).text(),
+                "fn main() {\n    let total = 0;\n}\n"
+            )
+        });
+        assert_eq!(agent_edit_hunk_count(&editor, cx), 0);
+    }
+
+    #[gpui::test]
+    async fn paseo_diagnostic_code_action_fills_the_agent_composer(cx: &mut TestAppContext) {
+        let (window, workspace, editor) = paseo_window_with_main_rs(cx).await;
+
+        cx.update(|cx| {
+            let buffer = editor
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .expect("a file buffer");
+            buffer.update(cx, |buffer, cx| {
+                let snapshot = buffer.snapshot();
+                let entry = language::DiagnosticEntry::new(
+                    language::PointUtf16::new(1, 21)..language::PointUtf16::new(1, 26),
+                    language::Diagnostic {
+                        severity: language::DiagnosticSeverity::ERROR,
+                        message: "mismatched types".to_owned().into(),
+                        source: Some("rustc".to_owned()),
+                        is_primary: true,
+                        ..Default::default()
+                    },
+                );
+                let diagnostics = language::DiagnosticSet::new([entry], &snapshot);
+                buffer.update_diagnostics(language::LanguageServerId(0), diagnostics, cx);
+            });
+        });
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+                        s.select_display_ranges([DisplayPoint::new(DisplayRow(1), 22)
+                            ..DisplayPoint::new(DisplayRow(1), 22)])
+                    });
+                })
+            })
+            .expect("workspace window");
+        cx.run_until_parked();
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.toggle_code_actions(
+                        &editor::actions::ToggleCodeActions {
+                            deployed_from: None,
+                            quick_launch: false,
+                        },
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .expect("workspace window");
+        cx.executor()
+            .advance_clock(editor::CODE_ACTIONS_DEBOUNCE_TIMEOUT * 2);
+        cx.run_until_parked();
+        let confirm = window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.confirm_code_action(
+                        &editor::actions::ConfirmCodeAction { item_ix: Some(0) },
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .expect("workspace window")
+            .expect("the code actions menu lists Ask Agent to Fix");
+        confirm.await.expect("the action applies");
+        cx.run_until_parked();
+
+        let text = cx.read(|cx| {
+            workspace
+                .read(cx)
+                .item_of_type::<paseo_ui::AgentTab>(cx)
+                .expect("an agent draft tab")
+                .read(cx)
+                .composer_text(cx)
+        });
+        assert!(
+            text.starts_with("Fix this problem in @"),
+            "unexpected composer text: {text}"
+        );
+        assert!(text.contains("main.rs:2:\n- error on line 2: mismatched types (rustc)\n"));
+        assert!(text.contains("    let count: u32 = \"one\";"));
     }
 
     #[track_caller]

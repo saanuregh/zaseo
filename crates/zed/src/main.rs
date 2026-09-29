@@ -736,6 +736,9 @@ fn main() {
         audio::init(cx);
         workspace::init(app_state.clone(), cx);
         paseo_ui::init(cx);
+        paseo_ui::set_project_switcher(std::rc::Rc::new(zed::switch_paseo_project), cx);
+        zed::hide_zed_only_actions(cx);
+        paseo_ui::connect_on_startup(cx);
         ui_prompt::init(cx);
 
         go_to_line::init(cx);

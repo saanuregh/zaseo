@@ -298,6 +298,12 @@ impl Render for QuickActionBar {
                                 )
                             })
                             .separator()
+                            .action_disabled_when(
+                                !has_selection,
+                                "Add Selection to Agent",
+                                Box::new(zed_actions::paseo::AddSelectionToAgent),
+                            )
+                            .separator()
                             .action("Go to Symbol", Box::new(ToggleOutline))
                             .action("Go to Line/Column", Box::new(ToggleGoToLine))
                             .separator()

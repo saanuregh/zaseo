@@ -333,7 +333,9 @@ impl MultiWorkspace {
 
     pub fn sidebar_render_state(&self, cx: &App) -> SidebarRenderState {
         SidebarRenderState {
-            open: self.sidebar_open() && self.multi_workspace_enabled(cx),
+            // Zaseo registers no sidebar (the Paseo agents panel replaces it), and the open flag
+            // still drives workspace retention, so only a registered sidebar takes layout space.
+            open: self.sidebar_open() && self.multi_workspace_enabled(cx) && self.has_sidebar(),
             side: self.sidebar_side(cx),
         }
     }
@@ -397,6 +399,10 @@ impl MultiWorkspace {
 
     pub fn sidebar_open(&self) -> bool {
         self.sidebar_open
+    }
+
+    pub fn has_sidebar(&self) -> bool {
+        self.sidebar.is_some()
     }
 
     pub fn sidebar_has_notifications(&self, cx: &App) -> bool {

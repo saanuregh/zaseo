@@ -8,13 +8,14 @@
       ...
     }:
     let
-      mkZed = import ../toolchain.nix { inherit inputs; };
-      zed-editor = mkZed pkgs;
+      mkZaseo = import ../toolchain.nix { inherit inputs; };
+      zaseo = mkZaseo pkgs;
     in
     {
       packages = {
-        default = zed-editor;
-        debug = zed-editor.override { profile = "dev"; };
+        default = zaseo;
+        inherit zaseo;
+        debug = zaseo.override { profile = "dev"; };
       };
     }
     // lib.optionalAttrs (lib.hasSuffix "linux" system) {

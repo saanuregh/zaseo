@@ -1,5 +1,5 @@
 {
-  description = "Zed is a minimal code editor crafted for speed and collaboration with humans and AI.";
+  description = "Zaseo, a Zed fork with native Paseo agents.";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
