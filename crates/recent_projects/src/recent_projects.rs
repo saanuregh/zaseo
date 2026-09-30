@@ -94,7 +94,7 @@ enum ProjectPickerEntry {
     /// that project group in the current window, while secondary confirm can move local project
     /// groups to a new window when multiple groups are available.
     ProjectGroup(StringMatch),
-    /// A workspace from the recent-project database's "Recent Projects" section.
+    /// A workspace from the recent-project database's "Recent Folders" section.
     ///
     /// The match's `candidate_id` indexes into `RecentProjectsDelegate::workspaces`. Confirming
     /// one opens that recent workspace in either the current window or a new window, depending on
@@ -930,7 +930,7 @@ impl PickerDelegate for RecentProjectsDelegate {
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        "Search projects…".into()
+        "Search folders…".into()
     }
 
     fn match_count(&self) -> usize {
@@ -1092,7 +1092,7 @@ impl PickerDelegate for RecentProjectsDelegate {
         };
 
         if has_recent_to_show {
-            entries.push(ProjectPickerEntry::Header("Recent Projects".into()));
+            entries.push(ProjectPickerEntry::Header("Recent Folders".into()));
 
             if is_empty_query {
                 for (id, workspace) in self.workspaces.iter().enumerate() {
@@ -1217,7 +1217,7 @@ impl PickerDelegate for RecentProjectsDelegate {
 
     fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
         let text = if self.workspaces.is_empty() && self.open_folders.is_empty() {
-            "Recently opened projects will show up here".into()
+            "Recently opened folders will show up here".into()
         } else {
             "No matches".into()
         };
@@ -1259,7 +1259,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                                 let focus_handle = self.focus_handle.clone();
                                 move |_, cx| {
                                     Tooltip::for_action_in(
-                                        "Remove Folder from Project",
+                                        "Remove Folder",
                                         &RemoveSelected,
                                         &focus_handle,
                                         cx,
@@ -1423,7 +1423,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                                 let focus_handle = self.focus_handle.clone();
                                 move |_, cx| {
                                     Tooltip::for_action_in(
-                                        "Remove Project from Window",
+                                        "Remove from Window",
                                         &RemoveSelected,
                                         &focus_handle,
                                         cx,
@@ -1510,9 +1510,9 @@ impl PickerDelegate for RecentProjectsDelegate {
                     .unzip();
 
                 let tooltip_title = if paths.len() > 1 {
-                    "Add Folders to this Project"
+                    "Add Folders…"
                 } else {
-                    "Add Folder to this Project"
+                    "Add Folder…"
                 };
 
                 let prefix = match &location {
@@ -1531,14 +1531,14 @@ impl PickerDelegate for RecentProjectsDelegate {
 
                 let focus_handle = self.focus_handle.clone();
                 let secondary_confirm_tooltip = if self.create_new_window {
-                    "Open Project in This Window"
+                    "Open Folder in This Window"
                 } else {
-                    "Open Project in New Window"
+                    "Open Folder in New Window"
                 };
                 let primary_confirm_tooltip = if self.create_new_window {
-                    "Open Project in New Window"
+                    "Open Folder in New Window"
                 } else {
-                    "Open Project in This Window"
+                    "Open Folder in This Window"
                 };
                 let secondary_confirm_icon = if self.create_new_window {
                     IconName::ThisWindow
@@ -1605,7 +1605,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                                 let focus_handle = self.focus_handle.clone();
                                 move |_, cx| {
                                     Tooltip::for_action_in(
-                                        "Remove from Recent Projects",
+                                        "Remove from Recent Folders",
                                         &RemoveSelected,
                                         &focus_handle,
                                         cx,
@@ -1951,7 +1951,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                                         menu.context(focus_handle)
                                             .when(show_add_to_workspace, |menu| {
                                                 menu.action(
-                                                    "Add Folder to this Project",
+                                                    "Add Folder…",
                                                     AddToWorkspace.boxed_clone(),
                                                 )
                                                 .separator()
@@ -2181,7 +2181,7 @@ impl RecentProjectsDelegate {
                         workspace
                             .open_workspace_for_paths(OpenMode::NewWindow, paths, window, cx)
                             .detach_and_prompt_err(
-                                "Failed to open project",
+                                "Failed to open folder",
                                 window,
                                 cx,
                                 |_, _, _| None,
@@ -2209,7 +2209,7 @@ impl RecentProjectsDelegate {
                             .await
                     })
                     .detach_and_prompt_err(
-                        "Failed to open project",
+                        "Failed to open folder",
                         window,
                         cx,
                         |_, _, _| None,
@@ -2508,7 +2508,7 @@ mod tests {
     //   [3] Header("This Window")
     //   [4] ProjectGroup(0)
     //   [5] ProjectGroup(1)
-    //   [6] Header("Recent Projects")
+    //   [6] Header("Recent Folders")
     //   [7..=26] RecentProject(0..=19)
     //
     const RECENT_PROJECT_COUNT: usize = 20;

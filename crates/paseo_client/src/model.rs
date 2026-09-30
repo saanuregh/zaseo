@@ -489,6 +489,9 @@ pub struct CreateAgent {
     pub attachments: Vec<Value>,
     pub worktree: Option<WorktreeTarget>,
     pub idempotency_key: String,
+    /// The Paseo workspace the agent joins. Without one the daemon starts a new workspace, and a
+    /// new worktree always gets its own.
+    pub workspace_id: Option<String>,
 }
 
 /// How a message sent while the agent is running treats the active turn.
@@ -511,6 +514,42 @@ pub struct SendMessage {
     pub message_id: String,
     pub behavior: Option<ActiveTurnBehavior>,
     pub images: Vec<ImageAttachment>,
+    /// Daemon attachment objects, such as [`UploadedFile::attachment`].
+    pub attachments: Vec<Value>,
+}
+
+/// A file to upload to the daemon's host, as Paseo's attach button does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileUpload {
+    pub file_name: String,
+    pub mime_type: String,
+    /// RFC 3339.
+    pub modified_at: String,
+    pub bytes: Vec<u8>,
+}
+
+/// A file the daemon stored for this session; agents read it at `path` on the daemon's host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadedFile {
+    pub id: String,
+    pub file_name: String,
+    pub mime_type: String,
+    pub size: u64,
+    pub path: String,
+}
+
+impl UploadedFile {
+    /// The attachment a message or new agent carries to hand the agent this file.
+    pub fn attachment(&self) -> Value {
+        serde_json::json!({
+            "type": "uploaded_file",
+            "id": self.id,
+            "fileName": self.file_name,
+            "mimeType": self.mime_type,
+            "size": self.size,
+            "path": self.path,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

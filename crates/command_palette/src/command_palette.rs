@@ -71,7 +71,18 @@ pub fn normalize_action_query(input: &str) -> String {
         result.push(normalized_char);
     }
 
+    // Matched against humanized names, which call Zed's project a folder.
     result
+        .split(' ')
+        .map(|word| match word {
+            "project" => "folder",
+            "projects" => "folders",
+            "project:" => "folder:",
+            "projects:" => "folders:",
+            word => word,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 impl CommandPalette {
@@ -864,7 +875,24 @@ impl PickerDelegate for CommandPaletteDelegate {
     }
 }
 
+/// An action's name as the palette, keymap editor and key hints show it. Zaseo calls Zed's
+/// project "folders", since Paseo owns "project"; action IDs keep Zed's names so keymaps and
+/// settings keep working.
 pub fn humanize_action_name(name: &str) -> String {
+    split_action_name(name)
+        .split(' ')
+        .map(|word| match word {
+            "project" => "folder",
+            "projects" => "folders",
+            "project:" => "folder:",
+            "projects:" => "folders:",
+            word => word,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn split_action_name(name: &str) -> String {
     let chars = name.chars().collect::<Vec<_>>();
     let capacity = name.len() + chars.iter().filter(|c| c.is_uppercase()).count();
     let mut result = String::with_capacity(capacity);
@@ -953,6 +981,26 @@ mod tests {
     use workspace::{AppState, MultiWorkspace, Workspace};
 
     #[test]
+    fn palette_names_say_folder_for_zeds_project() {
+        assert_eq!(
+            humanize_action_name("project_panel::NewFile"),
+            "folder panel: new file"
+        );
+        assert_eq!(
+            humanize_action_name("multi_workspace::NextProject"),
+            "multi workspace: next folder"
+        );
+        assert_eq!(
+            humanize_action_name("projects::OpenRecent"),
+            "folders: open recent"
+        );
+        assert_eq!(
+            humanize_action_name("editor::Backspace"),
+            "editor: backspace"
+        );
+    }
+
+    #[test]
     fn test_humanize_action_name() {
         assert_eq!(
             humanize_action_name("editor::GoToDefinition"),
@@ -972,7 +1020,7 @@ mod tests {
         );
         assert_eq!(
             humanize_action_name("agent::OpenProjectAGENTS.mdRules"),
-            "agent: open project AGENTS.md rules"
+            "agent: open folder AGENTS.md rules"
         );
         assert_eq!(humanize_action_name("editor::OpenURL"), "editor: open URL");
         assert_eq!(
@@ -983,6 +1031,9 @@ mod tests {
 
     #[test]
     fn test_normalize_query() {
+        // Names say "folder" for Zed's project, so a query using Zed's word still finds them.
+        assert_eq!(normalize_action_query("project panel"), "folder panel");
+        assert_eq!(normalize_action_query("projects: open"), "folders: open");
         assert_eq!(
             normalize_action_query("editor: backspace"),
             "editor: backspace"
@@ -1013,8 +1064,61 @@ mod tests {
         );
         assert_eq!(
             normalize_action_query("project_panel::ToggleFocus"),
-            "project panel:ToggleFocus"
+            "folder panel:ToggleFocus"
         );
+    }
+
+    #[gpui::test]
+    async fn palette_sources_add_results_even_while_the_interceptor_is_cleared(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        cx.update(|cx| {
+            // Vim clears the single interceptor whenever it is off; a source must survive that.
+            GlobalCommandPaletteInterceptor::clear(cx);
+            command_palette_hooks::CommandPaletteSources::add(cx, |query, _, _| {
+                Task::ready(
+                    (query == "open agent")
+                        .then(|| CommandInterceptItem {
+                            action: Box::new(editor::actions::Backspace),
+                            string: "Agent: Fix login".into(),
+                            positions: Vec::new(),
+                        })
+                        .into_iter()
+                        .collect(),
+                )
+            });
+        });
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let editor = cx.new_window_entity(|window, cx| Editor::single_line(window, cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+            editor.update(cx, |editor, cx| window.focus(&editor.focus_handle(cx), cx))
+        });
+
+        cx.dispatch_action(Toggle);
+        cx.simulate_input("open agent");
+        let palette = workspace.update(cx, |workspace, cx| {
+            workspace
+                .active_modal::<CommandPalette>(cx)
+                .expect("palette open")
+                .read(cx)
+                .picker
+                .clone()
+        });
+        palette.read_with(cx, |palette, _| {
+            assert_eq!(
+                palette
+                    .delegate
+                    .matches
+                    .first()
+                    .map(|matched| matched.string.as_str()),
+                Some("Agent: Fix login")
+            );
+        });
     }
 
     #[gpui::test]

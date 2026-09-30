@@ -452,7 +452,7 @@ impl PaneLeaderDecorator for PaneRenderContext<'_> {
                                             cx,
                                         )
                                         .detach_and_prompt_err(
-                                            "Failed to join project",
+                                            "Failed to join shared folders",
                                             window,
                                             cx,
                                             |error, _, _| Some(format!("{error:#}")),

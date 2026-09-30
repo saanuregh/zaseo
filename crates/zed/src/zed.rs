@@ -16,7 +16,6 @@ pub mod visual_tests;
 pub(crate) mod windows_only_instance;
 
 use agent_settings::{UserAgentsMdState, init_user_agents_md};
-use agent_ui::AgentDiffToolbar;
 use anyhow::Context as _;
 pub use app_menus::*;
 use assets::Assets;
@@ -29,7 +28,6 @@ use editor::{Editor, MultiBuffer};
 use extension_host::ExtensionStore;
 use feature_flags::{FeatureFlagAppExt as _, PanicFeatureFlag};
 use fs::Fs;
-use futures::FutureExt as _;
 use futures::{StreamExt, channel::mpsc, select_biased};
 use git_ui::branch_diff::BranchDiffToolbar;
 use git_ui::commit_view::CommitViewToolbar;
@@ -40,11 +38,11 @@ use git_ui::staged_diff::StagedDiffToolbar;
 use git_ui::unstaged_diff::UnstagedDiffToolbar;
 use git_ui_core::file_diff_view::FileDiffStyleToolbar;
 use gpui::{
-    Action, App, AppContext as _, AsyncWindowContext, ClipboardItem, Context, DismissEvent,
-    Element, Entity, FocusHandle, Focusable, Image, ImageFormat, KeyBinding, ParentElement,
-    PathPromptOptions, PromptLevel, ReadGlobal, SharedString, Size, Task, TaskExt, TitlebarOptions,
-    UpdateGlobal, WeakEntity, Window, WindowBounds, WindowHandle, WindowKind, WindowOptions,
-    actions, image_cache, img, point, px, retain_all,
+    Action, App, AppContext as _, ClipboardItem, Context, DismissEvent, Element, Entity,
+    FocusHandle, Focusable, Image, ImageFormat, KeyBinding, ParentElement, PathPromptOptions,
+    PromptLevel, ReadGlobal, SharedString, Size, Task, TaskExt, TitlebarOptions, UpdateGlobal,
+    WeakEntity, Window, WindowBounds, WindowHandle, WindowKind, WindowOptions, actions,
+    image_cache, img, point, px, retain_all,
 };
 use image_viewer::ImageInfo;
 use language::Capability;
@@ -99,9 +97,9 @@ use vim_mode_setting::VimModeSetting;
 use workspace::notifications::{NotificationId, dismiss_app_notification, show_app_notification};
 
 use workspace::{
-    AppState, MultiWorkspace, NewFile, NewWindow, OpenLog, Panel, Toast, Workspace,
-    WorkspaceSettings, create_and_open_local_file,
-    notifications::simple_message_notification::MessageNotification, open_new,
+    AppState, MultiWorkspace, NewFile, NewWindow, OpenLog, Toast, Workspace, WorkspaceSettings,
+    create_and_open_local_file, notifications::simple_message_notification::MessageNotification,
+    open_new,
 };
 use workspace::{CloseProject, CloseWindow, RestoreBanner, with_active_or_new_workspace};
 use workspace::{Pane, notifications::DetachAndPromptErr};
@@ -198,6 +196,7 @@ pub fn init(cx: &mut App) {
     #[cfg(target_os = "macos")]
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
     cx.on_action(quit);
+    register_paseo_project_switcher(cx);
 
     cx.on_action(|_: &RestoreBanner, cx| title_bar::restore_banner(cx));
 
@@ -440,7 +439,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
     init_reduce_motion(cx);
     init_global_config_error_notifications(cx);
 
-    cx.observe_new(|_multi_workspace: &mut MultiWorkspace, window, cx| {
+    cx.observe_new(|multi_workspace: &mut MultiWorkspace, window, cx| {
         let Some(window) = window else {
             return;
         };
@@ -448,8 +447,8 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         #[cfg(feature = "track-project-leak")]
         {
             let multi_workspace_handle = cx.weak_entity();
-            let workspace_handle = _multi_workspace.workspace().downgrade();
-            let project_handle = _multi_workspace.workspace().read(cx).project().downgrade();
+            let workspace_handle = multi_workspace.workspace().downgrade();
+            let project_handle = multi_workspace.workspace().read(cx).project().downgrade();
             let window_id_2 = window.window_handle().window_id();
             cx.on_window_closed(move |cx, window_id| {
                 let multi_workspace_handle = multi_workspace_handle.clone();
@@ -501,34 +500,23 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         });
 
         let multi_workspace_handle = cx.entity();
+        // `source_workspace` is often `None`, so the workspace switched away from is tracked here.
+        let mut previous_workspace = multi_workspace.workspace().downgrade();
         cx.subscribe_in(
             &multi_workspace_handle,
             window,
-            |this, _multi_workspace, event: &workspace::MultiWorkspaceEvent, window, cx| {
-                let workspace::MultiWorkspaceEvent::ActiveWorkspaceChanged { source_workspace } =
-                    event
-                else {
+            move |this, _multi_workspace, event: &workspace::MultiWorkspaceEvent, window, cx| {
+                let workspace::MultiWorkspaceEvent::ActiveWorkspaceChanged { .. } = event else {
                     return;
                 };
 
                 let active_workspace = this.workspace().clone();
-                let source_workspace = source_workspace.clone();
-                active_workspace.update(cx, |workspace, cx| {
-                    if let Some(ref source) = source_workspace {
-                        if let Some(panel) = workspace.panel::<agent_ui::AgentPanel>(cx) {
-                            panel.update(cx, |panel, cx| {
-                                panel.initialize_from_source_workspace_if_needed(
-                                    source.clone(),
-                                    window,
-                                    cx,
-                                );
-                            });
-                        }
-                    }
-
-                    ensure_agent_panel_for_workspace(workspace, source_workspace, window, cx)
-                        .detach_and_log_err(cx);
-                });
+                if let Some(previous) = previous_workspace.upgrade()
+                    && previous != active_workspace
+                {
+                    paseo_ui::workspace_switched(&previous, &active_workspace, window, cx);
+                }
+                previous_workspace = active_workspace.downgrade();
             },
         )
         .detach();
@@ -543,6 +531,18 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let workspace_handle = cx.entity();
         let center_pane = workspace.active_pane().clone();
         initialize_pane(workspace, &center_pane, window, cx);
+
+        // title_bar::init runs before this observer, so the title bar already exists.
+        if let Some(title_bar) = workspace
+            .titlebar_item()
+            .and_then(|item| item.downcast::<title_bar::TitleBar>().ok())
+        {
+            let (agent, status) = paseo_ui::title_bar_items(&workspace_handle, cx);
+            title_bar.update(cx, |title_bar, cx| {
+                title_bar.set_after_project_item(agent, cx);
+                title_bar.set_end_item(status, cx);
+            });
+        }
 
         cx.subscribe_in(&workspace_handle, window, {
             move |workspace, _, event, window, cx| match event {
@@ -794,109 +794,17 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             add_panel_when_ready(terminal_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
-            initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
         );
 
         workspace_handle.update(cx, |workspace, cx| {
             workspace.finish_dock_restoration(cx);
         })?;
+        workspace_handle.update_in(cx, |workspace, window, cx| {
+            paseo_ui::apply_sidebar_size(workspace, window, cx);
+        })?;
 
         anyhow::Ok(())
     })
-}
-
-fn setup_or_teardown_ai_panel<P: Panel>(
-    workspace: &mut Workspace,
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-    load_panel: impl FnOnce(
-        WeakEntity<Workspace>,
-        AsyncWindowContext,
-    ) -> Task<anyhow::Result<Entity<P>>>
-    + 'static,
-) -> Task<anyhow::Result<()>> {
-    let disable_ai = SettingsStore::global(cx)
-        .get::<DisableAiSettings>(None)
-        .disable_ai
-        || cfg!(test);
-    let existing_panel = workspace.panel::<P>(cx);
-    match (disable_ai, existing_panel) {
-        (false, None) => cx.spawn_in(window, async move |workspace, cx| {
-            let panel = load_panel(workspace.clone(), cx.clone()).await?;
-            workspace.update_in(cx, |workspace, window, cx| {
-                let disable_ai = SettingsStore::global(cx)
-                    .get::<DisableAiSettings>(None)
-                    .disable_ai;
-                let have_panel = workspace.panel::<P>(cx).is_some();
-                if !disable_ai && !have_panel {
-                    workspace.add_panel(panel, window, cx);
-                }
-            })
-        }),
-        (true, Some(existing_panel)) => {
-            workspace.remove_panel::<P>(&existing_panel, window, cx);
-            Task::ready(Ok(()))
-        }
-        _ => Task::ready(Ok(())),
-    }
-}
-
-fn ensure_agent_panel_for_workspace(
-    workspace: &mut Workspace,
-    source_workspace: Option<WeakEntity<Workspace>>,
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-) -> Task<anyhow::Result<()>> {
-    let task = setup_or_teardown_ai_panel(workspace, window, cx, move |workspace, cx| {
-        agent_ui::AgentPanel::load(workspace, cx)
-    });
-
-    cx.spawn_in(window, async move |workspace, cx| {
-        task.await?;
-        workspace.update_in(cx, |workspace, window, cx| {
-            if let Some(source_workspace) = source_workspace.clone()
-                && let Some(panel) = workspace.panel::<agent_ui::AgentPanel>(cx)
-            {
-                panel.update(cx, |panel, cx| {
-                    panel.initialize_from_source_workspace_if_needed(source_workspace, window, cx);
-                });
-            }
-        })
-    })
-}
-
-async fn initialize_agent_panel(
-    workspace_handle: WeakEntity<Workspace>,
-    mut cx: AsyncWindowContext,
-) -> anyhow::Result<()> {
-    workspace_handle
-        .update_in(&mut cx, |workspace, window, cx| {
-            ensure_agent_panel_for_workspace(workspace, None, window, cx)
-        })?
-        .await?;
-
-    workspace_handle.update_in(&mut cx, |workspace, window, cx| {
-        cx.observe_global_in::<SettingsStore>(window, move |workspace, window, cx| {
-            ensure_agent_panel_for_workspace(workspace, None, window, cx).detach_and_log_err(cx);
-        })
-        .detach();
-
-        // Register the actions that are shared between `assistant` and `assistant2`.
-        //
-        // We need to do this here instead of within the individual `init`
-        // functions so that we only register the actions once.
-        //
-        // Once we ship `assistant2` we can push this back down into `agent::agent_panel::init`.
-        if !cfg!(test) {
-            workspace
-                .register_action(agent_ui::AgentPanel::toggle_focus)
-                .register_action(agent_ui::AgentPanel::focus)
-                .register_action(agent_ui::AgentPanel::toggle)
-                .register_action(agent_ui::InlineAssistant::inline_assist);
-        }
-    })?;
-
-    anyhow::Ok(())
 }
 
 fn register_actions(
@@ -1450,6 +1358,24 @@ fn initialize_pane(
 ) {
     let workspace_handle = cx.weak_entity();
     pane.update(cx, |pane, cx| {
+        // An agent's tab puts its menu in the tab bar, in front of the pane's own buttons.
+        pane.set_render_tab_bar_buttons(cx, |pane, window, cx| {
+            let (left, right) = workspace::pane::default_render_tab_bar_buttons(pane, window, cx);
+            let agent_menu = pane
+                .active_item()
+                .and_then(|item| paseo_ui::agent_tab_menu(item.as_ref(), cx));
+            let right = match (agent_menu, right) {
+                (Some(menu), Some(right)) => Some(
+                    h_flex()
+                        .gap(ui::DynamicSpacing::Base04.rems(cx))
+                        .child(menu)
+                        .child(right)
+                        .into_any_element(),
+                ),
+                (menu, right) => menu.or(right),
+            };
+            (left, right)
+        });
         pane.toolbar().update(cx, |toolbar, cx| {
             let multibuffer_hint = cx.new(|_| MultibufferHint::new());
             toolbar.add_item(multibuffer_hint, window, cx);
@@ -1503,8 +1429,6 @@ fn initialize_pane(
             toolbar.add_item(solo_diff_git_toolbar, window, cx);
             let commit_view_toolbar = cx.new(|_| CommitViewToolbar::new());
             toolbar.add_item(commit_view_toolbar, window, cx);
-            let agent_diff_toolbar = cx.new(AgentDiffToolbar::new);
-            toolbar.add_item(agent_diff_toolbar, window, cx);
             let paseo_edits_toolbar = cx.new(paseo_ui::AgentEditsToolbar::new);
             toolbar.add_item(paseo_edits_toolbar, window, cx);
             let basedpyright_banner = cx.new(|cx| BasedPyrightBanner::new(workspace, cx));
@@ -2431,7 +2355,6 @@ enum PaseoEditorTarget {
         username: Option<String>,
         port: Option<u16>,
     },
-    NoEditorMapping,
 }
 
 // Paseo fills in port 22 when an SSH URI omits it. Passing no port instead lets
@@ -2485,11 +2408,15 @@ fn paseo_editor_target(
                     .trim_matches(['[', ']'])
                     .parse::<std::net::IpAddr>()
                     .is_ok_and(|address| address.is_loopback());
-            if loopback && directory.is_absolute() {
-                Ok(PaseoEditorTarget::Local)
-            } else {
-                Ok(PaseoEditorTarget::NoEditorMapping)
+            if !loopback {
+                anyhow::bail!(
+                    "A remote Paseo daemon needs an editor SSH mapping to open its folders"
+                );
             }
+            if !directory.is_absolute() {
+                anyhow::bail!("The Paseo agent's folder isn't an absolute path");
+            }
+            Ok(PaseoEditorTarget::Local)
         }
     }
 }
@@ -2510,21 +2437,14 @@ fn open_paseo_workspace(
             return;
         }
     };
-    match paseo_editor_target(&selected.target, &selected.directory) {
-        Ok(PaseoEditorTarget::NoEditorMapping) => {
-            workspace.show_error(
-                "Add an editor SSH mapping to open this remote Paseo workspace",
-                cx,
-            );
-            return;
-        }
-        Ok(_) => {}
-        Err(error) => {
-            workspace.show_error(error, cx);
-            return;
-        }
-    }
-    let switch = switch_paseo_project(selected, None, workspace, window, cx);
+    let switch = switch_paseo_project(
+        selected,
+        None,
+        paseo_ui::SwitchMode::Activate,
+        workspace,
+        window,
+        cx,
+    );
     cx.spawn_in(window, async move |workspace, cx| {
         if let Err(error) = switch.await {
             workspace.update(cx, |workspace, cx| workspace.show_error(error, cx))?;
@@ -2534,9 +2454,83 @@ fn open_paseo_workspace(
     .detach_and_log_err(cx);
 }
 
+/// Keeps Zed's own agent actions out of the command palette, since Paseo is Zaseo's agent, and
+/// shows edit prediction actions only when AI is on and a provider is set. `agent_ui` did this
+/// while Zed's agent ran.
+pub fn update_ai_command_palette_filter(cx: &mut App) {
+    use editor::actions::{
+        AcceptEditPrediction, AcceptNextLineEditPrediction, AcceptNextWordEditPrediction,
+        NextEditPrediction, PreviousEditPrediction, ShowEditPrediction, ToggleEditPrediction,
+    };
+    use language::language_settings::{AllLanguageSettings, EditPredictionProvider};
+    use std::any::TypeId;
+
+    let disable_ai = DisableAiSettings::get_global(cx).disable_ai;
+    let provider = AllLanguageSettings::get_global(cx)
+        .edit_predictions
+        .provider;
+    command_palette_hooks::CommandPaletteFilter::update_global(cx, |filter, _| {
+        let edit_prediction_actions = [
+            TypeId::of::<AcceptEditPrediction>(),
+            TypeId::of::<AcceptNextWordEditPrediction>(),
+            TypeId::of::<AcceptNextLineEditPrediction>(),
+            TypeId::of::<ShowEditPrediction>(),
+            TypeId::of::<NextEditPrediction>(),
+            TypeId::of::<PreviousEditPrediction>(),
+            TypeId::of::<ToggleEditPrediction>(),
+        ];
+        filter.hide_namespace("agent");
+        filter.hide_namespace("agents");
+        filter.hide_namespace("assistant");
+        filter.hide_action_types(&[
+            TypeId::of::<zed_actions::assistant::ManageSkills>(),
+            TypeId::of::<zed_actions::assistant::OpenSkillCreator>(),
+            TypeId::of::<zed_actions::assistant::CreateSkillFromUrl>(),
+        ]);
+        let predictions = match (disable_ai, provider) {
+            (true, _) | (false, EditPredictionProvider::None) => None,
+            (false, EditPredictionProvider::Copilot) => Some(true),
+            (false, _) => Some(false),
+        };
+        match predictions {
+            None => {
+                filter.hide_namespace("edit_prediction");
+                filter.hide_namespace("copilot");
+                filter.hide_namespace("zed_predict_onboarding");
+                filter.hide_action_types(&edit_prediction_actions);
+                filter.hide_action_types(&[TypeId::of::<zed_actions::OpenZedPredictOnboarding>()]);
+            }
+            Some(copilot) => {
+                filter.show_namespace("edit_prediction");
+                if copilot {
+                    filter.show_namespace("copilot");
+                } else {
+                    filter.hide_namespace("copilot");
+                }
+                filter.show_namespace("zed_predict_onboarding");
+                filter.show_action_types(edit_prediction_actions.iter());
+                filter.show_action_types(&[TypeId::of::<zed_actions::OpenZedPredictOnboarding>()]);
+            }
+        }
+    });
+}
+
 /// Hides actions that open projects by hand or reach Zed's own services from the command
-/// palette, because Zaseo opens projects from agents and has no Zed account.
+/// palette, because Zaseo opens projects from agents and has no Zed account: Zed's
+/// collaboration, account, updates and feedback, and Zed's own agent threads and assistant.
 pub fn hide_zed_only_actions(cx: &mut App) {
+    let hidden_namespaces = [
+        "collab",
+        "collab_panel",
+        "channel_modal",
+        "livekit_client",
+        "client",
+        "feedback",
+        "auto_update",
+        "agents_sidebar",
+        "inline_assistant",
+        "skill_creator",
+    ];
     let hidden = [
         std::any::TypeId::of::<workspace::Open>(),
         std::any::TypeId::of::<workspace::OpenFiles>(),
@@ -2550,8 +2544,17 @@ pub fn hide_zed_only_actions(cx: &mut App) {
         std::any::TypeId::of::<feedback::OpenZedRepo>(),
         std::any::TypeId::of::<workspace::ToggleWorkspaceSidebar>(),
         std::any::TypeId::of::<workspace::FocusWorkspaceSidebar>(),
+        std::any::TypeId::of::<workspace::Feedback>(),
+        std::any::TypeId::of::<workspace::FollowNextCollaborator>(),
+        std::any::TypeId::of::<workspace::Unfollow>(),
+        std::any::TypeId::of::<zed_actions::OpenAccountSettings>(),
+        std::any::TypeId::of::<zed_actions::GetMerch>(),
+        std::any::TypeId::of::<zed_actions::ShowCallStats>(),
     ];
     command_palette_hooks::CommandPaletteFilter::update_global(cx, |filter, _| {
+        for namespace in hidden_namespaces {
+            filter.hide_namespace(namespace);
+        }
         filter.hide_action_types(&hidden);
     });
 }
@@ -2571,53 +2574,116 @@ fn workspace_holds_directory(
             .any(|root| directory.starts_with(root))
 }
 
-/// Activates the window's project for a Paseo agent's directory, opening it when no open
-/// project covers it. Resolves to `None` when the current project already does, or when a
-/// remote agent has no editor SSH mapping to open.
-pub fn switch_paseo_project(
+/// Registers how Paseo agents find and open their editor workspaces.
+fn register_paseo_project_switcher(cx: &mut App) {
+    paseo_ui::set_project_switcher(
+        std::rc::Rc::new(switch_paseo_project),
+        std::rc::Rc::new(workspace_owns_paseo_agent),
+        cx,
+    );
+}
+
+fn paseo_editor_host(
+    selected: &paseo_ui::SelectedWorkspace,
+    cx: &App,
+) -> anyhow::Result<Option<remote::RemoteConnectionOptions>> {
+    Ok(
+        match paseo_editor_target(&selected.target, &selected.directory)? {
+            PaseoEditorTarget::Local => None,
+            PaseoEditorTarget::Ssh {
+                host,
+                username,
+                port,
+            } => Some(remote::RemoteConnectionOptions::Ssh(
+                RemoteSettings::get_global(cx).connection_options_for(host, port, username),
+            )),
+        },
+    )
+}
+
+fn workspace_owns_paseo_agent(
+    selected: &paseo_ui::SelectedWorkspace,
+    workspace: &Workspace,
+    cx: &App,
+) -> bool {
+    paseo_editor_host(selected, cx).is_ok_and(|host| {
+        workspace_holds_directory(workspace, &selected.directory, host.as_ref(), cx)
+    })
+}
+
+/// Finds the workspace that holds a Paseo agent's directory, in the current window first and
+/// then in the others, and opens it in the current window when none does. `Activate` shows it
+/// and brings its window forward; `Background` changes what no window shows.
+fn switch_paseo_project(
     selected: paseo_ui::SelectedWorkspace,
     mut init: Option<paseo_ui::WorkspaceInit>,
+    mode: paseo_ui::SwitchMode,
     workspace: &mut Workspace,
     window: &mut Window,
     cx: &mut Context<Workspace>,
-) -> Task<anyhow::Result<Option<Entity<Workspace>>>> {
-    let host = match paseo_editor_target(&selected.target, &selected.directory) {
-        Ok(PaseoEditorTarget::Local) => None,
-        Ok(PaseoEditorTarget::Ssh {
-            host,
-            username,
-            port,
-        }) => Some(remote::RemoteConnectionOptions::Ssh(
-            RemoteSettings::get_global(cx).connection_options_for(host, port, username),
-        )),
-        Ok(PaseoEditorTarget::NoEditorMapping) => return Task::ready(Ok(None)),
+) -> Task<anyhow::Result<Entity<Workspace>>> {
+    let host = match paseo_editor_host(&selected, cx) {
+        Ok(host) => host,
         Err(error) => return Task::ready(Err(error)),
     };
     if workspace_holds_directory(workspace, &selected.directory, host.as_ref(), cx) {
-        return Task::ready(Ok(None));
+        return Task::ready(Ok(cx.entity()));
     }
     let Some(window_handle) = window.window_handle().downcast::<MultiWorkspace>() else {
-        return Task::ready(Ok(None));
+        return Task::ready(Err(anyhow::anyhow!(
+            "This window can't open Paseo workspaces"
+        )));
     };
+    let activate = mode == paseo_ui::SwitchMode::Activate;
     let app_state = workspace.app_state().clone();
     let directory = selected.directory;
     cx.spawn_in(window, async move |_, cx| {
-        let existing = window_handle.update(cx, |multi_workspace, _window, cx| {
-            multi_workspace
-                .workspaces()
-                .find(|workspace| {
-                    workspace_holds_directory(workspace.read(cx), &directory, host.as_ref(), cx)
-                })
-                .cloned()
+        let other_windows = cx.update(|_, cx| {
+            cx.windows()
+                .into_iter()
+                .filter_map(|window| window.downcast::<MultiWorkspace>())
+                .filter(|window| *window != window_handle)
+                .collect::<Vec<_>>()
         })?;
-        if let Some(existing) = existing {
-            window_handle.update(cx, |multi_workspace, window, cx| {
+        for candidate in std::iter::once(window_handle).chain(other_windows) {
+            let existing = candidate
+                .read_with(cx, |multi_workspace, cx| {
+                    multi_workspace
+                        .workspaces()
+                        .find(|workspace| {
+                            workspace_holds_directory(
+                                workspace.read(cx),
+                                &directory,
+                                host.as_ref(),
+                                cx,
+                            )
+                        })
+                        .cloned()
+                })
+                .ok()
+                .flatten();
+            let Some(existing) = existing else {
+                continue;
+            };
+            candidate.update(cx, |multi_workspace, window, cx| {
                 if let Some(init) = init.take() {
                     existing.update(cx, |workspace, cx| init(workspace, window, cx));
                 }
-                multi_workspace.activate(existing.clone(), None, window, cx);
+                if activate {
+                    multi_workspace.activate(existing.clone(), None, window, cx);
+                    window.activate_window();
+                }
             })?;
-            return Ok(Some(existing));
+            return Ok(existing);
+        }
+        let open_mode = if activate {
+            workspace::OpenMode::Activate
+        } else {
+            workspace::OpenMode::Add
+        };
+        // `open_remote_project` always shows the new workspace and its connection prompt.
+        if !activate && host.is_some() {
+            anyhow::bail!("Click the agent to connect to its SSH host");
         }
         match host {
             None => {
@@ -2632,43 +2698,50 @@ pub fn switch_paseo_project(
                         .is_none();
                     // `open_project` replaces an empty starting workspace, prompting to save
                     // its buffers, so it stays in charge of that case.
-                    if current_is_empty {
-                        multi_workspace.open_project(
-                            vec![directory],
-                            workspace::OpenMode::Activate,
-                            window,
-                            cx,
-                        )
+                    if current_is_empty && activate {
+                        multi_workspace.open_project(vec![directory], open_mode, window, cx)
                     } else {
                         multi_workspace.find_or_create_local_workspace(
                             workspace::PathList::new(&[directory]),
                             None,
                             init.take(),
-                            workspace::OpenMode::Activate,
+                            open_mode,
                             None,
                             window,
                             cx,
                         )
                     }
                 })?;
-                Ok(Some(open.await?))
+                open.await
             }
             Some(connection) => {
                 open_remote_project(
-                    connection,
-                    vec![directory],
+                    connection.clone(),
+                    vec![directory.clone()],
                     app_state,
                     workspace::OpenOptions {
                         requesting_window: Some(window_handle),
-                        open_mode: workspace::OpenMode::Activate,
+                        open_mode,
                         ..Default::default()
                     },
                     cx,
                 )
                 .await?;
-                let active = window_handle
-                    .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())?;
-                Ok(Some(active))
+                window_handle
+                    .read_with(cx, |multi_workspace, cx| {
+                        multi_workspace
+                            .workspaces()
+                            .find(|workspace| {
+                                workspace_holds_directory(
+                                    workspace.read(cx),
+                                    &directory,
+                                    Some(&connection),
+                                    cx,
+                                )
+                            })
+                            .cloned()
+                    })?
+                    .context("The agent's SSH workspace didn't open")
             }
         }
     })
@@ -2693,9 +2766,9 @@ mod paseo_editor_target_tests {
             websocket_url: "wss://daemon.example/ws".into(),
             editor_ssh: None,
         };
-        assert_eq!(
-            paseo_editor_target(&remote, Path::new("/project")).expect("remote target"),
-            PaseoEditorTarget::NoEditorMapping
+        assert!(
+            paseo_editor_target(&remote, Path::new("/project")).is_err(),
+            "a remote daemon without an editor SSH mapping has no editor folder"
         );
 
         let mapped = ConnectionTarget::Direct {
@@ -3176,7 +3249,6 @@ mod tests {
     use node_runtime::NodeRuntime;
     use pretty_assertions::{assert_eq, assert_ne};
     use project::{Project, ProjectPath};
-    use prompt_store::PromptBuilder;
     use remote::RemoteClient;
     use remote_server::{HeadlessAppState, HeadlessProject};
     use semver::Version;
@@ -3221,6 +3293,21 @@ mod tests {
             .unwrap();
 
         futures::future::join_all(all_tasks).await;
+    }
+
+    #[gpui::test]
+    fn zaseo_hides_zed_service_commands(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            command_palette_hooks::init(cx);
+            hide_zed_only_actions(cx);
+            let filter =
+                command_palette_hooks::CommandPaletteFilter::try_global(cx).expect("filter set");
+            assert!(filter.is_hidden(&workspace::ShareProject));
+            assert!(filter.is_hidden(&workspace::Unfollow));
+            assert!(filter.is_hidden(&zed_actions::OpenAccountSettings));
+            assert!(!filter.is_hidden(&workspace::CloseActiveDock));
+            assert!(!filter.is_hidden(&paseo_ui::OpenHistory));
+        });
     }
 
     #[gpui::test]
@@ -6525,19 +6612,10 @@ mod tests {
             language_models::init(app_state.user_store.clone(), app_state.client.clone(), cx);
             web_search::init(cx);
             web_search_providers::init(app_state.client.clone(), app_state.user_store.clone(), cx);
-            let prompt_builder = PromptBuilder::load(app_state.fs.clone(), false, cx);
             project::AgentRegistryStore::init_global(
                 cx,
                 app_state.fs.clone(),
                 app_state.client.http_client(),
-            );
-            agent_ui::init(
-                app_state.fs.clone(),
-                prompt_builder,
-                app_state.languages.clone(),
-                true,
-                false,
-                cx,
             );
 
             repl::init(app_state.fs.clone(), cx);
@@ -6616,6 +6694,1222 @@ mod tests {
                 .read(cx)
                 .has_notification(&NotificationId::unique::<&'static str>())
         }));
+    }
+
+    #[gpui::test]
+    async fn paseo_question_card_steps_through_questions(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        cx.update(init);
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        cx.run_until_parked();
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let tab = window
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    let workspace_handle = cx.weak_entity();
+                    let tab = cx.new(|cx| {
+                        paseo_ui::AgentTab::new(
+                            Some("agent".into()),
+                            None,
+                            Some(workspace_handle),
+                            window,
+                            cx,
+                        )
+                    });
+                    workspace.add_item_to_active_pane(
+                        Box::new(tab.clone()),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    );
+                    tab
+                })
+            })
+            .unwrap();
+        cx.update(|cx| {
+            paseo_ui::test_add_permission(
+                paseo_client::PermissionRequest {
+                    agent_id: "agent".into(),
+                    request_id: "question".into(),
+                    title: "Question".into(),
+                    description: None,
+                    extra: json!({"kind": "question", "input": {"questions": [
+                        {"header": "Domain", "question": "Which domain?", "allowOther": true,
+                         "options": [{"label": "New"}, {"label": "Reuse"}]},
+                        {"header": "Link", "question": "Admin link?", "allowOther": true,
+                         "options": [{"label": "Yes"}]}
+                    ]}}),
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let advance = |cx: &mut TestAppContext| {
+            window
+                .update(cx, |_, window, cx| {
+                    paseo_ui::AgentTab::test_advance_question(&tab, window, cx)
+                })
+                .unwrap()
+        };
+        assert_eq!(advance(cx), None, "Next waits for an answer");
+        window
+            .update(cx, |_, window, cx| {
+                paseo_ui::AgentTab::test_type_answer(
+                    &tab,
+                    "question",
+                    0,
+                    "Custom domain",
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        assert_eq!(advance(cx), Some(1), "a typed Other answer counts");
+        assert_eq!(advance(cx), Some(1), "Submit waits for the last answer");
+        window
+            .update(cx, |_, window, cx| {
+                paseo_ui::AgentTab::test_select_answer(&tab, "question", 1, "Yes", window, cx)
+            })
+            .unwrap();
+        let expected = Some(paseo_client::PermissionResponse::Allow {
+            selected_action_id: Some("accept".into()),
+            updated_input: Some(json!({
+                "questions": [
+                    {"header": "Domain", "question": "Which domain?", "allowOther": true,
+                     "options": [{"label": "New"}, {"label": "Reuse"}]},
+                    {"header": "Link", "question": "Admin link?", "allowOther": true,
+                     "options": [{"label": "Yes"}]}
+                ],
+                "answers": {"Domain": "Custom domain", "Link": "Yes"}
+            })),
+        });
+        let response = |cx: &mut TestAppContext| {
+            cx.read(|cx| paseo_ui::AgentTab::test_question_response(&tab, cx))
+        };
+        assert_eq!(response(cx), expected);
+        assert_eq!(cx.read(paseo_ui::test_store_error), None);
+        assert_eq!(advance(cx), Some(1));
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read(paseo_ui::test_store_error).as_deref(),
+            Some("Not connected to Paseo"),
+            "Submit sends the answers to the daemon"
+        );
+        assert_eq!(response(cx), expected, "a failed submit keeps the answers");
+    }
+
+    #[gpui::test]
+    async fn paseo_question_other_replaces_pick(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        cx.update(init);
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        cx.run_until_parked();
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let tab = window
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    let workspace_handle = cx.weak_entity();
+                    let tab = cx.new(|cx| {
+                        paseo_ui::AgentTab::new(
+                            Some("agent".into()),
+                            None,
+                            Some(workspace_handle),
+                            window,
+                            cx,
+                        )
+                    });
+                    workspace.add_item_to_active_pane(
+                        Box::new(tab.clone()),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    );
+                    tab
+                })
+            })
+            .unwrap();
+        cx.update(|cx| {
+            paseo_ui::test_add_permission(
+                paseo_client::PermissionRequest {
+                    agent_id: "agent".into(),
+                    request_id: "question".into(),
+                    title: "Question".into(),
+                    description: None,
+                    extra: json!({"kind": "question", "input": {"questions": [
+                        {"header": "Domain", "question": "Which domain?", "allowOther": true,
+                         "options": [{"label": "New"}, {"label": "Reuse"}]},
+                        {"header": "Tags", "question": "Which tags?", "allowOther": true,
+                         "multiSelect": true, "options": [{"label": "Web"}]}
+                    ]}}),
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let answer = |question: usize, cx: &mut TestAppContext| {
+            cx.read(|cx| paseo_ui::AgentTab::test_answer(&tab, "question", question, cx))
+        };
+        let select = |question: usize, label: &str, cx: &mut TestAppContext| {
+            window
+                .update(cx, |_, window, cx| {
+                    paseo_ui::AgentTab::test_select_answer(
+                        &tab, "question", question, label, window, cx,
+                    )
+                })
+                .unwrap();
+            cx.run_until_parked();
+        };
+        let type_answer = |question: usize, text: &str, cx: &mut TestAppContext| {
+            window
+                .update(cx, |_, window, cx| {
+                    paseo_ui::AgentTab::test_type_answer(
+                        &tab, "question", question, text, window, cx,
+                    )
+                })
+                .unwrap();
+            cx.run_until_parked();
+        };
+
+        type_answer(0, "Custom", cx);
+        select(0, "New", cx);
+        assert_eq!(answer(0, cx), (vec!["New".to_owned()], String::new()));
+        assert_eq!(
+            cx.read(|cx| paseo_ui::AgentTab::test_current_question(&tab, cx)),
+            Some(1),
+            "a single-choice pick moves on"
+        );
+        type_answer(0, "Custom", cx);
+        assert_eq!(answer(0, cx), (Vec::new(), "Custom".to_owned()));
+
+        select(1, "Web", cx);
+        type_answer(1, "Mobile", cx);
+        assert_eq!(
+            answer(1, cx),
+            (vec!["Web".to_owned()], "Mobile".to_owned()),
+            "multi-choice keeps both"
+        );
+    }
+
+    /// A window with two projects, `/one` (active, `a.rs` open in an editor) and `/two`.
+    async fn paseo_two_workspaces(
+        cx: &mut TestAppContext,
+    ) -> (
+        WindowHandle<MultiWorkspace>,
+        Entity<Workspace>,
+        Entity<Workspace>,
+    ) {
+        let app_state = init_test(cx);
+        cx.update(init);
+        let fs = app_state.fs.as_fake();
+        fs.insert_tree(path!("/one"), json!({"a.rs": ""})).await;
+        fs.insert_tree(path!("/two"), json!({"b.rs": ""})).await;
+        let project_one = Project::test(app_state.fs.clone(), [path!("/one").as_ref()], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project_one, window, cx));
+        cx.run_until_parked();
+        let one = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let project_two = Project::test(app_state.fs.clone(), [path!("/two").as_ref()], cx).await;
+        let two = window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.test_add_workspace(project_two, window, cx)
+            })
+            .unwrap();
+        activate_workspace(window, &one, cx);
+        window
+            .update(cx, |_, window, cx| {
+                one.update(cx, |workspace, cx| {
+                    workspace.open_abs_path(
+                        PathBuf::from(path!("/one/a.rs")),
+                        OpenOptions::default(),
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .unwrap()
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        (window, one, two)
+    }
+
+    fn activate_workspace(
+        window: WindowHandle<MultiWorkspace>,
+        workspace: &Entity<Workspace>,
+        cx: &mut TestAppContext,
+    ) {
+        window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.activate(workspace.clone(), None, window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    fn open_paseo_agent(
+        window: WindowHandle<MultiWorkspace>,
+        workspace: &Entity<Workspace>,
+        agent_id: &str,
+        cx: &mut TestAppContext,
+    ) {
+        window
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    paseo_ui::open_agent(workspace, agent_id, false, window, cx)
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    /// Puts an agent's tab in `workspace` directly, like a draft that became an agent there.
+    fn place_paseo_agent(
+        window: WindowHandle<MultiWorkspace>,
+        workspace: &Entity<Workspace>,
+        agent_id: &str,
+        cx: &mut TestAppContext,
+    ) {
+        window
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    paseo_ui::test_open_agent_here(workspace, agent_id, window, cx)
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    fn agent_tabs(workspace: &Entity<Workspace>, cx: &TestAppContext) -> Vec<gpui::EntityId> {
+        cx.read(|cx| {
+            workspace
+                .read(cx)
+                .items_of_type::<paseo_ui::AgentTab>(cx)
+                .map(|tab| paseo_ui::AgentTab::test_view_id(&tab, cx))
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    async fn paseo_agent_tabs_stay_in_their_workspace(cx: &mut TestAppContext) {
+        let (window, one, two) = paseo_two_workspaces(cx).await;
+        add_paseo_agent("agent", path!("/one/src"), cx);
+        open_paseo_agent(window, &one, "agent", cx);
+        let tab = agent_tabs(&one, cx);
+        assert_eq!(tab.len(), 1);
+        let editors = |workspace: &Entity<Workspace>, cx: &TestAppContext| {
+            cx.read(|cx| workspace.read(cx).items_of_type::<Editor>(cx).count())
+        };
+
+        activate_workspace(window, &two, cx);
+        assert_eq!(
+            agent_tabs(&one, cx),
+            tab,
+            "the chat stays with its workspace"
+        );
+        assert_eq!(agent_tabs(&two, cx), Vec::new());
+        assert_eq!(editors(&one, cx), 1);
+        assert_eq!(editors(&two, cx), 0);
+
+        activate_workspace(window, &one, cx);
+        assert_eq!(agent_tabs(&one, cx), tab);
+    }
+
+    fn add_paseo_agent(id: &str, directory: &str, cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            paseo_ui::test_use_local_host(cx);
+            paseo_ui::test_add_agent(
+                paseo_client::AgentSummary {
+                    id: id.into(),
+                    title: Some("Fix login".into()),
+                    status: "idle".into(),
+                    directory: Some(PathBuf::from(directory)),
+                    project: Some(json!({"projectName": "one"})),
+                    extra: json!({}),
+                },
+                cx,
+            )
+        });
+    }
+
+    /// Adds an agent of the Paseo workspace `paseo_workspace_id`; later `order`s are newer.
+    fn add_workspace_agent(
+        id: &str,
+        directory: &str,
+        paseo_workspace_id: &str,
+        order: u32,
+        cx: &mut TestAppContext,
+    ) {
+        let timestamp = format!("2026-09-30T00:00:{order:02}Z");
+        cx.update(|cx| {
+            paseo_ui::test_use_local_host(cx);
+            paseo_ui::test_add_agent(
+                paseo_client::AgentSummary {
+                    id: id.into(),
+                    title: Some(id.into()),
+                    status: "idle".into(),
+                    directory: Some(PathBuf::from(directory)),
+                    project: Some(json!({"projectName": "one"})),
+                    extra: json!({
+                        "workspaceId": paseo_workspace_id,
+                        "createdAt": timestamp,
+                        "updatedAt": timestamp,
+                    }),
+                },
+                cx,
+            )
+        });
+    }
+
+    /// Two Paseo workspaces on `/one`: `wks_a` with agents `a1` and `a2`, `wks_b` with `b1`.
+    fn add_two_paseo_workspaces_on_one(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            paseo_ui::test_add_paseo_workspace("wks_a", Path::new(path!("/one")), false, cx);
+            paseo_ui::test_add_paseo_workspace("wks_b", Path::new(path!("/one")), false, cx);
+        });
+        add_workspace_agent("a1", path!("/one"), "wks_a", 1, cx);
+        add_workspace_agent("a2", path!("/one"), "wks_a", 2, cx);
+        add_workspace_agent("b1", path!("/one"), "wks_b", 3, cx);
+    }
+
+    fn agent_tab_ids(workspace: &Entity<Workspace>, cx: &TestAppContext) -> Vec<String> {
+        cx.read(|cx| {
+            let mut ids = workspace
+                .read(cx)
+                .items_of_type::<paseo_ui::AgentTab>(cx)
+                .filter_map(|tab| tab.read(cx).agent_id(cx))
+                .collect::<Vec<_>>();
+            ids.sort();
+            ids
+        })
+    }
+
+    fn agent_tab(
+        workspace: &Entity<Workspace>,
+        agent_id: &str,
+        cx: &App,
+    ) -> Entity<paseo_ui::AgentTab> {
+        workspace
+            .read(cx)
+            .items_of_type::<paseo_ui::AgentTab>(cx)
+            .find(|tab| tab.read(cx).agent_id(cx).as_deref() == Some(agent_id))
+            .expect("agent tab")
+    }
+
+    #[gpui::test]
+    async fn paseo_switching_workspaces_swaps_agent_tabs(cx: &mut TestAppContext) {
+        let (window, one, _) = paseo_two_workspaces(cx).await;
+        add_two_paseo_workspaces_on_one(cx);
+
+        open_paseo_agent(window, &one, "a1", cx);
+        assert_eq!(agent_tab_ids(&one, cx), ["a1", "a2"]);
+        let a1_view =
+            cx.read(|cx| paseo_ui::AgentTab::test_view_id(&agent_tab(&one, "a1", cx), cx));
+        window
+            .update(cx, |_, window, cx| {
+                let tab = agent_tab(&one, "a1", cx);
+                paseo_ui::AgentTab::test_type_in_composer(&tab, "half a thought", window, cx);
+            })
+            .unwrap();
+
+        open_paseo_agent(window, &one, "b1", cx);
+        assert_eq!(agent_tab_ids(&one, cx), ["b1"]);
+
+        open_paseo_agent(window, &one, "a2", cx);
+        assert_eq!(agent_tab_ids(&one, cx), ["a1", "a2"]);
+        cx.read(|cx| {
+            let tab = agent_tab(&one, "a1", cx);
+            assert_eq!(paseo_ui::AgentTab::test_view_id(&tab, cx), a1_view);
+            assert_eq!(tab.read(cx).composer_text(cx), "half a thought");
+        });
+    }
+
+    #[gpui::test]
+    async fn paseo_workspace_opens_a_tab_for_every_agent(cx: &mut TestAppContext) {
+        let (window, one, _) = paseo_two_workspaces(cx).await;
+        add_two_paseo_workspaces_on_one(cx);
+        open_paseo_agent(window, &one, "a1", cx);
+        assert_eq!(agent_tab_ids(&one, cx), ["a1", "a2"]);
+
+        add_workspace_agent("a3", path!("/one"), "wks_a", 4, cx);
+        cx.run_until_parked();
+        assert_eq!(agent_tab_ids(&one, cx), ["a1", "a2", "a3"]);
+        let active = cx.read(|cx| {
+            one.read(cx)
+                .active_item(cx)
+                .and_then(|item| item.downcast::<paseo_ui::AgentTab>())
+                .and_then(|tab| tab.read(cx).agent_id(cx))
+        });
+        assert_eq!(
+            active.as_deref(),
+            Some("a1"),
+            "a new agent's tab opens in the background"
+        );
+    }
+
+    #[gpui::test]
+    async fn paseo_closed_agent_tab_stays_closed(cx: &mut TestAppContext) {
+        let (window, one, _) = paseo_two_workspaces(cx).await;
+        add_two_paseo_workspaces_on_one(cx);
+        open_paseo_agent(window, &one, "a1", cx);
+        window
+            .update(cx, |_, window, cx| {
+                let tab = agent_tab(&one, "a2", cx);
+                let pane = one.read(cx).pane_for(&tab).expect("pane");
+                pane.update(cx, |pane, cx| {
+                    pane.close_item_by_id(tab.entity_id(), SaveIntent::Skip, window, cx)
+                })
+            })
+            .unwrap()
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        add_workspace_agent("a3", path!("/one"), "wks_a", 4, cx);
+        cx.run_until_parked();
+        assert_eq!(agent_tab_ids(&one, cx), ["a1", "a3"]);
+
+        open_paseo_agent(window, &one, "a2", cx);
+        assert_eq!(agent_tab_ids(&one, cx), ["a1", "a2", "a3"]);
+    }
+
+    #[gpui::test]
+    async fn paseo_restored_mixed_tabs_show_one_workspace(cx: &mut TestAppContext) {
+        let (window, one, _) = paseo_two_workspaces(cx).await;
+        window
+            .update(cx, |_, window, cx| {
+                one.update(cx, |workspace, cx| {
+                    paseo_ui::test_restore_agent_tab(workspace, "a1", window, cx);
+                    paseo_ui::test_restore_agent_tab(workspace, "b1", window, cx);
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        add_two_paseo_workspaces_on_one(cx);
+        cx.run_until_parked();
+        assert_eq!(
+            agent_tab_ids(&one, cx),
+            ["b1"],
+            "the active tab's workspace is shown"
+        );
+
+        open_paseo_agent(window, &one, "a1", cx);
+        assert_eq!(agent_tab_ids(&one, cx), ["a1", "a2"]);
+    }
+
+    #[gpui::test]
+    async fn paseo_restored_tab_of_another_folder_brings_no_tabs(cx: &mut TestAppContext) {
+        let (window, _, two) = paseo_two_workspaces(cx).await;
+        window
+            .update(cx, |_, window, cx| {
+                two.update(cx, |workspace, cx| {
+                    paseo_ui::test_restore_agent_tab(workspace, "a1", window, cx);
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        add_two_paseo_workspaces_on_one(cx);
+        cx.run_until_parked();
+        assert!(agent_tab_ids(&two, cx).is_empty());
+    }
+
+    #[gpui::test]
+    async fn paseo_new_agent_joins_the_shown_workspace(cx: &mut TestAppContext) {
+        let (window, one, _) = paseo_two_workspaces(cx).await;
+        add_two_paseo_workspaces_on_one(cx);
+        open_paseo_agent(window, &one, "b1", cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                one.update(cx, |workspace, cx| {
+                    paseo_ui::new_agent(workspace, window, cx)
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(draft_workspace_ids(&one, cx), [Some("wks_b".to_owned())]);
+
+        window
+            .update(cx, |_, window, cx| {
+                window.dispatch_action(Box::new(paseo_ui::NewAgentWorkspace), cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let mut drafts = draft_workspace_ids(&one, cx);
+        drafts.sort();
+        assert_eq!(drafts, [None, Some("wks_b".to_owned())]);
+        assert_eq!(agent_tab_ids(&one, cx), ["b1"]);
+
+        open_paseo_agent(window, &one, "a1", cx);
+        assert_eq!(
+            draft_workspace_ids(&one, cx),
+            [None],
+            "wks_b's draft is hidden"
+        );
+    }
+
+    /// The Paseo workspace each draft tab's agent will join.
+    fn draft_workspace_ids(
+        workspace: &Entity<Workspace>,
+        cx: &TestAppContext,
+    ) -> Vec<Option<String>> {
+        cx.read(|cx| {
+            workspace
+                .read(cx)
+                .items_of_type::<paseo_ui::AgentTab>(cx)
+                .filter(|tab| tab.read(cx).agent_id(cx).is_none())
+                .map(|tab| paseo_ui::test_draft_workspace_id(&tab, cx))
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    async fn paseo_created_agent_keeps_one_tab(cx: &mut TestAppContext) {
+        let (window, one, _) = paseo_two_workspaces(cx).await;
+        add_two_paseo_workspaces_on_one(cx);
+        open_paseo_agent(window, &one, "a1", cx);
+        window
+            .update(cx, |_, window, cx| {
+                one.update(cx, |workspace, cx| {
+                    paseo_ui::new_agent(workspace, window, cx)
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let draft = cx.read(|cx| {
+            one.read(cx)
+                .items_of_type::<paseo_ui::AgentTab>(cx)
+                .find(|tab| tab.read(cx).agent_id(cx).is_none())
+                .expect("draft")
+        });
+        cx.update(|cx| paseo_ui::AgentTab::test_begin_creating(&draft, cx));
+        add_workspace_agent("a3", path!("/one"), "wks_a", 4, cx);
+        cx.run_until_parked();
+        cx.update(|cx| paseo_ui::AgentTab::test_finish_creating(&draft, "a3", cx));
+        cx.run_until_parked();
+        assert_eq!(agent_tab_ids(&one, cx), ["a1", "a2", "a3"]);
+    }
+
+    #[gpui::test]
+    async fn paseo_clear_starts_a_draft_in_the_same_workspace(cx: &mut TestAppContext) {
+        let (window, one, _) = paseo_two_workspaces(cx).await;
+        add_two_paseo_workspaces_on_one(cx);
+        open_paseo_agent(window, &one, "a1", cx);
+        window
+            .update(cx, |_, window, cx| {
+                let tab = agent_tab(&one, "a1", cx);
+                paseo_ui::AgentTab::test_type_in_composer(&tab, "/clear", window, cx);
+                paseo_ui::AgentTab::test_submit(&tab, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(draft_workspace_ids(&one, cx), [Some("wks_a".to_owned())]);
+    }
+
+    #[gpui::test]
+    async fn paseo_workspace_row_opens_its_tabs(cx: &mut TestAppContext) {
+        let (window, one, two) = paseo_two_workspaces(cx).await;
+        add_two_paseo_workspaces_on_one(cx);
+        activate_workspace(window, &two, cx);
+        window
+            .update(cx, |_, window, cx| {
+                two.update(cx, |workspace, cx| {
+                    paseo_ui::open_paseo_workspace_tabs(workspace, "wks_a", window, cx)
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let active = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        assert_eq!(active, one);
+        assert_eq!(agent_tab_ids(&one, cx), ["a1", "a2"]);
+        let active_agent = cx.read(|cx| {
+            one.read(cx)
+                .active_item(cx)
+                .and_then(|item| item.downcast::<paseo_ui::AgentTab>())
+                .and_then(|tab| tab.read(cx).agent_id(cx))
+        });
+        assert_eq!(active_agent.as_deref(), Some("a2"), "the most recent agent");
+        assert!(agent_tab_ids(&two, cx).is_empty());
+    }
+
+    #[gpui::test]
+    async fn paseo_archived_workspace_closes_its_tabs(cx: &mut TestAppContext) {
+        let (window, one, two) = paseo_two_workspaces(cx).await;
+        add_two_paseo_workspaces_on_one(cx);
+        open_paseo_agent(window, &one, "b1", cx);
+        open_paseo_agent(window, &one, "a1", cx);
+        cx.update(|cx| paseo_ui::test_archive_paseo_workspace("wks_a", cx));
+        cx.run_until_parked();
+        assert_eq!(
+            agent_tab_ids(&one, cx),
+            ["b1"],
+            "the hidden workspace is shown instead"
+        );
+
+        cx.update(|cx| {
+            paseo_ui::test_add_paseo_workspace("wks_w", Path::new(path!("/two")), true, cx)
+        });
+        add_workspace_agent("w1", path!("/two"), "wks_w", 5, cx);
+        open_paseo_agent(window, &two, "w1", cx);
+        assert_eq!(agent_tab_ids(&two, cx), ["w1"]);
+        cx.update(|cx| paseo_ui::test_archive_paseo_workspace("wks_w", cx));
+        cx.run_until_parked();
+        let held = window
+            .read_with(cx, |multi_workspace, _| {
+                multi_workspace.workspaces().cloned().collect::<Vec<_>>()
+            })
+            .unwrap();
+        assert!(
+            !held.contains(&two),
+            "a worktree workspace closes with its folder"
+        );
+        assert!(held.contains(&one));
+    }
+
+    #[gpui::test]
+    async fn paseo_sidebar_click_opens_in_own_workspace(cx: &mut TestAppContext) {
+        let (window, one, two) = paseo_two_workspaces(cx).await;
+        add_paseo_agent("agent", path!("/one/src"), cx);
+        let active = |cx: &mut TestAppContext| {
+            window
+                .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+                .unwrap()
+        };
+        activate_workspace(window, &two, cx);
+        open_paseo_agent(window, &two, "agent", cx);
+        assert_eq!(active(cx), one, "an agent opens in its own workspace");
+        assert_eq!(agent_tabs(&one, cx).len(), 1);
+
+        activate_workspace(window, &two, cx);
+        open_paseo_agent(window, &two, "agent", cx);
+        assert_eq!(active(cx), one, "and again from elsewhere");
+        assert_eq!(agent_tabs(&one, cx).len(), 1, "reusing its tab");
+        assert_eq!(agent_tabs(&two, cx), Vec::new());
+    }
+
+    #[gpui::test]
+    async fn paseo_agent_in_other_window_focuses_it(cx: &mut TestAppContext) {
+        let (window, one, two) = paseo_two_workspaces(cx).await;
+        let fs = cx.read(|cx| one.read(cx).app_state().fs.clone());
+        fs.as_fake()
+            .insert_tree(path!("/three"), json!({"c.rs": ""}))
+            .await;
+        let project_three = Project::test(fs, [path!("/three").as_ref()], cx).await;
+        let other_window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project_three, window, cx));
+        cx.run_until_parked();
+        let three = other_window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        add_paseo_agent("agent", path!("/three/src"), cx);
+
+        activate_workspace(window, &two, cx);
+        open_paseo_agent(window, &two, "agent", cx);
+        assert_eq!(
+            agent_tabs(&three, cx).len(),
+            1,
+            "the agent opens in the window that has its workspace"
+        );
+        assert_eq!(agent_tabs(&two, cx), Vec::new());
+        assert_eq!(
+            window
+                .read_with(cx, |multi_workspace, _| multi_workspace
+                    .workspaces()
+                    .count())
+                .unwrap(),
+            2,
+            "without opening a second copy of its workspace here"
+        );
+        assert_eq!(
+            cx.update(|cx| cx.active_window()),
+            Some(other_window.into()),
+            "and brings that window forward"
+        );
+    }
+
+    #[gpui::test]
+    async fn paseo_new_agent_on_other_folder_drafts_there(cx: &mut TestAppContext) {
+        let (window, one, two) = paseo_two_workspaces(cx).await;
+        cx.update(paseo_ui::test_use_local_host);
+        activate_workspace(window, &two, cx);
+        window
+            .update(cx, |_, window, cx| {
+                two.update(cx, |workspace, cx| {
+                    paseo_ui::open_draft_in(
+                        workspace,
+                        PathBuf::from(path!("/one/src")),
+                        window,
+                        cx,
+                    )
+                    .detach_and_log_err(cx);
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            window
+                .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+                .unwrap(),
+            one,
+            "a new agent for another folder switches to that folder's workspace"
+        );
+        assert_eq!(agent_tabs(&one, cx).len(), 1, "and drafts there");
+        assert_eq!(agent_tabs(&two, cx), Vec::new());
+
+        window
+            .update(cx, |_, window, cx| {
+                one.update(cx, |workspace, cx| {
+                    paseo_ui::open_draft_in(workspace, PathBuf::from(path!("/one")), window, cx)
+                        .detach_and_log_err(cx);
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            agent_tabs(&one, cx).len(),
+            2,
+            "its own folder drafts in place"
+        );
+    }
+
+    #[gpui::test]
+    async fn paseo_restored_tab_of_other_workspace_closes(cx: &mut TestAppContext) {
+        let (window, _one, two) = paseo_two_workspaces(cx).await;
+        let restore = |agent_id: &str, cx: &mut TestAppContext| {
+            window
+                .update(cx, |_, window, cx| {
+                    two.update(cx, |workspace, cx| {
+                        paseo_ui::test_restore_agent_tab(workspace, agent_id, window, cx)
+                    })
+                })
+                .unwrap();
+            cx.run_until_parked();
+        };
+        let restored_agents = |cx: &TestAppContext| {
+            cx.read(|cx| {
+                two.read(cx)
+                    .items_of_type::<paseo_ui::AgentTab>(cx)
+                    .filter_map(|tab| tab.read(cx).agent_id(cx))
+                    .collect::<Vec<_>>()
+            })
+        };
+        add_paseo_agent("known-elsewhere", path!("/one/src"), cx);
+        restore("known-elsewhere", cx);
+        assert_eq!(
+            restored_agents(cx),
+            Vec::<String>::new(),
+            "a restored tab of an agent already known to be elsewhere closes"
+        );
+
+        restore("theirs", cx);
+        restore("ours", cx);
+        assert_eq!(
+            restored_agents(cx).len(),
+            2,
+            "tabs stay while their agents aren't known yet"
+        );
+        add_paseo_agent("theirs", path!("/one/src"), cx);
+        add_paseo_agent("ours", path!("/two/src"), cx);
+        cx.run_until_parked();
+        assert_eq!(
+            restored_agents(cx),
+            vec!["ours".to_string()],
+            "once known, only the workspace's own agent keeps its tab"
+        );
+    }
+
+    #[gpui::test]
+    async fn paseo_restored_tab_moved_from_the_empty_start_is_still_checked(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, start, one) = paseo_empty_start_and_one(cx).await;
+        cx.update(paseo_ui::test_use_local_host);
+        window
+            .update(cx, |_, window, cx| {
+                start.update(cx, |workspace, cx| {
+                    paseo_ui::test_restore_agent_tab(workspace, "unknown-yet", window, cx)
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        activate_workspace(window, &one, cx);
+        assert_eq!(
+            agent_tabs(&one, cx).len(),
+            1,
+            "a restored tab whose agent isn't known yet moves with the drafts"
+        );
+
+        add_paseo_agent("unknown-yet", path!("/elsewhere/src"), cx);
+        cx.run_until_parked();
+        assert_eq!(
+            agent_tabs(&one, cx),
+            Vec::new(),
+            "and still closes once its agent turns out to belong elsewhere"
+        );
+    }
+
+    #[gpui::test]
+    async fn paseo_agent_open_failure_stays_put(cx: &mut TestAppContext) {
+        let (window, one, two) = paseo_two_workspaces(cx).await;
+        add_paseo_agent("agent", "relative/src", cx);
+
+        activate_workspace(window, &two, cx);
+        open_paseo_agent(window, &two, "agent", cx);
+        assert_eq!(
+            agent_tabs(&two, cx),
+            Vec::new(),
+            "an agent whose workspace can't open doesn't open here"
+        );
+        assert_eq!(agent_tabs(&one, cx), Vec::new());
+        assert_eq!(
+            window
+                .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+                .unwrap(),
+            two,
+            "the window stays where it was"
+        );
+    }
+
+    /// A window whose start workspace has no folders, plus a workspace for `/one`.
+    async fn paseo_empty_start_and_one(
+        cx: &mut TestAppContext,
+    ) -> (
+        WindowHandle<MultiWorkspace>,
+        Entity<Workspace>,
+        Entity<Workspace>,
+    ) {
+        let app_state = init_test(cx);
+        cx.update(init);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/one"), json!({"a.rs": ""}))
+            .await;
+        let empty = Project::test(app_state.fs.clone(), [], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(empty, window, cx));
+        cx.run_until_parked();
+        let start = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let project_one = Project::test(app_state.fs.clone(), [path!("/one").as_ref()], cx).await;
+        let one = window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.test_add_workspace(project_one, window, cx)
+            })
+            .unwrap();
+        activate_workspace(window, &start, cx);
+        (window, start, one)
+    }
+
+    fn type_in_agent_tab(
+        window: WindowHandle<MultiWorkspace>,
+        workspace: &Entity<Workspace>,
+        text: &str,
+        cx: &mut TestAppContext,
+    ) {
+        window
+            .update(cx, |_, window, cx| {
+                let tab = workspace
+                    .read(cx)
+                    .items_of_type::<paseo_ui::AgentTab>(cx)
+                    .next()
+                    .expect("agent tab");
+                paseo_ui::AgentTab::test_type_in_composer(&tab, text, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn paseo_empty_workspace_sends_agents_to_their_workspace(cx: &mut TestAppContext) {
+        let (window, start, one) = paseo_empty_start_and_one(cx).await;
+        let fs = cx.read(|cx| one.read(cx).app_state().fs.clone());
+        fs.as_fake()
+            .insert_tree(path!("/two"), json!({"b.rs": ""}))
+            .await;
+        fs.as_fake()
+            .insert_tree(path!("/three"), json!({"src": {"c.rs": ""}}))
+            .await;
+        let project_two = Project::test(fs, [path!("/two").as_ref()], cx).await;
+        let two = window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.test_add_workspace(project_two, window, cx)
+            })
+            .unwrap();
+        add_paseo_agent("in-two", path!("/two/src"), cx);
+        add_paseo_agent("in-three", path!("/three/src"), cx);
+        add_paseo_agent("also-in-three", path!("/three/src"), cx);
+        activate_workspace(window, &start, cx);
+        place_paseo_agent(window, &start, "in-two", cx);
+        place_paseo_agent(window, &start, "in-three", cx);
+        place_paseo_agent(window, &start, "also-in-three", cx);
+        window
+            .update(cx, |_, window, cx| {
+                start.update(cx, |workspace, cx| {
+                    paseo_ui::open_draft(workspace, None, window, cx);
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(agent_tabs(&start, cx).len(), 4);
+
+        activate_workspace(window, &one, cx);
+        let active = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        assert_eq!(active, one, "sending agents home doesn't switch the window");
+        assert_eq!(agent_tabs(&one, cx).len(), 1, "the draft comes along");
+        assert_eq!(
+            agent_tabs(&two, cx).len(),
+            1,
+            "an agent goes to its open workspace"
+        );
+        let threes = window
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace
+                    .workspaces()
+                    .filter(|workspace| {
+                        workspace
+                            .read(cx)
+                            .root_paths(cx)
+                            .iter()
+                            .any(|root| root.as_ref() == Path::new(path!("/three/src")))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+        assert_eq!(
+            threes.len(),
+            1,
+            "a folder that wasn't open opens once in the background, for both its agents"
+        );
+        assert_eq!(agent_tabs(&threes[0], cx).len(), 2, "and gets their tabs");
+    }
+
+    #[gpui::test]
+    async fn paseo_moving_out_of_the_empty_start_keeps_unsent_text(cx: &mut TestAppContext) {
+        let (window, start, one) = paseo_empty_start_and_one(cx).await;
+        add_paseo_agent("agent", path!("/one/src"), cx);
+        place_paseo_agent(window, &start, "agent", cx);
+        type_in_agent_tab(window, &start, "half-written reply", cx);
+        let typed = agent_tabs(&start, cx);
+        place_paseo_agent(window, &one, "agent", cx);
+
+        activate_workspace(window, &one, cx);
+        assert_eq!(
+            agent_tabs(&one, cx),
+            typed,
+            "the chat with unsent text replaces the empty one"
+        );
+    }
+
+    #[gpui::test]
+    async fn paseo_moving_out_of_the_empty_start_keeps_the_targets_text(cx: &mut TestAppContext) {
+        let (window, start, one) = paseo_empty_start_and_one(cx).await;
+        add_paseo_agent("agent", path!("/one/src"), cx);
+        place_paseo_agent(window, &start, "agent", cx);
+        place_paseo_agent(window, &one, "agent", cx);
+        type_in_agent_tab(window, &one, "reply in progress", cx);
+        let typed = agent_tabs(&one, cx);
+
+        activate_workspace(window, &one, cx);
+        assert_eq!(
+            agent_tabs(&one, cx),
+            typed,
+            "an empty chat gives way to the one with unsent text"
+        );
+    }
+
+    fn paseo_sidebar_size(
+        workspace: &Entity<Workspace>,
+        cx: &TestAppContext,
+    ) -> Option<workspace::dock::PanelSizeState> {
+        cx.read(|cx| {
+            let workspace = workspace.read(cx);
+            let panel = workspace.panel::<paseo_ui::PaseoPanel>(cx)?;
+            workspace
+                .all_docks()
+                .into_iter()
+                .find_map(|dock| dock.read(cx).stored_panel_size_state(&panel))
+        })
+    }
+
+    #[gpui::test]
+    async fn paseo_sidebar_width_is_shared(cx: &mut TestAppContext) {
+        let (window, one, two) = paseo_two_workspaces(cx).await;
+        let wide = workspace::dock::PanelSizeState {
+            size: Some(px(420.)),
+            flex: None,
+        };
+        window
+            .update(cx, |_, window, cx| {
+                one.update(cx, |workspace, cx| {
+                    workspace.set_panel_size_state::<paseo_ui::PaseoPanel>(wide, window, cx)
+                })
+            })
+            .unwrap();
+        activate_workspace(window, &two, cx);
+        assert_eq!(paseo_sidebar_size(&two, cx), Some(wide));
+
+        let project = Project::test(
+            one.read_with(cx, |workspace, _| workspace.app_state().fs.clone()),
+            [],
+            cx,
+        )
+        .await;
+        let three = window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.test_add_workspace(project, window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            paseo_sidebar_size(&three, cx),
+            Some(wide),
+            "a project opened later starts at the shared width"
+        );
+
+        let wider = workspace::dock::PanelSizeState {
+            size: Some(px(600.)),
+            flex: None,
+        };
+        let panel_three = paseo_panel(&three, cx);
+        window
+            .update(cx, |_, window, cx| {
+                three.update(cx, |workspace, cx| {
+                    workspace.set_panel_size_state::<paseo_ui::PaseoPanel>(wider, window, cx)
+                });
+                paseo_ui::PaseoPanel::test_size_changed(&panel_three, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let project = Project::test(
+            one.read_with(cx, |workspace, _| workspace.app_state().fs.clone()),
+            [],
+            cx,
+        )
+        .await;
+        let four = window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.test_add_workspace(project, window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            paseo_sidebar_size(&four, cx),
+            Some(wider),
+            "a resize, not only a switch, sets the shared width"
+        );
+    }
+
+    #[gpui::test]
+    async fn paseo_chat_tabs_follow_from_the_empty_start(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        cx.update(init);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/project"), json!({"a.rs": ""}))
+            .await;
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        cx.run_until_parked();
+        let start = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        add_paseo_agent("agent", path!("/project/src"), cx);
+        place_paseo_agent(window, &start, "agent", cx);
+        let chats = agent_tabs(&start, cx);
+        assert_eq!(chats.len(), 1);
+
+        window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.open_project(
+                    vec![PathBuf::from(path!("/project"))],
+                    workspace::OpenMode::Activate,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap()
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        let active = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        assert_eq!(
+            agent_tabs(&active, cx),
+            chats,
+            "chats opened before any project stay open once one opens"
+        );
+    }
+
+    fn paseo_panel(
+        workspace: &Entity<Workspace>,
+        cx: &TestAppContext,
+    ) -> Entity<paseo_ui::PaseoPanel> {
+        cx.read(|cx| {
+            workspace
+                .read(cx)
+                .panel::<paseo_ui::PaseoPanel>(cx)
+                .expect("Paseo panel")
+        })
+    }
+
+    #[gpui::test]
+    async fn paseo_sidebar_grouping_is_shared(cx: &mut TestAppContext) {
+        let (window, one, two) = paseo_two_workspaces(cx).await;
+        let (panel_one, panel_two) = (paseo_panel(&one, cx), paseo_panel(&two, cx));
+        assert!(!cx.read(|cx| paseo_ui::PaseoPanel::test_groups_by_status(&panel_two, cx)));
+        window
+            .update(cx, |_, window, cx| {
+                paseo_ui::PaseoPanel::test_toggle_grouping(&panel_one, window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            cx.read(|cx| paseo_ui::PaseoPanel::test_groups_by_status(&panel_two, cx)),
+            "every project's sidebar shows the grouping just chosen"
+        );
+    }
+
+    #[gpui::test]
+    async fn paseo_sidebar_left_behind_catches_up(cx: &mut TestAppContext) {
+        let (window, one, two) = paseo_two_workspaces(cx).await;
+        let panel_one = paseo_panel(&one, cx);
+        cx.update(|cx| paseo_ui::PaseoPanel::test_set_pointer_inside(&panel_one, true, cx));
+        cx.update(|cx| {
+            paseo_ui::test_add_permission(
+                paseo_client::PermissionRequest {
+                    agent_id: "agent".into(),
+                    request_id: "request".into(),
+                    title: "Run".into(),
+                    description: None,
+                    extra: json!({}),
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(cx.read(|cx| paseo_ui::PaseoPanel::test_refresh_pending(&panel_one, cx)));
+
+        activate_workspace(window, &two, cx);
+        assert!(
+            !cx.read(|cx| paseo_ui::PaseoPanel::test_refresh_pending(&panel_one, cx)),
+            "a sidebar switched away from stops waiting for the pointer to leave"
+        );
     }
 
     /// A window whose project holds `/root/main.rs`, opened in an editor.
@@ -6711,6 +8005,43 @@ mod tests {
             text.contains("fn main() {\n    l\n"),
             "unexpected composer text: {text}"
         );
+    }
+
+    #[gpui::test]
+    async fn paseo_selection_skips_another_workspaces_focused_agent(cx: &mut TestAppContext) {
+        let (window, one, two) = paseo_two_workspaces(cx).await;
+        add_paseo_agent("elsewhere", path!("/two/src"), cx);
+        cx.update(|cx| paseo_ui::test_set_focused_agent("elsewhere", cx));
+        let editor = cx.read(|cx| {
+            one.read(cx)
+                .active_item(cx)
+                .and_then(|item| item.downcast::<Editor>())
+                .expect("a.rs is open in /one")
+        });
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| editor.set_text("fn main() {}", window, cx));
+                editor.focus_handle(cx).dispatch_action(
+                    &zed_actions::paseo::AddSelectionToAgent,
+                    window,
+                    cx,
+                );
+            })
+            .expect("workspace window");
+        cx.run_until_parked();
+
+        let agents = cx.read(|cx| {
+            one.read(cx)
+                .items_of_type::<paseo_ui::AgentTab>(cx)
+                .map(|tab| tab.read(cx).agent_id(cx))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            agents,
+            vec![None],
+            "the selection goes to a new draft here, not another workspace's agent"
+        );
+        assert_eq!(agent_tabs(&two, cx), Vec::new());
     }
 
     fn agent_edit_hunk_count(editor: &Entity<Editor>, cx: &mut TestAppContext) -> usize {

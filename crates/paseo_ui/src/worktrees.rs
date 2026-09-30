@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use ui::{Tooltip, prelude::*};
 use workspace::{Item, Workspace, item::ItemEvent};
 
-use crate::store::{ConnectionStatus, PaseoStore};
+use crate::store::{ConnectionStatus, PaseoStore, agent_workspace_id};
 use crate::timeline::{format_relative, parse_timestamp};
 
 enum WorktreesState {
@@ -45,13 +45,11 @@ fn worktree_rows(
             let agent_count = agents
                 .iter()
                 .filter(|agent| {
-                    agent.extra["workspaceId"]
-                        .as_str()
-                        .is_some_and(|workspace_id| {
-                            using_workspaces
-                                .iter()
-                                .any(|workspace| workspace.id == workspace_id)
-                        })
+                    agent_workspace_id(agent).is_some_and(|workspace_id| {
+                        using_workspaces
+                            .iter()
+                            .any(|workspace| workspace.id == workspace_id)
+                    })
                 })
                 .count();
             WorktreeRow {

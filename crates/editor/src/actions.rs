@@ -715,7 +715,7 @@ actions!(
         NextScreen,
         /// Goes to the next snippet tabstop if one exists.
         NextSnippetTabstop,
-        /// Opens a view of all bookmarks in the project.
+        /// Opens a view of all bookmarks in the open folders.
         ViewBookmarks,
         /// Opens the context menu at cursor position.
         OpenContextMenu,

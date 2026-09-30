@@ -11,7 +11,7 @@ use ui::{ContextMenu, prelude::*};
 use ui_input::InputField;
 use workspace::{ModalView, Workspace};
 
-use crate::{composer::BaseRef, open_draft, sidebar::project_label, store, terminal, worktrees};
+use crate::{composer::BaseRef, sidebar::project_label, store, terminal, worktrees};
 
 /// Paseo's label colors, in the order new labels take them.
 const LABEL_COLORS: [&str; 10] = [
@@ -158,9 +158,9 @@ fn workspace_agents<'a>(
     agents: &'a [AgentSummary],
     workspace_id: &'a str,
 ) -> impl Iterator<Item = &'a AgentSummary> {
-    agents.iter().filter(move |agent| {
-        agent.extra.get("workspaceId").and_then(Value::as_str) == Some(workspace_id)
-    })
+    agents
+        .iter()
+        .filter(move |agent| store::agent_workspace_id(agent) == Some(workspace_id))
 }
 
 /// Whether "Mark as Read" has something to clear: the daemon clears attention except on agents
@@ -212,6 +212,34 @@ where
     });
 }
 
+/// Sets a workspace's title; an empty name restores the default.
+fn rename_workspace(workspace_id: String, name: &str, cx: &mut App) {
+    let title = Some(name.trim().to_owned()).filter(|name| !name.is_empty());
+    request(cx, move |session| async move {
+        session
+            .set_workspace_title(&workspace_id, title.as_deref())
+            .await
+    });
+}
+
+pub(crate) fn open_workspace_rename(
+    workspace: &mut Workspace,
+    descriptor: &WorkspaceDescriptor,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let workspace_id = descriptor.id.clone();
+    open_text_prompt(
+        workspace,
+        "Rename workspace",
+        "Workspace name (empty uses the default)",
+        descriptor.title.as_deref().unwrap_or(&descriptor.name),
+        move |name, _, cx| rename_workspace(workspace_id.clone(), &name, cx),
+        window,
+        cx,
+    );
+}
+
 /// The workspace row's right-click menu, like Paseo's sidebar workspace menu.
 pub(crate) fn workspace_menu(
     menu: ContextMenu,
@@ -231,7 +259,7 @@ pub(crate) fn workspace_menu(
     let setup = store.state.setup.get(workspace_id).cloned();
     let id = descriptor.id.clone();
 
-    let new_agent = (workspace.clone(), descriptor.directory.clone());
+    let new_agent = (workspace.clone(), descriptor.id.clone());
     let rename = (
         workspace.clone(),
         id.clone(),
@@ -251,10 +279,11 @@ pub(crate) fn workspace_menu(
 
     let mut menu = menu
         .entry("New Agent Here", None, move |window, cx| {
-            let (workspace, directory) = new_agent.clone();
+            let (workspace, paseo_workspace_id) = new_agent.clone();
             window.defer(cx, move |window, cx| {
                 if let Err(error) = workspace.update(cx, |workspace, cx| {
-                    open_draft(workspace, Some(directory), window, cx);
+                    crate::new_agent_in_paseo_workspace(workspace, &paseo_workspace_id, window, cx)
+                        .detach_and_log_err(cx);
                 }) {
                     log::debug!("Paseo workspace closed: {error}");
                 }
@@ -268,15 +297,7 @@ pub(crate) fn workspace_menu(
                 "Rename workspace",
                 "Workspace name (empty uses the default)",
                 current,
-                move |name, _, cx| {
-                    let workspace_id = workspace_id.clone();
-                    let title = Some(name.trim().to_owned()).filter(|name| !name.is_empty());
-                    request(cx, move |session| async move {
-                        session
-                            .set_workspace_title(&workspace_id, title.as_deref())
-                            .await
-                    });
-                },
+                move |name, _, cx| rename_workspace(workspace_id.clone(), &name, cx),
                 window,
                 cx,
             );
@@ -694,21 +715,27 @@ impl NewWorkspaceModal {
         cx.emit(DismissEvent);
         window.defer(cx, move |window, cx| {
             if let Err(error) = workspace.update(cx, |workspace, cx| {
-                let tab = open_draft(workspace, Some(root), window, cx);
-                let composer = tab.read(cx).view().read(cx).composer.clone();
-                composer.update(cx, |composer, cx| {
-                    composer.set_new_worktree(new_worktree, cx);
-                    if let Some(base) = base {
-                        composer.set_worktree_base(
-                            BaseRef {
-                                label: base.clone(),
-                                ref_name: base,
-                                detail: None,
-                            },
-                            cx,
-                        );
-                    }
-                });
+                let draft = crate::open_draft_in(workspace, root, window, cx);
+                cx.spawn(async move |_, cx| {
+                    let tab = draft.await?;
+                    let composer =
+                        tab.read_with(cx, |tab, cx| tab.view().read(cx).composer.clone());
+                    composer.update(cx, |composer, cx| {
+                        composer.set_new_worktree(new_worktree, cx);
+                        if let Some(base) = base {
+                            composer.set_worktree_base(
+                                BaseRef {
+                                    label: base.clone(),
+                                    ref_name: base,
+                                    detail: None,
+                                },
+                                cx,
+                            );
+                        }
+                    });
+                    anyhow::Ok(())
+                })
+                .detach_and_log_err(cx);
             }) {
                 log::debug!("Paseo workspace closed: {error}");
             }
@@ -870,7 +897,7 @@ pub(crate) fn project_menu(
             let (workspace, directory) = new_agent.clone();
             window.defer(cx, move |window, cx| {
                 if let Err(error) = workspace.update(cx, |workspace, cx| {
-                    open_draft(workspace, Some(directory), window, cx);
+                    crate::open_draft_in(workspace, directory, window, cx).detach_and_log_err(cx);
                 }) {
                     log::debug!("Paseo workspace closed: {error}");
                 }

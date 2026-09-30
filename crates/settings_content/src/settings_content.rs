@@ -341,6 +341,104 @@ pub struct SettingsContent {
 pub struct PaseoSettingsContent {
     pub profiles: Option<Vec<PaseoConnectionProfile>>,
     pub active_profile: Option<String>,
+    /// How agent chats read.
+    pub chat: Option<PaseoChatSettingsContent>,
+    /// How the Paseo sidebar lists workspaces and agents.
+    pub sidebar: Option<PaseoSidebarSettingsContent>,
+    /// How Zaseo tells you an agent needs you.
+    pub alerts: Option<PaseoAlertSettingsContent>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct PaseoChatSettingsContent {
+    /// Font family for chat prose; code keeps the buffer font.
+    ///
+    /// Default: the UI font family
+    pub font_family: Option<FontFamilyName>,
+    /// Font size of the chat, in pixels. Zooming the editor (Ctrl +/-) zooms it too.
+    ///
+    /// Default: the UI font size
+    pub font_size: Option<FontSize>,
+    /// Line height of chat prose, as a multiple of its font size.
+    ///
+    /// Default: 1.55
+    pub line_height: Option<f32>,
+    /// Widest the chat column grows, in characters of the chat font.
+    ///
+    /// Default: 80
+    pub line_length: Option<u32>,
+    /// Whether a finished turn starts with its steps before the final answer folded under
+    /// "Worked for …".
+    ///
+    /// Default: true
+    pub fold_finished_turns: Option<bool>,
+    /// Whether thinking shows as a line while an agent works; when off it only shows inside an
+    /// unfolded turn.
+    ///
+    /// Default: true
+    pub show_thinking: Option<bool>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct PaseoSidebarSettingsContent {
+    /// How the sidebar groups agents.
+    ///
+    /// Default: project
+    pub grouping: Option<PaseoSidebarGrouping>,
+    /// How many lines a row's title may wrap onto.
+    ///
+    /// Default: 2
+    pub title_lines: Option<u32>,
+    /// Whether sidebar rows and agent tabs animate: the activity line under running or waiting
+    /// agents, and rows easing in or flashing when an agent appears or changes state.
+    ///
+    /// Default: true
+    pub animate_status: Option<bool>,
+}
+
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    PartialEq,
+    Eq,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PaseoSidebarGrouping {
+    /// Projects, then their workspaces and agents.
+    #[default]
+    Project,
+    /// Workspaces by what their agents are doing: needs input, working, done.
+    Status,
+    /// Workspaces under each of their labels.
+    Labels,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct PaseoAlertSettingsContent {
+    /// Whether an agent that finishes, fails or needs input raises a toast.
+    ///
+    /// Default: true
+    pub toasts: Option<bool>,
+    /// Whether the sidebar's bell shows how many agents need you.
+    ///
+    /// Default: true
+    pub bell_count: Option<bool>,
+    /// Whether an agent that finishes, fails or needs input while no Zaseo window has focus
+    /// raises a system notification.
+    ///
+    /// Default: true
+    pub system_notifications: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]

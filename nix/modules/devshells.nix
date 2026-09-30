@@ -13,29 +13,6 @@
       # `crates/docs_preprocessor/Cargo.toml`).
       mdbook = (import inputs.nixpkgs-mdbook { inherit system; }).mdbook;
 
-      # Prebuilt docs preprocessor/postprocessor binary. `docs/book.toml`
-      # defaults to `cargo run -p docs_preprocessor` so non-Nix contributors are
-      # unaffected; in the devshell we point mdBook at this prebuilt binary via
-      # the `MDBOOK_*` env vars below so `mdbook build docs` doesn't have to
-      # compile the preprocessor on every run.
-      #
-      # We reuse `zed-editor`'s crane builder and shared arguments (exposed via
-      # `passthru`) rather than `overrideAttrs`, because crane bakes
-      # `cargoExtraArgs` into the build command at evaluation time.
-      docs-preprocessor = zed-editor.passthru.craneLib.buildPackage (
-        zed-editor.passthru.commonArgs
-        // {
-          inherit (zed-editor.passthru) cargoArtifacts;
-          pname = "zed-docs-preprocessor";
-          cargoExtraArgs = "-p docs_preprocessor --locked";
-          dontUseCmakeConfigure = true;
-          meta = {
-            description = "mdBook preprocessor and postprocessor for the Zed docs";
-            mainProgram = "docs_preprocessor";
-          };
-        }
-      );
-
       rustBin = inputs.rust-overlay.lib.mkRustBin { } pkgs;
       rustToolchain = rustBin.fromRustupToolchainFile ../../rust-toolchain.toml;
 
@@ -65,6 +42,17 @@
         name = "zed-editor-dev";
         inputsFrom = [ zed-editor ];
 
+        # `packages` below puts this shell's cargo first on PATH, which would bypass mbx's Cargo
+        # shim (written by `mbx setup`); put the shim back in front when it's installed. mbx then
+        # runs the next cargo on PATH, so the timing wrapper still applies.
+        shellHook = ''
+          mbx_cargo_shim_dir="''${XDG_DATA_HOME:-$HOME/.local/share}/mbx/bin"
+          if [ -x "$mbx_cargo_shim_dir/cargo" ]; then
+            PATH="$mbx_cargo_shim_dir:$PATH"
+          fi
+          unset mbx_cargo_shim_dir
+        '';
+
         packages =
           with pkgs;
           [
@@ -82,9 +70,11 @@
             nodejs_22
             zig
 
-            # Documentation tooling: `nix develop -c mdbook build docs`
+            # Documentation tooling: `nix develop -c mdbook build docs`. The docs
+            # preprocessor runs through `docs/book.toml`'s `cargo run` default rather
+            # than a prebuilt binary, because building it here from the working tree
+            # rebuilt Zed's dependencies whenever the tree changed.
             mdbook
-            docs-preprocessor
 
             # A11y testing infra
             gobject-introspection
@@ -113,13 +103,6 @@
               ];
             };
             PROTOC = "${pkgs.protobuf}/bin/protoc";
-
-            # Point mdBook at the prebuilt preprocessor/postprocessor binary
-            # instead of `cargo run`. mdBook lowercases these keys and turns `_`
-            # into `-`, so they map to `preprocessor.zed-docs-preprocessor.command`
-            # and `output.zed-html.command` in `docs/book.toml`.
-            MDBOOK_PREPROCESSOR__ZED_DOCS_PREPROCESSOR__COMMAND = "${docs-preprocessor}/bin/docs_preprocessor";
-            MDBOOK_OUTPUT__ZED_HTML__COMMAND = "${docs-preprocessor}/bin/docs_preprocessor postprocess";
 
             ZED_ZSTD_MUSL_LIB = "${pkgs.pkgsCross.musl64.pkgsStatic.zstd.out}/lib";
             # For aws-lc-sys musl cross-compilation

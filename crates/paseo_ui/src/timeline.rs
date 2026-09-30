@@ -1,7 +1,7 @@
 use chrono::{DateTime, Datelike as _, TimeZone, Utc};
 use paseo_client::{TimelineEntry, TimelinePayload};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 use std::path::Path;
 
@@ -512,6 +512,94 @@ pub fn tool_display(call: &ToolCall, cwd: Option<&Path>) -> ToolDisplay {
         label,
         summary: summary.map(|summary| summary.lines().next().unwrap_or_default().to_owned()),
     }
+}
+
+/// One chat row's worth of a turn: an item on its own, or a run of tool calls shown as one group.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Segment {
+    Item(usize),
+    ToolRun(Range<usize>),
+}
+
+/// Whether a tool call joins a group. Plans and thinking read as prose, so Paseo keeps them out.
+fn is_groupable_tool(item: &StreamItem) -> bool {
+    match &item.content {
+        StreamContent::Tool(call) => !matches!(
+            tool_display(call, None).kind,
+            ToolKind::Plan | ToolKind::Thinking
+        ),
+        _ => false,
+    }
+}
+
+/// Splits `range` of `items` into segments, grouping every unbroken run of tool calls, as
+/// Paseo's overview does. Any other item ends a run.
+pub fn tool_runs(items: &[StreamItem], range: Range<usize>) -> Vec<Segment> {
+    let mut segments = Vec::new();
+    let mut run_start = None;
+    for index in range.clone() {
+        let groupable = items.get(index).is_some_and(is_groupable_tool);
+        match (groupable, run_start) {
+            (true, None) => run_start = Some(index),
+            (true, Some(_)) => {}
+            (false, start) => {
+                if let Some(start) = start {
+                    segments.push(Segment::ToolRun(start..index));
+                    run_start = None;
+                }
+                segments.push(Segment::Item(index));
+            }
+        }
+    }
+    if let Some(start) = run_start {
+        segments.push(Segment::ToolRun(start..range.end));
+    }
+    segments
+}
+
+/// A tool group's summary, worded like Paseo's: "Ran 2 commands and used 1 other tool".
+pub fn tool_group_label<'a>(calls: impl IntoIterator<Item = &'a ToolCall>) -> String {
+    let mut edited = BTreeSet::new();
+    let mut read = BTreeSet::new();
+    let (mut commands, mut searches, mut other) = (0, 0, 0);
+    for call in calls {
+        let path = call.detail.get("filePath").and_then(Value::as_str);
+        match tool_display(call, None).kind {
+            ToolKind::Edit | ToolKind::Write => {
+                edited.insert(path.unwrap_or(&call.call_id).to_owned());
+            }
+            ToolKind::Shell => commands += 1,
+            ToolKind::Read => {
+                read.insert(path.unwrap_or(&call.call_id).to_owned());
+            }
+            ToolKind::Search => searches += 1,
+            _ => other += 1,
+        }
+    }
+    let count = |count: usize, verb: &str, one: &str, many: &str| {
+        (count > 0).then(|| format!("{verb} {count} {}", if count == 1 { one } else { many }))
+    };
+    let parts = [
+        count(edited.len(), "edited", "file", "files"),
+        count(commands, "ran", "command", "commands"),
+        count(read.len(), "read", "file", "files"),
+        count(searches, "searched", "time", "times"),
+        count(other, "used", "other tool", "other tools"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let sentence = match parts.as_slice() {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    };
+    let mut characters = sentence.chars();
+    characters
+        .next()
+        .map(|first| first.to_uppercase().chain(characters).collect())
+        .unwrap_or_default()
 }
 
 /// Counts added and removed lines of a unified diff, ignoring file headers.
@@ -1187,6 +1275,71 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(summary, vec![("/p/a.rs", 3, 2), ("/p/d.rs", 1, 0)]);
         assert!(changes[0].lines.contains(&(DiffLineKind::Hunk, "⋯".into())));
+    }
+
+    #[test]
+    fn consecutive_tool_calls_form_one_run() {
+        let text = |key: u64| StreamItem {
+            key,
+            timestamp: None,
+            last_timestamp: None,
+            content: StreamContent::Assistant {
+                text: "done".into(),
+            },
+        };
+        let shell = |key: u64| {
+            tool(
+                key,
+                ToolStatus::Completed,
+                json!({"type":"shell","command":"ls"}),
+            )
+        };
+        let items = vec![
+            text(0),
+            shell(1),
+            shell(2),
+            text(3),
+            shell(4),
+            tool(5, ToolStatus::Completed, json!({"type":"plan"})),
+            shell(6),
+        ];
+        assert_eq!(
+            tool_runs(&items, 0..items.len()),
+            vec![
+                Segment::Item(0),
+                Segment::ToolRun(1..3),
+                Segment::Item(3),
+                Segment::ToolRun(4..5),
+                Segment::Item(5),
+                Segment::ToolRun(6..7),
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_group_labels_follow_paseo() {
+        let call = |detail: Value| ToolCall {
+            call_id: "c".into(),
+            name: "tool".into(),
+            detail,
+            status: ToolStatus::Completed,
+            error: None,
+        };
+        let shell = call(json!({"type":"shell","command":"ls"}));
+        let other = call(json!({"type":"fetch","url":"https://x"}));
+        assert_eq!(tool_group_label([&shell, &shell]), "Ran 2 commands");
+        assert_eq!(
+            tool_group_label([&shell, &other]),
+            "Ran 1 command and used 1 other tool"
+        );
+        let edit_a = call(json!({"type":"edit","filePath":"/p/a.rs"}));
+        let write_a = call(json!({"type":"write","filePath":"/p/a.rs"}));
+        let read_b = call(json!({"type":"read","filePath":"/p/b.rs"}));
+        let search = call(json!({"type":"search","query":"x"}));
+        assert_eq!(
+            tool_group_label([&edit_a, &write_a, &shell, &read_b, &search, &search]),
+            "Edited 1 file, ran 1 command, read 1 file, and searched 2 times"
+        );
     }
 
     #[test]

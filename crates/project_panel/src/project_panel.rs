@@ -368,17 +368,17 @@ struct SelectPrevDiagnostic {
 actions!(
     project_panel,
     [
-        /// Expands the selected entry in the project tree.
+        /// Expands the selected entry in the folder tree.
         ExpandSelectedEntry,
-        /// Collapses the selected entry in the project tree.
+        /// Collapses the selected entry in the folder tree.
         CollapseSelectedEntry,
-        /// Collapses the selected entry and its children in the project tree.
+        /// Collapses the selected entry and its children in the folder tree.
         CollapseSelectedEntryAndChildren,
-        /// Expands the selected entry and its children in the project tree.
+        /// Expands the selected entry and its children in the folder tree.
         ExpandSelectedEntryAndChildren,
-        /// Collapses all entries in the project tree.
+        /// Collapses all entries in the folder tree.
         CollapseAllEntries,
-        /// Expands all entries in the project tree.
+        /// Expands all entries in the folder tree.
         ExpandAllEntries,
         /// Creates a new directory.
         NewDirectory,
@@ -390,7 +390,7 @@ actions!(
         Duplicate,
         /// Reveals the selected item in the system file manager.
         RevealInFileManager,
-        /// Removes the selected folder from the project.
+        /// Removes the selected folder.
         RemoveFromProject,
         /// Cuts the selected file or directory.
         Cut,
@@ -7953,7 +7953,7 @@ impl Render for ProjectPanel {
                 .size_full()
                 .child(
                     ProjectEmptyState::new(
-                        "Project Panel",
+                        "Folder Panel",
                         focus_handle.clone(),
                         KeyBinding::for_action_in(&workspace::Open::default(), &focus_handle, cx),
                     )
@@ -8080,7 +8080,7 @@ impl Panel for ProjectPanel {
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
-        Some("Project Panel")
+        Some("Folder Panel")
     }
 
     fn toggle_action(&self) -> Box<dyn Action> {

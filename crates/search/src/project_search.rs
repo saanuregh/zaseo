@@ -65,7 +65,7 @@ use workspace::{
 actions!(
     project_search,
     [
-        /// Searches in a new project search tab.
+        /// Searches in a new folder search tab.
         SearchInNew,
         /// Toggles focus between the search bar and the search results.
         ToggleFocus,
@@ -1113,7 +1113,7 @@ impl Item for ProjectSearchView {
             .is_empty()
             .not()
             .then(|| query_text.into())
-            .or_else(|| Some("Project Search".into()))
+            .or_else(|| Some("Folder Search".into()))
     }
 
     fn act_as_type<'a>(
@@ -1157,7 +1157,7 @@ impl Item for ProjectSearchView {
 
         last_query
             .filter(|query| !query.is_empty())
-            .unwrap_or_else(|| "Project Search".into())
+            .unwrap_or_else(|| "Folder Search".into())
     }
 
     fn telemetry_event_text(&self) -> Option<&'static str> {

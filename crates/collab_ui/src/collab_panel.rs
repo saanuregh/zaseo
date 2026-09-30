@@ -1271,7 +1271,7 @@ impl CollabPanel {
                         let app_state = workspace.app_state().clone();
                         workspace::join_in_room_project(project_id, host_user_id, app_state, cx)
                             .detach_and_prompt_err(
-                                "Failed to join project",
+                                "Failed to join shared folders",
                                 window,
                                 cx,
                                 |error, _, _| Some(format!("{error:#}")),
@@ -1861,7 +1861,7 @@ impl CollabPanel {
                         let app_state = workspace.read(cx).app_state().clone();
                         workspace::join_in_room_project(*project_id, *host_user_id, app_state, cx)
                             .detach_and_prompt_err(
-                                "Failed to join project",
+                                "Failed to join shared folders",
                                 window,
                                 cx,
                                 |error, _, _| Some(format!("{error:#}")),

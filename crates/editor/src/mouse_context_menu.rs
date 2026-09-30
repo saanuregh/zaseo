@@ -221,6 +221,7 @@ pub fn deploy_context_menu(
         let evaluate_selection = window.is_action_available(&EvaluateSelectedText, cx);
         let run_to_cursor = window.is_action_available(&RunToCursor, cx);
         let format_selections = window.is_action_available(&FormatSelections, cx);
+        let add_to_thread = window.is_action_available(&AddSelectionToThread, cx);
         let disable_ai = DisableAiSettings::is_ai_disabled_for_buffer(
             editor.buffer.read(cx).as_singleton().as_ref(),
             cx,
@@ -292,7 +293,7 @@ pub fn deploy_context_menu(
                         quick_launch: false,
                     }),
                 )
-                .when(!disable_ai && has_selections, |this| {
+                .when(!disable_ai && add_to_thread && has_selections, |this| {
                     this.action("Add to Agent Thread", Box::new(AddSelectionToThread))
                 })
                 .when(has_selections, |this| {

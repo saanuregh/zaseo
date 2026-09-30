@@ -71,6 +71,7 @@ notifications = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }
 rpc = { workspace = true, features = ["test-support"] }
 settings = { workspace = true, features = ["test-support"] }
+title_bar = { workspace = true, features = ["test-support"] }
 
 util = { workspace = true, features = ["test-support"] }
 

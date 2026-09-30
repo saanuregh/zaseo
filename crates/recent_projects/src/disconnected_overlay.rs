@@ -148,7 +148,7 @@ impl Render for DisconnectedOverlay {
 
         let message = match &self.host {
             Host::CollabGuestProject => {
-                "Your connection to the remote project has been lost.".to_string()
+                "Your connection to the remote folder has been lost.".to_string()
             }
             Host::RemoteServerProject(options, server_not_running) => {
                 let autosave = if ProjectSettings::get_global(cx)

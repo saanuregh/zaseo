@@ -51,6 +51,12 @@ pub enum StoreEvent {
     /// because streamed chunks are the most frequent event and only the views showing
     /// that timeline read it.
     TimelineChanged(String),
+    /// A Paseo workspace was archived or deleted. `worktree_directory` is its folder when it was a
+    /// Paseo worktree, which goes away with it.
+    WorkspaceRemoved {
+        workspace_id: String,
+        worktree_directory: Option<PathBuf>,
+    },
 }
 
 #[derive(Default)]
@@ -108,13 +114,7 @@ impl PaseoStore {
                 .ok()
                 .is_some_and(|url| {
                     matches!(url.scheme(), "ws" | "wss")
-                        && url.host_str().is_some_and(|host| {
-                            host.eq_ignore_ascii_case("localhost")
-                                || host
-                                    .trim_matches(['[', ']'])
-                                    .parse::<std::net::IpAddr>()
-                                    .is_ok_and(|address| address.is_loopback())
-                        })
+                        && crate::connection_picker::is_loopback(&url)
                 })
         })
     }
@@ -123,15 +123,19 @@ impl PaseoStore {
         self.state
             .agents
             .iter()
-            .map(|agent| {
-                let pending = self
-                    .state
-                    .permissions
-                    .values()
-                    .any(|request| request.agent_id == agent.id);
-                (agent.id.clone(), agent_bucket(agent, pending))
-            })
+            .map(|agent| (agent.id.clone(), self.bucket(agent)))
             .collect()
+    }
+
+    /// The agent's bucket, counting permission requests the store holds but its snapshot may not
+    /// list yet.
+    pub(crate) fn bucket(&self, agent: &AgentSummary) -> AgentBucket {
+        let pending = self
+            .state
+            .permissions
+            .values()
+            .any(|request| request.agent_id == agent.id);
+        agent_bucket(agent, pending)
     }
 
     fn announce_transitions(&self, before: &HashMap<String, AgentBucket>, cx: &mut Context<Self>) {
@@ -139,10 +143,13 @@ impl PaseoStore {
             let Some(previous) = before.get(&agent_id).copied() else {
                 continue;
             };
-            if previous == bucket || self.focused_agent.as_deref() == Some(agent_id.as_str()) {
+            // The focused agent is the one the user is watching, unless no Zaseo window has focus.
+            let watched = self.focused_agent.as_deref() == Some(agent_id.as_str())
+                && cx.active_window().is_some();
+            if previous == bucket || watched {
                 continue;
             }
-            let Some(title) = self.agent(&agent_id).map(agent_title) else {
+            let Some(title) = self.agent(&agent_id).map(|agent| self.display_title(agent)) else {
                 continue;
             };
             let message = match bucket {
@@ -249,6 +256,17 @@ impl PaseoStore {
                 .or_else(|| self.agent(parent_agent_id)?.directory.clone()),
             None => self.agent(timeline_id)?.directory.clone(),
         }
+    }
+
+    pub(crate) fn display_title(&self, agent: &AgentSummary) -> String {
+        agent_display_title(&self.state.agents, &self.state.workspaces, agent)
+    }
+
+    pub(crate) fn lone_agent_workspace(
+        &self,
+        agent: &AgentSummary,
+    ) -> Option<&WorkspaceDescriptor> {
+        lone_agent_workspace(&self.state.agents, &self.state.workspaces, agent)
     }
 
     pub(crate) fn agent(&self, agent_id: &str) -> Option<&AgentSummary> {
@@ -452,7 +470,7 @@ impl PaseoStore {
         cx.notify();
     }
 
-    fn handle_event(&mut self, event: PaseoEvent, cx: &mut Context<Self>) {
+    pub(crate) fn handle_event(&mut self, event: PaseoEvent, cx: &mut Context<Self>) {
         if matches!(
             event,
             PaseoEvent::TerminalOutput { .. }
@@ -544,6 +562,18 @@ impl PaseoStore {
                 if let Some(archived) = self.archived.as_mut() {
                     archived.retain(|archived| !agents.iter().any(|agent| agent.id == archived.id));
                 }
+            }
+            PaseoEvent::WorkspaceRemoved { workspace_id, .. } => {
+                let worktree_directory = self
+                    .state
+                    .workspaces
+                    .get(workspace_id)
+                    .filter(|workspace| workspace.kind == "worktree" || workspace.is_paseo_worktree)
+                    .map(|workspace| workspace.directory.clone());
+                cx.emit(StoreEvent::WorkspaceRemoved {
+                    workspace_id: workspace_id.clone(),
+                    worktree_directory,
+                });
             }
             _ => {}
         }
@@ -1137,9 +1167,8 @@ impl PaseoStore {
     pub(crate) fn archive(&mut self, agent_id: &str, cx: &mut Context<Self>) {
         if let Some(agent) = self.agent(agent_id).cloned() {
             self.state.agents.retain(|existing| existing.id != agent_id);
-            if let Some(archived) = self.archived.as_mut() {
-                archived.insert(0, agent);
-            }
+            // Kept even before History loads any, so the agent's tab knows it is archived.
+            self.archived.get_or_insert_with(Vec::new).insert(0, agent);
             cx.notify();
         }
         let agent_id = agent_id.to_owned();
@@ -1322,30 +1351,22 @@ impl PaseoStore {
         })
     }
 
-    pub(crate) fn load_archived(&mut self, cx: &mut Context<Self>) {
-        let generation = self.connection_generation;
-        let task =
-            self.session_request(
-                cx,
-                move |session| async move { session.archived_agents().await },
-            );
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            this.update(cx, |store, cx| {
-                if !store.is_current_connection(generation) {
-                    return;
-                }
-                match result {
-                    Ok(agents) => {
-                        store.archived = Some(agents);
-                        store.load_recovery(cx);
-                    }
-                    Err(error) => store.state.error = Some(error.to_string()),
-                }
-                cx.notify();
-            })
-        })
-        .detach_and_log_err(cx);
+    /// Keeps archived agents History loaded, so their tabs find them and their workspaces'
+    /// Restore is known.
+    pub(crate) fn remember_archived(
+        &mut self,
+        agents: impl IntoIterator<Item = AgentSummary>,
+        cx: &mut Context<Self>,
+    ) {
+        let archived = self.archived.get_or_insert_with(Vec::new);
+        for agent in agents {
+            match archived.iter_mut().find(|known| known.id == agent.id) {
+                Some(known) => *known = agent,
+                None => archived.push(agent),
+            }
+        }
+        self.load_recovery(cx);
+        cx.notify();
     }
 
     /// Asks which archived agents' workspaces can be restored, for those not asked yet.
@@ -1354,7 +1375,7 @@ impl PaseoStore {
             .archived
             .iter()
             .flatten()
-            .filter_map(|agent| agent.extra.get("workspaceId").and_then(Value::as_str))
+            .filter_map(agent_workspace_id)
             .filter(|workspace_id| !self.recovery.contains_key(*workspace_id))
             .map(str::to_owned)
             .collect::<BTreeSet<_>>();
@@ -1391,7 +1412,7 @@ impl PaseoStore {
         .detach_and_log_err(cx);
     }
 
-    /// Restores an archived workspace with its agents, then reloads the archived list.
+    /// Restores an archived workspace with its agents, which then leave the archived list.
     pub(crate) fn restore_workspace(&mut self, workspace_id: String, cx: &mut Context<Self>) {
         let generation = self.connection_generation;
         let request_id = workspace_id.clone();
@@ -1407,7 +1428,11 @@ impl PaseoStore {
                 match result {
                     Ok(()) => {
                         store.recovery.remove(&workspace_id);
-                        store.load_archived(cx);
+                        if let Some(archived) = store.archived.as_mut() {
+                            archived.retain(|agent| {
+                                agent_workspace_id(agent) != Some(workspace_id.as_str())
+                            });
+                        }
                     }
                     Err(error) => store.state.error = Some(error.to_string()),
                 }
@@ -1822,7 +1847,12 @@ pub fn agent_bucket(agent: &AgentSummary, has_pending_permission: bool) -> Agent
             .is_some_and(|pending| !pending.is_empty())
     {
         AgentBucket::NeedsInput
-    } else if agent.status == "error" {
+    } else if agent.status == "error"
+        || (agent_requires_attention(agent)
+            && agent_string(agent, "attentionReason") == Some("error"))
+    {
+        // The daemon can flag an error while the agent sits idle, such as a turn that failed and
+        // ended.
         AgentBucket::Failed
     } else if agent.status == "running" || agent.status == "initializing" {
         AgentBucket::Running
@@ -1849,12 +1879,91 @@ pub fn agent_title(agent: &AgentSummary) -> String {
         .unwrap_or_else(|| "New agent".into())
 }
 
+/// The workspace an agent shares its sidebar row with: the one it is alone in. The project
+/// grouping titles that row with the workspace's name, so renaming the agent renames it.
+pub fn lone_agent_workspace<'a>(
+    agents: &[AgentSummary],
+    workspaces: &'a BTreeMap<String, WorkspaceDescriptor>,
+    agent: &AgentSummary,
+) -> Option<&'a WorkspaceDescriptor> {
+    let workspace_id = agent_workspace_id(agent)?;
+    let alone = agents.iter().any(|other| other.id == agent.id)
+        && agents
+            .iter()
+            .all(|other| other.id == agent.id || agent_workspace_id(other) != Some(workspace_id));
+    workspaces
+        .get(workspace_id)
+        .filter(|workspace| alone && !workspace.name.trim().is_empty())
+}
+
+/// The title the project grouping shows for an agent.
+pub fn agent_display_title(
+    agents: &[AgentSummary],
+    workspaces: &BTreeMap<String, WorkspaceDescriptor>,
+    agent: &AgentSummary,
+) -> String {
+    match lone_agent_workspace(agents, workspaces, agent) {
+        Some(workspace) => workspace.name.clone(),
+        None => agent_title(agent),
+    }
+}
+
 pub fn agent_string<'a>(agent: &'a AgentSummary, key: &str) -> Option<&'a str> {
     agent
         .extra
         .get(key)
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
+}
+
+/// Why the agent's last turn failed, as the daemon reports it.
+pub fn agent_last_error(agent: &AgentSummary) -> Option<&str> {
+    agent_string(agent, "lastError")
+}
+
+/// Whether the agent's provider can't run on the host right now, so messages to it would fail.
+pub fn agent_provider_unavailable(agent: &AgentSummary) -> bool {
+    agent
+        .extra
+        .get("providerUnavailable")
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+/// Since when the agent has needed the user, as the daemon reports it.
+pub fn agent_attention_since(agent: &AgentSummary) -> Option<DateTime<Utc>> {
+    agent_string(agent, "attentionTimestamp")
+        .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+#[cfg(test)]
+pub(crate) fn test_agent(id: &str, status: &str, extra: Value) -> AgentSummary {
+    AgentSummary {
+        id: id.into(),
+        title: None,
+        status: status.into(),
+        directory: Some(PathBuf::from("/work/zaseo")),
+        extra,
+        project: None,
+    }
+}
+
+/// The Paseo workspace an agent belongs to.
+pub fn agent_workspace_id(agent: &AgentSummary) -> Option<&str> {
+    agent_string(agent, "workspaceId")
+}
+
+/// The agent that started this one, from the snapshot or Paseo's parent label.
+pub fn agent_parent_id(agent: &AgentSummary) -> Option<&str> {
+    agent_string(agent, "parentAgentId").or_else(|| {
+        agent
+            .extra
+            .get("labels")
+            .and_then(|labels| labels.get("paseo.parent-agent-id"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    })
 }
 
 pub fn agent_provider(agent: &AgentSummary) -> &str {
@@ -2001,16 +2110,7 @@ mod tests {
         }
     }
 
-    fn agent(id: &str, status: &str, extra: Value) -> AgentSummary {
-        AgentSummary {
-            id: id.into(),
-            title: None,
-            status: status.into(),
-            directory: Some(PathBuf::from("/work/zaseo")),
-            extra,
-            project: None,
-        }
-    }
+    use super::test_agent as agent;
 
     #[test]
     fn stale_refresh_cannot_replace_new_host_agents() {

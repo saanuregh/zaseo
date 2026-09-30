@@ -1,3 +1,4 @@
+use command_palette_hooks::CommandInterceptItem;
 use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
 use gpui::{
     Action, App, AppContext as _, Context, DismissEvent, Entity, EventEmitter, FocusHandle,
@@ -8,173 +9,158 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use ui::{HighlightedLabel, KeyBinding, ListItem, ListItemSpacing, prelude::*};
+use ui::{ListItem, ListItemSpacing, prelude::*};
 use workspace::{ModalView, Workspace};
 
 use crate::composer::{BaseRef, Composer, base_ref_choices};
-use crate::sidebar::provider_icon;
-use crate::store::{
-    AgentBucket, agent_bucket, agent_project_directory, agent_project_name, agent_provider,
-    agent_title, agent_updated_at,
-};
+use crate::store::{agent_bucket, agent_project_directory, agent_project_name, agent_updated_at};
 use crate::{
-    ArchiveAgent, CopyAgentId, CycleMode, FocusComposer, ManageHosts, NewAgent, OpenWorkspace,
-    Reconnect, RenameAgent, ToggleArchived, ToggleGroupByStatus, ToggleModePicker,
-    ToggleModelPicker, TogglePanel, ToggleThinkingPicker, open_agent, store,
+    ArchiveAgent, CopyAgentId, CycleMode, FocusComposer, ManageHosts, NewAgent, OpenHistory,
+    OpenWorkspace, Reconnect, RenameAgent, ToggleGroupByStatus, ToggleModePicker,
+    ToggleModelPicker, TogglePanel, ToggleThinkingPicker, store,
 };
 
-enum CommandTarget {
-    Action(Box<dyn Action>),
-    Agent(String),
-    Terminal {
-        info: paseo_client::TerminalInfo,
-        directory: String,
-    },
-}
-
-struct CommandEntry {
+/// A Paseo result for Zed's command palette: the text shown and matched, and what it does.
+struct PaletteEntry {
     label: String,
-    detail: Option<String>,
-    icon: IconName,
-    icon_color: Color,
-    target: CommandTarget,
-    is_agent: bool,
+    action: Box<dyn Action>,
+    /// An agent or terminal, as opposed to a command.
+    is_agent_or_terminal: bool,
 }
 
-pub(crate) fn toggle(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
-    let workspace_handle = cx.weak_entity();
-    let previous_focus = window.focused(cx);
-    let current_agent = crate::current_agent_id(workspace, cx);
-    workspace.toggle_modal(window, cx, move |window, cx| {
-        CommandCenter::new(workspace_handle, previous_focus, current_agent, window, cx)
-    });
+/// How many agents and terminals one query lists, so they don't bury the commands.
+const MAX_PLACE_RESULTS: usize = 8;
+
+/// Adds Paseo to Zed's command palette: for a typed query, matching agents, the current agent's
+/// terminals, and Paseo's commands under their own names, which then stand in for the palette's
+/// generic "paseo ui: …" entries.
+pub(crate) fn init_palette_source(cx: &mut App) {
+    command_palette_hooks::CommandPaletteSources::add(cx, palette_results);
 }
 
-pub struct CommandCenter {
-    picker: Entity<Picker<CommandCenterDelegate>>,
-}
-
-impl CommandCenter {
-    fn new(
-        workspace: WeakEntity<Workspace>,
-        previous_focus: Option<FocusHandle>,
-        current_agent: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let entries = command_entries(current_agent, cx);
-        let delegate = CommandCenterDelegate {
-            command_center: cx.weak_entity(),
-            workspace,
-            previous_focus,
-            candidates: Arc::new(
-                entries
-                    .iter()
-                    .enumerate()
-                    .map(|(index, entry)| {
-                        StringMatchCandidate::new(
-                            index,
-                            &format!("{} {}", entry.label, entry.detail.as_deref().unwrap_or("")),
-                        )
-                    })
-                    .collect(),
-            ),
-            entries,
-            matches: Vec::new(),
-            selected_index: 0,
-        };
-        let picker = cx.new(|cx| Picker::list(delegate, window, cx));
-        Self { picker }
+fn palette_results(
+    query: &str,
+    workspace: WeakEntity<Workspace>,
+    cx: &mut App,
+) -> Task<Vec<CommandInterceptItem>> {
+    let query = query.trim().to_owned();
+    if query.is_empty() {
+        return Task::ready(Vec::new());
     }
+    let current_agent = workspace
+        .upgrade()
+        .and_then(|workspace| crate::current_agent_id(workspace.read(cx), cx));
+    let entries = palette_entries(current_agent, cx);
+    let candidates = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| StringMatchCandidate::new(index, &entry.label))
+        .collect::<Vec<_>>();
+    let background = cx.background_executor().clone();
+    cx.spawn(async move |_| {
+        let matches = match_strings(
+            &candidates,
+            &query,
+            false,
+            true,
+            200,
+            &Default::default(),
+            background,
+        )
+        .await;
+        let matches = matches
+            .into_iter()
+            .filter(|matched| {
+                entries
+                    .get(matched.candidate_id)
+                    .is_some_and(|entry| contains_every_word(&entry.label, &query))
+            })
+            .collect();
+        pick_matches(&entries, matches)
+            .into_iter()
+            .map(|(entry, positions)| CommandInterceptItem {
+                action: entry.action.boxed_clone(),
+                string: entry.label.clone(),
+                positions,
+            })
+            .collect()
+    })
 }
 
-fn command_entries(current_agent: Option<String>, cx: &App) -> Vec<CommandEntry> {
-    let action = |label: &str, icon: IconName, action: Box<dyn Action>| CommandEntry {
+/// Whether every word of `query` appears in `label`, ignoring case. The palette lists these
+/// results above its own matches whatever their score, so a loose fuzzy match must not qualify.
+fn contains_every_word(label: &str, query: &str) -> bool {
+    let label = label.to_lowercase();
+    query
+        .split_whitespace()
+        .all(|word| label.contains(&word.to_lowercase()))
+}
+
+/// The best matches in order, with at most [`MAX_PLACE_RESULTS`] agents and terminals.
+fn pick_matches(
+    entries: &[PaletteEntry],
+    matches: Vec<StringMatch>,
+) -> Vec<(&PaletteEntry, Vec<usize>)> {
+    let mut places = 0;
+    matches
+        .into_iter()
+        .filter_map(|matched| {
+            let entry = entries.get(matched.candidate_id)?;
+            if entry.is_agent_or_terminal {
+                places += 1;
+                if places > MAX_PLACE_RESULTS {
+                    return None;
+                }
+            }
+            Some((entry, matched.positions))
+        })
+        .collect()
+}
+
+fn palette_entries(current_agent: Option<String>, cx: &App) -> Vec<PaletteEntry> {
+    let action = |label: &str, action: Box<dyn Action>| PaletteEntry {
         label: label.to_owned(),
-        detail: None,
-        icon,
-        icon_color: Color::Muted,
-        target: CommandTarget::Action(action),
-        is_agent: false,
+        action,
+        is_agent_or_terminal: false,
     };
     let mut entries = vec![
-        action("New agent", IconName::Plus, Box::new(NewAgent)),
-        action(
-            "Focus message input",
-            IconName::Chat,
-            Box::new(FocusComposer),
-        ),
-        action(
-            "Change model",
-            IconName::Sparkle,
-            Box::new(ToggleModelPicker),
-        ),
-        action(
-            "Change thinking effort",
-            IconName::ToolThink,
-            Box::new(ToggleThinkingPicker),
-        ),
-        action("Change mode", IconName::Lock, Box::new(ToggleModePicker)),
-        action("Cycle mode", IconName::ArrowCircle, Box::new(CycleMode)),
-        action("Rename agent", IconName::Pencil, Box::new(RenameAgent)),
-        action("Archive agent", IconName::Archive, Box::new(ArchiveAgent)),
-        action("Copy agent ID", IconName::Copy, Box::new(CopyAgentId)),
-        action(
-            "Fork agent",
-            IconName::GitBranchPlus,
-            Box::new(crate::ForkAgent),
-        ),
-        action(
-            "Open project in editor",
-            IconName::FolderOpen,
-            Box::new(OpenWorkspace),
-        ),
-        action(
-            "Toggle sidebar",
-            IconName::ThreadsSidebarLeftOpen,
-            Box::new(TogglePanel),
-        ),
+        action("New agent", Box::new(NewAgent)),
+        action("New workspace", Box::new(crate::NewAgentWorkspace)),
+        action("Open history", Box::new(OpenHistory)),
+        action("Focus message input", Box::new(FocusComposer)),
+        action("Change model", Box::new(ToggleModelPicker)),
+        action("Change thinking effort", Box::new(ToggleThinkingPicker)),
+        action("Change mode", Box::new(ToggleModePicker)),
+        action("Cycle mode", Box::new(CycleMode)),
+        action("Rename agent", Box::new(RenameAgent)),
+        action("Archive agent", Box::new(ArchiveAgent)),
+        action("Copy agent ID", Box::new(CopyAgentId)),
+        action("Fork agent", Box::new(crate::ForkAgent)),
+        action("Open workspace in editor", Box::new(OpenWorkspace)),
+        action("Toggle sidebar", Box::new(TogglePanel)),
         action(
             "Group sidebar by project or status",
-            IconName::ListTree,
             Box::new(ToggleGroupByStatus),
         ),
         action(
-            "Show archived agents",
-            IconName::Archive,
-            Box::new(ToggleArchived),
-        ),
-        action(
             "Review last turn's changes",
-            IconName::FileDiff,
             Box::new(crate::ReviewLastTurn),
         ),
-        action(
-            "New terminal",
-            IconName::Terminal,
-            Box::new(crate::NewTerminal),
-        ),
-        action("Dictate", IconName::Mic, Box::new(crate::ToggleDictation)),
-        action(
-            "Provider usage",
-            IconName::Sparkle,
-            Box::new(crate::OpenProviderUsage),
-        ),
-        action("Manage hosts", IconName::Server, Box::new(ManageHosts)),
-        action("Reconnect to host", IconName::RotateCw, Box::new(Reconnect)),
+        action("New terminal", Box::new(crate::NewTerminal)),
+        action("Dictate", Box::new(crate::ToggleDictation)),
+        action("Provider usage", Box::new(crate::OpenProviderUsage)),
+        action("Manage hosts", Box::new(ManageHosts)),
+        action("Reconnect to host", Box::new(Reconnect)),
     ];
     if let Some(directory) = crate::terminal::agent_directory(current_agent, cx) {
         for info in crate::terminal::terminals_for(&directory, cx) {
-            entries.push(CommandEntry {
-                label: crate::terminal::terminal_title(&info),
-                detail: Some("Terminal".into()),
-                icon: IconName::Terminal,
-                icon_color: Color::Muted,
-                target: CommandTarget::Terminal {
-                    info,
+            entries.push(PaletteEntry {
+                label: format!("Terminal: {}", crate::terminal::terminal_title(&info)),
+                action: Box::new(crate::OpenPaseoTerminal {
                     directory: directory.clone(),
-                },
-                is_agent: false,
+                    terminal_id: info.id.clone(),
+                }),
+                is_agent_or_terminal: true,
             });
         }
     }
@@ -188,236 +174,20 @@ fn command_entries(current_agent: Option<String>, cx: &App) -> Vec<CommandEntry>
             .permissions
             .values()
             .any(|request| request.agent_id == agent.id);
-        let bucket = agent_bucket(agent, has_permission);
-        entries.push(CommandEntry {
-            label: agent_title(agent),
-            detail: Some(format!(
-                "{} · {}",
+        entries.push(PaletteEntry {
+            label: format!(
+                "Agent: {} — {} · {}",
+                store.display_title(agent),
                 agent_project_name(agent),
-                bucket.label()
-            )),
-            icon: provider_icon(agent_provider(agent)),
-            icon_color: match bucket {
-                AgentBucket::NeedsInput => Color::Warning,
-                AgentBucket::Failed => Color::Error,
-                AgentBucket::Running => Color::Info,
-                AgentBucket::Attention => Color::Success,
-                AgentBucket::Done => Color::Muted,
-            },
-            target: CommandTarget::Agent(agent.id.clone()),
-            is_agent: true,
+                agent_bucket(agent, has_permission).label()
+            ),
+            action: Box::new(crate::OpenAgentById {
+                agent_id: agent.id.clone(),
+            }),
+            is_agent_or_terminal: true,
         });
     }
     entries
-}
-
-impl Render for CommandCenter {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
-            .key_context("PaseoCommandCenter")
-            .w(rems(40.))
-            .child(self.picker.clone())
-    }
-}
-
-impl Focusable for CommandCenter {
-    fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.picker.focus_handle(cx)
-    }
-}
-
-impl EventEmitter<DismissEvent> for CommandCenter {}
-impl ModalView for CommandCenter {}
-
-pub struct CommandCenterDelegate {
-    command_center: WeakEntity<CommandCenter>,
-    workspace: WeakEntity<Workspace>,
-    previous_focus: Option<FocusHandle>,
-    entries: Vec<CommandEntry>,
-    candidates: Arc<Vec<StringMatchCandidate>>,
-    matches: Vec<StringMatch>,
-    selected_index: usize,
-}
-
-impl PickerDelegate for CommandCenterDelegate {
-    type ListItem = ListItem;
-
-    fn name() -> &'static str {
-        "Paseo command center"
-    }
-
-    fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        "Search commands and agents…".into()
-    }
-
-    fn match_count(&self) -> usize {
-        self.matches.len()
-    }
-
-    fn selected_index(&self) -> usize {
-        self.selected_index
-    }
-
-    fn set_selected_index(&mut self, index: usize, _: &mut Window, _: &mut Context<Picker<Self>>) {
-        self.selected_index = index;
-    }
-
-    fn separators_after_indices(&self) -> Vec<usize> {
-        self.matches
-            .windows(2)
-            .enumerate()
-            .filter_map(|(index, pair)| {
-                let first = self.entries.get(pair[0].candidate_id)?;
-                let second = self.entries.get(pair[1].candidate_id)?;
-                (first.is_agent != second.is_agent).then_some(index)
-            })
-            .collect()
-    }
-
-    fn update_matches(
-        &mut self,
-        query: String,
-        window: &mut Window,
-        cx: &mut Context<Picker<Self>>,
-    ) -> Task<()> {
-        let candidates = self.candidates.clone();
-        let background = cx.background_executor().clone();
-        cx.spawn_in(window, async move |picker, cx| {
-            let matches = if query.trim().is_empty() {
-                candidates
-                    .iter()
-                    .map(|candidate| StringMatch {
-                        candidate_id: candidate.id,
-                        string: candidate.string.clone(),
-                        positions: Vec::new(),
-                        score: 0.,
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                match_strings(
-                    &candidates,
-                    &query,
-                    false,
-                    true,
-                    200,
-                    &Default::default(),
-                    background,
-                )
-                .await
-            };
-            if let Err(error) = picker.update(cx, |picker, cx| {
-                picker.delegate.matches = matches;
-                picker.delegate.selected_index = 0;
-                cx.notify();
-            }) {
-                log::debug!("Paseo command center closed: {error}");
-            }
-        })
-    }
-
-    fn confirm(&mut self, _secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
-        let Some(entry) = self
-            .matches
-            .get(self.selected_index)
-            .and_then(|matched| self.entries.get(matched.candidate_id))
-        else {
-            return;
-        };
-        match &entry.target {
-            CommandTarget::Agent(agent_id) => {
-                let agent_id = agent_id.clone();
-                if let Some(workspace) = self.workspace.upgrade() {
-                    self.dismissed(window, cx);
-                    workspace.update(cx, |workspace, cx| {
-                        open_agent(workspace, &agent_id, true, window, cx);
-                    });
-                    return;
-                }
-            }
-            CommandTarget::Terminal { info, directory } => {
-                let (info, directory) = (info.clone(), directory.clone());
-                if let Some(workspace) = self.workspace.upgrade() {
-                    self.dismissed(window, cx);
-                    workspace.update(cx, |workspace, cx| {
-                        crate::terminal::open_terminal(workspace, info, directory, window, cx);
-                    });
-                    return;
-                }
-            }
-            CommandTarget::Action(action) => {
-                let action = action.boxed_clone();
-                let previous_focus = self.previous_focus.clone();
-                self.dismissed(window, cx);
-                window.defer(cx, move |window, cx| {
-                    if let Some(previous_focus) = previous_focus {
-                        window.focus(&previous_focus, cx);
-                    }
-                    window.dispatch_action(action, cx);
-                });
-                return;
-            }
-        }
-        self.dismissed(window, cx);
-    }
-
-    fn dismissed(&mut self, _: &mut Window, cx: &mut Context<Picker<Self>>) {
-        if let Err(error) = self
-            .command_center
-            .update(cx, |_, cx| cx.emit(DismissEvent))
-        {
-            log::debug!("Paseo command center closed: {error}");
-        }
-    }
-
-    fn render_match(
-        &self,
-        index: usize,
-        selected: bool,
-        _window: &mut Window,
-        cx: &mut Context<Picker<Self>>,
-    ) -> Option<Self::ListItem> {
-        let matched = self.matches.get(index)?;
-        let entry = self.entries.get(matched.candidate_id)?;
-        let label_positions = matched
-            .positions
-            .iter()
-            .copied()
-            .filter(|position| *position < entry.label.len())
-            .collect::<Vec<_>>();
-        let binding = match &entry.target {
-            CommandTarget::Action(action) => self
-                .previous_focus
-                .as_ref()
-                .map(|focus| KeyBinding::for_action_in(action.as_ref(), focus, cx)),
-            CommandTarget::Agent(_) | CommandTarget::Terminal { .. } => None,
-        };
-        Some(
-            ListItem::new(index)
-                .inset(true)
-                .spacing(ListItemSpacing::Sparse)
-                .toggle_state(selected)
-                .start_slot(
-                    Icon::new(entry.icon)
-                        .size(IconSize::Small)
-                        .color(entry.icon_color),
-                )
-                .child(
-                    h_flex()
-                        .w_full()
-                        .gap_2()
-                        .child(HighlightedLabel::new(entry.label.clone(), label_positions))
-                        .when_some(entry.detail.clone(), |this, detail| {
-                            this.child(
-                                Label::new(detail)
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted)
-                                    .truncate(),
-                            )
-                        }),
-                )
-                .end_slot::<KeyBinding>(binding),
-        )
-    }
 }
 
 pub(crate) fn choose_directory(
@@ -888,5 +658,61 @@ impl PickerDelegate for BaseBranchPickerDelegate {
                     )
                 }),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn palette_results_need_every_typed_word() {
+        assert!(contains_every_word(
+            "Agent: Fix login — zaseo · Done",
+            "fix log"
+        ));
+        assert!(contains_every_word("Rename agent", "AGENT ren"));
+        // A scattered subsequence would jump above Zed's own commands.
+        assert!(!contains_every_word(
+            "Agent: Improve composer footer — zaseo · Done",
+            "open"
+        ));
+    }
+
+    #[test]
+    fn palette_lists_a_few_agents_and_terminals_but_every_command() {
+        let entry = |label: &str, is_agent_or_terminal: bool| PaletteEntry {
+            label: label.to_owned(),
+            action: Box::new(NewAgent),
+            is_agent_or_terminal,
+        };
+        let mut entries = (0..MAX_PLACE_RESULTS + 3)
+            .map(|index| entry(&format!("Agent: {index}"), true))
+            .collect::<Vec<_>>();
+        entries.push(entry("Rename agent", false));
+        let matches = (0..entries.len())
+            .map(|candidate_id| StringMatch {
+                candidate_id,
+                string: String::new(),
+                positions: vec![candidate_id],
+                score: 1.,
+            })
+            .collect();
+        let picked = pick_matches(&entries, matches);
+        assert_eq!(
+            picked
+                .iter()
+                .filter(|(entry, _)| entry.is_agent_or_terminal)
+                .count(),
+            MAX_PLACE_RESULTS
+        );
+        assert_eq!(
+            picked.last().map(|(entry, _)| entry.label.as_str()),
+            Some("Rename agent")
+        );
+        assert_eq!(
+            picked.first().map(|(_, positions)| positions.clone()),
+            Some(vec![0])
+        );
     }
 }

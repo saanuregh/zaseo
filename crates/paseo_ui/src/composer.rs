@@ -3,28 +3,31 @@ use base64::Engine as _;
 use editor::{CompletionProvider, Editor, EditorElement, EditorMode, EditorStyle, MultiBuffer};
 use gpui::{
     AnyElement, App, AppContext as _, AsyncApp, ClipboardEntry, Context, Entity, EventEmitter,
-    FocusHandle, Focusable, Image, IntoElement, Subscription, Task, TaskExt, TextStyle, WeakEntity,
-    Window, prelude::*,
+    FocusHandle, Focusable, Image, ImageFormat, IntoElement, Subscription, Task, TaskExt,
+    TextStyle, WeakEntity, Window, prelude::*,
 };
 use language::{Buffer, CodeLabel};
 use lsp::CompletionContext;
 use paseo_client::{
     ActiveTurnBehavior, AgentSummary, BranchSuggestion, CheckoutStatus, CreateAgent, DraftConfig,
-    ImageAttachment, PaseoEvent, Provider, SendMessage, WorktreeTarget,
+    FileUpload, ImageAttachment, PaseoEvent, Provider, SendMessage, UploadedFile, WorktreeTarget,
 };
+use picker::Picker;
 use project::{Completion, CompletionDisplayOptions, CompletionResponse, CompletionSource};
 use serde_json::Value;
 use settings::Settings as _;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use text::{Anchor, ToOffset as _};
 use theme_settings::ThemeSettings;
 use ui::{
-    CircularProgress, CommonAnimationExt, ContextMenu, IconButton, IconButtonShape, Indicator,
-    PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*,
+    CircularProgress, CommonAnimationExt, IconButton, IconButtonShape, Indicator, PopoverMenu,
+    PopoverMenuHandle, Tooltip, prelude::*,
 };
 
+use crate::choice_picker::{ChoicePickerDelegate, choice_picker};
 use crate::dictation::{
     AudioMessage, CHUNK_SAMPLES, CaptureFormat, Pcm16Encoder, Recorder, start_capture,
 };
@@ -147,6 +150,21 @@ struct QueuedMessage {
     id: usize,
     text: String,
     images: Vec<PastedImage>,
+    files: Vec<UploadedFile>,
+}
+
+/// A file picked with the attach button. It uploads to the daemon's host as soon as it's picked,
+/// as in Paseo, so sending doesn't wait on it.
+struct AttachedFile {
+    id: usize,
+    name: String,
+    upload: FileUploadState,
+}
+
+enum FileUploadState {
+    Uploading,
+    Uploaded(UploadedFile),
+    Failed(String),
 }
 
 #[derive(Clone)]
@@ -166,7 +184,10 @@ impl PastedImage {
 
 pub enum ComposerEvent {
     AgentCreated(String),
-    ClearRequested { directory: Option<PathBuf> },
+    ClearRequested {
+        directory: Option<PathBuf>,
+        workspace_id: Option<String>,
+    },
     Submitted,
 }
 
@@ -176,10 +197,14 @@ pub struct Composer {
     editor: Entity<Editor>,
     pub(crate) draft: AgentChoices,
     pub(crate) draft_directory: Option<PathBuf>,
+    /// The Paseo workspace a draft's agent joins; `None` starts a new workspace.
+    pub(crate) draft_workspace_id: Option<String>,
     queue: Vec<QueuedMessage>,
     next_queue_id: usize,
     images: Vec<PastedImage>,
     next_image_id: usize,
+    files: Vec<AttachedFile>,
+    next_file_id: usize,
     /// Daemon attachments sent when a draft creates its agent, such as forked chat history.
     context_attachments: Vec<Value>,
     /// Loaded once because reading the key-value store on every render blocks the main thread.
@@ -188,10 +213,10 @@ pub struct Composer {
     pending_text: Option<String>,
     creating: bool,
     was_running: bool,
-    model_menu: PopoverMenuHandle<ContextMenu>,
-    thinking_menu: PopoverMenuHandle<ContextMenu>,
-    mode_menu: PopoverMenuHandle<ContextMenu>,
-    provider_menu: PopoverMenuHandle<ContextMenu>,
+    model_menu: PopoverMenuHandle<Picker<ChoicePickerDelegate>>,
+    thinking_menu: PopoverMenuHandle<Picker<ChoicePickerDelegate>>,
+    mode_menu: PopoverMenuHandle<Picker<ChoicePickerDelegate>>,
+    provider_menu: PopoverMenuHandle<Picker<ChoicePickerDelegate>>,
     dictation: Option<Dictation>,
     /// The base the user picked for a new worktree; `None` branches off `default_base`.
     worktree_base: Option<BaseRef>,
@@ -420,10 +445,13 @@ impl Composer {
             editor,
             draft: AgentChoices::default(),
             draft_directory,
+            draft_workspace_id: None,
             queue: Vec::new(),
             next_queue_id: 0,
             images: Vec::new(),
             next_image_id: 0,
+            files: Vec::new(),
+            next_file_id: 0,
             context_attachments: Vec::new(),
             preferences: saved_preferences,
             fork_source_title: None,
@@ -463,6 +491,31 @@ impl Composer {
 
     pub(crate) fn text(&self, cx: &App) -> String {
         self.editor.read(cx).text(cx)
+    }
+
+    /// Whether a draft is waiting for the daemon to create its agent.
+    pub(crate) fn is_creating(&self) -> bool {
+        self.creating
+    }
+
+    /// Marks a draft as sent, for tests of what happens while its agent is created.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn begin_creating_for_test(&mut self) {
+        self.creating = true;
+    }
+
+    /// Finishes a sent draft the way a created agent does, for tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn finish_creating_for_test(&mut self, agent_id: String, cx: &mut Context<Self>) {
+        self.creating = false;
+        self.set_agent(agent_id.clone(), cx);
+        cx.emit(ComposerEvent::AgentCreated(agent_id));
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_text_for_test(&self, text: &str, window: &mut Window, cx: &mut App) {
+        self.editor
+            .update(cx, |editor, cx| editor.set_text(text, window, cx));
     }
 
     fn agent<'a>(&self, cx: &'a App) -> Option<&'a AgentSummary> {
@@ -745,6 +798,7 @@ impl Composer {
     pub fn set_draft_directory(&mut self, directory: PathBuf, cx: &mut Context<Self>) {
         if self.draft_directory.as_ref() != Some(&directory) {
             self.worktree_base = None;
+            self.draft_workspace_id = None;
         }
         self.draft_directory = Some(directory);
         self.load_commands(cx);
@@ -922,10 +976,22 @@ impl Composer {
     pub fn submit(&mut self, queue: bool, cx: &mut Context<Self>) {
         let text = self.text(cx);
         let trimmed = text.trim();
-        if (trimmed.is_empty() && self.images.is_empty())
+        if (trimmed.is_empty() && self.images.is_empty() && self.files.is_empty())
             || self.pending_text.is_some()
             || self.creating
+            || self.uploading()
         {
+            return;
+        }
+        if self
+            .files
+            .iter()
+            .any(|file| matches!(file.upload, FileUploadState::Failed(_)))
+        {
+            self.report_error(
+                "Remove the files that didn't upload, then send again".into(),
+                cx,
+            );
             return;
         }
         if self.agent_id.is_some() {
@@ -940,12 +1006,19 @@ impl Composer {
                 }
                 "/clear" | "/new" => {
                     self.clear_editor(cx);
-                    let directory = self.agent(cx).and_then(|agent| agent.directory.clone());
+                    let agent = self.agent(cx);
+                    let directory = agent.and_then(|agent| agent.directory.clone());
+                    let workspace_id = agent
+                        .and_then(crate::store::agent_workspace_id)
+                        .map(str::to_owned);
                     if let Some(agent_id) = self.agent_id.clone() {
                         self.store
                             .update(cx, |store, cx| store.archive(&agent_id, cx));
                     }
-                    cx.emit(ComposerEvent::ClearRequested { directory });
+                    cx.emit(ComposerEvent::ClearRequested {
+                        directory,
+                        workspace_id,
+                    });
                     return;
                 }
                 _ => {}
@@ -955,13 +1028,29 @@ impl Composer {
             self.create_agent(text, cx);
             return;
         };
+        if let Some(agent) = self
+            .agent(cx)
+            .filter(|agent| crate::store::agent_provider_unavailable(agent))
+        {
+            let message = format!(
+                "The {} provider isn't available on this host, so the message wasn't sent",
+                agent_provider(agent)
+            );
+            self.store.update(cx, |store, cx| {
+                store.state.error = Some(message);
+                cx.notify();
+            });
+            return;
+        }
         let running = self.is_running(cx);
         let pasted = std::mem::take(&mut self.images);
+        let files = self.take_uploaded_files();
         if queue && running {
             self.queue.push(QueuedMessage {
                 id: self.next_queue_id,
                 text,
                 images: pasted,
+                files,
             });
             self.next_queue_id += 1;
             self.clear_editor(cx);
@@ -981,11 +1070,12 @@ impl Composer {
                     message_id,
                     behavior,
                     images: attachments(&pasted),
+                    attachments: files.iter().map(UploadedFile::attachment).collect(),
                 },
                 cx,
             )
         });
-        self.finish_send(task, pasted, cx);
+        self.finish_send(task, pasted, files, cx);
     }
 
     /// Sends a queued message, putting it back at the front of the queue if the send fails.
@@ -1009,6 +1099,7 @@ impl Composer {
                     message_id,
                     behavior,
                     images: attachments(&queued.images),
+                    attachments: queued.files.iter().map(UploadedFile::attachment).collect(),
                 },
                 cx,
             )
@@ -1033,6 +1124,7 @@ impl Composer {
         &mut self,
         task: Task<Result<()>>,
         pasted: Vec<PastedImage>,
+        files: Vec<UploadedFile>,
         cx: &mut Context<Self>,
     ) {
         cx.spawn(async move |this, cx| {
@@ -1048,16 +1140,202 @@ impl Composer {
                     }
                     Err(error) => {
                         composer.images.splice(0..0, pasted);
-                        composer.store.update(cx, |store, cx| {
-                            store.state.error = Some(error.to_string());
-                            cx.notify();
-                        })
+                        composer.restore_uploaded_files(files);
+                        composer.report_error(error.to_string(), cx);
                     }
                 }
                 cx.notify();
             })
         })
         .detach_and_log_err(cx);
+    }
+
+    fn uploading(&self) -> bool {
+        self.files
+            .iter()
+            .any(|file| matches!(file.upload, FileUploadState::Uploading))
+    }
+
+    /// Takes the uploaded files for a message; `submit` refuses to send while others remain.
+    fn take_uploaded_files(&mut self) -> Vec<UploadedFile> {
+        std::mem::take(&mut self.files)
+            .into_iter()
+            .filter_map(|file| match file.upload {
+                FileUploadState::Uploaded(uploaded) => Some(uploaded),
+                FileUploadState::Uploading | FileUploadState::Failed(_) => None,
+            })
+            .collect()
+    }
+
+    fn restore_uploaded_files(&mut self, files: Vec<UploadedFile>) {
+        let restored = files.into_iter().map(|uploaded| {
+            let id = self.next_file_id;
+            self.next_file_id += 1;
+            AttachedFile {
+                id,
+                name: uploaded.file_name.clone(),
+                upload: FileUploadState::Uploaded(uploaded),
+            }
+        });
+        let restored = restored.collect::<Vec<_>>();
+        self.files.splice(0..0, restored);
+    }
+
+    /// Asks for files to attach: images join the message's images, everything else uploads to the
+    /// daemon's host for the agent to read.
+    fn attach_files(&mut self, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let paths = match paths.await {
+                Ok(Ok(Some(paths))) => paths,
+                Ok(Ok(None)) | Err(_) => return anyhow::Ok(()),
+                Ok(Err(error)) => {
+                    this.update(cx, |composer, cx| {
+                        composer.report_error(format!("Couldn't choose files: {error}"), cx)
+                    })?;
+                    return Ok(());
+                }
+            };
+            for path in paths {
+                let read = cx
+                    .background_spawn({
+                        let path = path.clone();
+                        async move { read_attachment(&path) }
+                    })
+                    .await;
+                this.update(cx, |composer, cx| composer.add_attachment(&path, read, cx))?;
+            }
+            Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn add_attachment(
+        &mut self,
+        path: &Path,
+        read: Result<(Vec<u8>, std::time::SystemTime)>,
+        cx: &mut Context<Self>,
+    ) {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let (bytes, modified) = match read {
+            Ok(read) => read,
+            Err(error) => {
+                self.report_error(format!("Couldn't read {name}: {error}"), cx);
+                return;
+            }
+        };
+        if let Some(format) = attachable_image_format(path) {
+            self.images.push(PastedImage {
+                id: self.next_image_id,
+                image: Arc::new(Image::from_bytes(format, bytes)),
+            });
+            self.next_image_id += 1;
+            cx.notify();
+            return;
+        }
+        let id = self.next_file_id;
+        self.next_file_id += 1;
+        self.files.push(AttachedFile {
+            id,
+            name: name.clone(),
+            upload: FileUploadState::Uploading,
+        });
+        let upload = FileUpload {
+            file_name: name,
+            mime_type: file_mime_type(path).to_owned(),
+            modified_at: chrono::DateTime::<chrono::Utc>::from(modified).to_rfc3339(),
+            bytes,
+        };
+        let task = self.store.update(cx, |store, cx| {
+            store.session_request(cx, move |session| async move {
+                session.upload_file(upload).await
+            })
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |composer, cx| {
+                // The user may have removed the file while it uploaded.
+                if let Some(file) = composer.files.iter_mut().find(|file| file.id == id) {
+                    file.upload = match result {
+                        Ok(uploaded) => FileUploadState::Uploaded(uploaded),
+                        Err(error) => FileUploadState::Failed(error.to_string()),
+                    };
+                    cx.notify();
+                }
+            })
+        })
+        .detach_and_log_err(cx);
+        cx.notify();
+    }
+
+    fn render_files(&self, cx: &Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        h_flex()
+            .gap_1p5()
+            .flex_wrap()
+            .children(self.files.iter().map(|file| {
+                let id = file.id;
+                let (icon, tooltip) = match &file.upload {
+                    FileUploadState::Uploading => (
+                        Icon::new(IconName::LoadCircle)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted)
+                            .with_rotate_animation(2)
+                            .into_any_element(),
+                        format!("Uploading {}", file.name),
+                    ),
+                    FileUploadState::Uploaded(uploaded) => (
+                        Icon::new(IconName::File)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted)
+                            .into_any_element(),
+                        format!("The agent reads it at {}", uploaded.path),
+                    ),
+                    FileUploadState::Failed(error) => (
+                        Icon::new(IconName::Warning)
+                            .size(IconSize::XSmall)
+                            .color(Color::Error)
+                            .into_any_element(),
+                        error.clone(),
+                    ),
+                };
+                h_flex()
+                    .id(("paseo-file", id))
+                    .h(rems_from_px(26_f32))
+                    .max_w(rems_from_px(360_f32))
+                    .pl_2()
+                    .pr_0p5()
+                    .gap_1p5()
+                    .rounded_md()
+                    .bg(colors.element_background)
+                    .border_1()
+                    .border_color(colors.border_variant)
+                    .tooltip(Tooltip::text(tooltip))
+                    .child(icon)
+                    .child(
+                        Label::new(file.name.clone())
+                            .size(LabelSize::Small)
+                            .truncate(),
+                    )
+                    .child(
+                        IconButton::new(("paseo-file-remove", id), IconName::Close)
+                            .icon_size(IconSize::XSmall)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Remove"))
+                            .on_click(cx.listener(move |composer, _, _, cx| {
+                                composer.files.retain(|file| file.id != id);
+                                cx.notify();
+                            })),
+                    )
+            }))
     }
 
     fn create_agent(&mut self, text: String, cx: &mut Context<Self>) {
@@ -1083,6 +1361,9 @@ impl Composer {
         let submitted = text.clone();
         let new_worktree = self.uses_new_worktree(cx);
         let pasted = std::mem::take(&mut self.images);
+        let files = self.take_uploaded_files();
+        let mut creation_attachments = self.context_attachments.clone();
+        creation_attachments.extend(files.iter().map(UploadedFile::attachment));
         let task = self.store.update(cx, |store, cx| {
             store.create_agent(
                 CreateAgent {
@@ -1095,11 +1376,12 @@ impl Composer {
                     mode_id: choices.mode,
                     thinking_option_id: choices.thinking,
                     images: attachments(&pasted),
-                    attachments: self.context_attachments.clone(),
+                    attachments: creation_attachments,
                     worktree: new_worktree.then(|| WorktreeTarget {
                         new_branch: worktree_branch_name(&submitted),
                         base: self.worktree_base().map(|base| base.ref_name.clone()),
                     }),
+                    workspace_id: self.draft_workspace_id.clone(),
                 },
                 cx,
             )
@@ -1119,10 +1401,8 @@ impl Composer {
                     }
                     Err(error) => {
                         composer.images.splice(0..0, pasted);
-                        composer.store.update(cx, |store, cx| {
-                            store.state.error = Some(error.to_string());
-                            cx.notify();
-                        })
+                        composer.restore_uploaded_files(files);
+                        composer.report_error(error.to_string(), cx);
                     }
                 }
                 cx.notify();
@@ -1432,11 +1712,14 @@ impl Composer {
     }
 
     /// Whether the connected host can create worktrees for new agents.
+    /// A draft joining a Paseo workspace works in that workspace's folder, so it can't start one.
     pub fn can_create_worktree(&self, cx: &App) -> bool {
-        self.store
-            .read(cx)
-            .server_info
-            .has_feature("workspaceMultiplicity")
+        self.draft_workspace_id.is_none()
+            && self
+                .store
+                .read(cx)
+                .server_info
+                .has_feature("workspaceMultiplicity")
     }
 
     pub fn uses_new_worktree(&self, cx: &App) -> bool {
@@ -1544,6 +1827,7 @@ impl Composer {
                 editor.set_text(queued.text, window, cx);
             });
             self.images.extend(queued.images);
+            self.restore_uploaded_files(queued.files);
             self.focus(window, cx);
             cx.notify();
         }
@@ -1564,7 +1848,7 @@ impl Composer {
         EditorElement::new(
             &self.editor,
             EditorStyle {
-                background: cx.theme().colors().surface_background,
+                background: cx.theme().colors().elevated_surface_background,
                 local_player: cx.theme().players().local(),
                 text: text_style,
                 syntax: cx.theme().syntax().clone(),
@@ -1641,39 +1925,34 @@ impl Composer {
                 .anchor(gpui::Anchor::BottomLeft)
                 .menu(move |window, cx| {
                     let this = this.clone();
-                    let providers = providers.clone();
-                    let current = current.clone();
-                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                        menu = menu.header("Provider");
-                        for provider in providers {
-                            let ready = provider.status == "ready";
-                            let label = provider
+                    let choices = providers
+                        .iter()
+                        .map(|provider| Choice {
+                            id: provider.id.clone(),
+                            label: provider
                                 .label
                                 .clone()
-                                .unwrap_or_else(|| provider.id.clone());
-                            let label = if ready {
-                                label
-                            } else {
-                                format!("{label} ({})", provider.status)
-                            };
-                            let this = this.clone();
-                            let id = provider.id.clone();
-                            menu = menu.toggleable_entry(
-                                label,
-                                current.as_deref() == Some(provider.id.as_str()),
-                                ui::IconPosition::End,
-                                None,
-                                move |_, cx| {
-                                    if let Err(error) = this.update(cx, |composer, cx| {
-                                        composer.select_provider(id.clone(), cx)
-                                    }) {
-                                        log::debug!("Paseo composer closed: {error}");
-                                    }
-                                },
-                            );
-                        }
-                        menu
-                    }))
+                                .unwrap_or_else(|| provider.id.clone()),
+                            description: (provider.status != "ready")
+                                .then(|| provider.status.clone()),
+                            is_default: false,
+                            color_tier: None,
+                        })
+                        .collect();
+                    Some(choice_picker(
+                        "Provider",
+                        choices,
+                        current.clone(),
+                        Rc::new(move |id, _, cx| {
+                            if let Err(error) =
+                                this.update(cx, |composer, cx| composer.select_provider(id, cx))
+                            {
+                                log::debug!("Paseo composer closed: {error}");
+                            }
+                        }),
+                        window,
+                        cx,
+                    ))
                 })
         });
 
@@ -1692,29 +1971,20 @@ impl Composer {
                 .anchor(gpui::Anchor::BottomLeft)
                 .menu(move |window, cx| {
                     let this = this.clone();
-                    let models = models.clone();
-                    let current = current.clone();
-                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                        menu = menu.header("Model");
-                        for model in models {
-                            let this = this.clone();
-                            let id = model.id.clone();
-                            menu = menu.toggleable_entry(
-                                model.label.clone(),
-                                current.as_deref() == Some(model.id.as_str()),
-                                ui::IconPosition::End,
-                                None,
-                                move |_, cx| {
-                                    if let Err(error) = this.update(cx, |composer, cx| {
-                                        composer.select_model(id.clone(), cx)
-                                    }) {
-                                        log::debug!("Paseo composer closed: {error}");
-                                    }
-                                },
-                            );
-                        }
-                        menu
-                    }))
+                    Some(choice_picker(
+                        "Model",
+                        models.clone(),
+                        current.clone(),
+                        Rc::new(move |id, _, cx| {
+                            if let Err(error) =
+                                this.update(cx, |composer, cx| composer.select_model(id, cx))
+                            {
+                                log::debug!("Paseo composer closed: {error}");
+                            }
+                        }),
+                        window,
+                        cx,
+                    ))
                 })
         });
 
@@ -1744,29 +2014,20 @@ impl Composer {
                 .anchor(gpui::Anchor::BottomLeft)
                 .menu(move |window, cx| {
                     let this = this.clone();
-                    let thinking = thinking.clone();
-                    let current = current.clone();
-                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                        menu = menu.header("Thinking");
-                        for option in thinking {
-                            let this = this.clone();
-                            let id = option.id.clone();
-                            menu = menu.toggleable_entry(
-                                option.label.clone(),
-                                current.as_deref() == Some(option.id.as_str()),
-                                ui::IconPosition::End,
-                                None,
-                                move |_, cx| {
-                                    if let Err(error) = this.update(cx, |composer, cx| {
-                                        composer.select_thinking(id.clone(), cx)
-                                    }) {
-                                        log::debug!("Paseo composer closed: {error}");
-                                    }
-                                },
-                            );
-                        }
-                        menu
-                    }))
+                    Some(choice_picker(
+                        "Thinking",
+                        thinking.clone(),
+                        current.clone(),
+                        Rc::new(move |id, _, cx| {
+                            if let Err(error) =
+                                this.update(cx, |composer, cx| composer.select_thinking(id, cx))
+                            {
+                                log::debug!("Paseo composer closed: {error}");
+                            }
+                        }),
+                        window,
+                        cx,
+                    ))
                 })
         });
 
@@ -1797,35 +2058,20 @@ impl Composer {
                 .anchor(gpui::Anchor::BottomLeft)
                 .menu(move |window, cx| {
                     let this = this.clone();
-                    let modes = modes.clone();
-                    let current = current.clone();
-                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                        menu = menu.header("Mode");
-                        for mode in modes {
-                            let this = this.clone();
-                            let id = mode.id.clone();
-                            let entry_label = match &mode.description {
-                                Some(description) if !description.is_empty() => {
-                                    format!("{} — {description}", mode.label)
-                                }
-                                _ => mode.label.clone(),
-                            };
-                            menu = menu.toggleable_entry(
-                                entry_label,
-                                current.as_deref() == Some(mode.id.as_str()),
-                                ui::IconPosition::End,
-                                None,
-                                move |_, cx| {
-                                    if let Err(error) = this.update(cx, |composer, cx| {
-                                        composer.select_mode(id.clone(), cx)
-                                    }) {
-                                        log::debug!("Paseo composer closed: {error}");
-                                    }
-                                },
-                            );
-                        }
-                        menu
-                    }))
+                    Some(choice_picker(
+                        "Mode",
+                        modes.clone(),
+                        current.clone(),
+                        Rc::new(move |id, _, cx| {
+                            if let Err(error) =
+                                this.update(cx, |composer, cx| composer.select_mode(id, cx))
+                            {
+                                log::debug!("Paseo composer closed: {error}");
+                            }
+                        }),
+                        window,
+                        cx,
+                    ))
                 })
         });
 
@@ -1895,8 +2141,9 @@ impl Composer {
 
     fn render_send_button(&self, cx: &Context<Self>) -> impl IntoElement {
         let running = self.is_running(cx);
-        let has_text = !self.text(cx).trim().is_empty() || !self.images.is_empty();
-        let busy = self.pending_text.is_some() || self.creating;
+        let has_text =
+            !self.text(cx).trim().is_empty() || !self.images.is_empty() || !self.files.is_empty();
+        let busy = self.pending_text.is_some() || self.creating || self.uploading();
         let focus = self.editor.focus_handle(cx);
         let colors = cx.theme().colors();
         if running && !has_text {
@@ -1979,10 +2226,8 @@ impl Composer {
                 .gap_2()
                 .px_2()
                 .py_1()
-                .rounded_lg()
-                .bg(cx.theme().colors().surface_background)
-                .border_1()
-                .border_color(cx.theme().colors().border_variant)
+                .rounded(rems_from_px(crate::stream::CARD_RADIUS))
+                .map(|queued| crate::stream::raised_card(queued, cx))
                 .child(
                     Icon::new(IconName::ListTodo)
                         .size(IconSize::XSmall)
@@ -2033,6 +2278,63 @@ fn remember_sent_images(store: &mut PaseoStore, message_id: &str, images: &[Past
             message_id.to_owned(),
             images.iter().map(|pasted| pasted.image.clone()).collect(),
         );
+    }
+}
+
+/// The largest file Paseo's own composer attaches.
+const MAX_ATTACHMENT_BYTES: u64 = 50 * 1024 * 1024;
+
+fn read_attachment(path: &Path) -> Result<(Vec<u8>, std::time::SystemTime)> {
+    let metadata = std::fs::metadata(path)?;
+    check_attachment_size(path, metadata.len())?;
+    let bytes = std::fs::read(path)?;
+    let modified = metadata
+        .modified()
+        .unwrap_or_else(|_| std::time::SystemTime::now());
+    Ok((bytes, modified))
+}
+
+/// Refuses a file too big to attach before it is read into memory, as Paseo does.
+fn check_attachment_size(path: &Path, size: u64) -> Result<()> {
+    if size > MAX_ATTACHMENT_BYTES {
+        anyhow::bail!(
+            "{} is too large (max 50MB)",
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string())
+        );
+    }
+    Ok(())
+}
+
+/// Picked files in the image formats providers accept attach as images; others upload as files.
+fn attachable_image_format(path: &Path) -> Option<ImageFormat> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    match extension.as_str() {
+        "png" => Some(ImageFormat::Png),
+        "jpg" | "jpeg" => Some(ImageFormat::Jpeg),
+        "gif" => Some(ImageFormat::Gif),
+        "webp" => Some(ImageFormat::Webp),
+        _ => None,
+    }
+}
+
+fn file_mime_type(path: &Path) -> &'static str {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    match extension.as_str() {
+        "pdf" => "application/pdf",
+        "json" => "application/json",
+        "md" | "markdown" => "text/markdown",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "svg" => "image/svg+xml",
+        "txt" | "log" | "rs" | "ts" | "tsx" | "js" | "py" | "go" | "toml" | "yaml" | "yml"
+        | "nix" | "sh" | "c" | "h" | "cpp" | "java" | "sql" => "text/plain",
+        _ => "application/octet-stream",
     }
 }
 
@@ -2105,9 +2407,8 @@ impl Render for Composer {
                     .px_3()
                     .pt_3()
                     .pb_2()
-                    .rounded(rems_from_px(16_f32))
-                    .bg(colors.surface_background)
-                    .border_1()
+                    .rounded(rems_from_px(crate::stream::CARD_RADIUS))
+                    .map(|composer| crate::stream::raised_card(composer, cx))
                     .border_color(if focused {
                         colors.border_focused.opacity(0.6)
                     } else {
@@ -2120,6 +2421,9 @@ impl Render for Composer {
                     })
                     .when(!self.images.is_empty(), |this| {
                         this.child(self.render_images(cx))
+                    })
+                    .when(!self.files.is_empty(), |this| {
+                        this.child(self.render_files(cx))
                     })
                     .child(div().px_1().child(self.render_editor(cx)))
                     .children(self.render_dictation(cx))
@@ -2135,6 +2439,16 @@ impl Render for Composer {
                                     .gap_1()
                                     .children(self.render_context_meter(cx))
                                     .children(self.render_last_turn_button(cx))
+                                    .child(
+                                        IconButton::new("paseo-attach", IconName::Paperclip)
+                                            .shape(IconButtonShape::Square)
+                                            .icon_size(IconSize::Small)
+                                            .icon_color(Color::Muted)
+                                            .tooltip(Tooltip::text("Attach images or files"))
+                                            .on_click(cx.listener(|composer, _, _, cx| {
+                                                composer.attach_files(cx)
+                                            })),
+                                    )
                                     .children(self.render_dictation_button(cx))
                                     .when(running && !self.text(cx).trim().is_empty(), |this| {
                                         this.child(
@@ -2203,7 +2517,9 @@ impl CompletionProvider for PaseoCompletionProvider {
             return Task::ready(Ok(Vec::new()));
         };
         let replace_range = snapshot.anchor_before(start)..buffer_position;
-        let match_start = Some(snapshot.anchor_after(start + 1));
+        // Leans left so text typed after a lone "/" or "@" lands inside the query rather than
+        // pushing the query's start past it.
+        let match_start = Some(snapshot.anchor_before(start + 1));
         let Some(composer) = self.composer.upgrade() else {
             return Task::ready(Ok(Vec::new()));
         };
@@ -2219,13 +2535,23 @@ impl CompletionProvider for PaseoCompletionProvider {
                 .commands
                 .get(&composer.command_cache_key(cx))
             {
-                completions.extend(commands.iter().map(|command| {
-                    (
-                        command.name.clone(),
-                        command.description.clone(),
-                        command.argument_hint.clone(),
-                    )
-                }));
+                // Zaseo handles its own commands, so the daemon's same-named ones would repeat.
+                let own = completions
+                    .iter()
+                    .map(|(name, _, _)| name.clone())
+                    .collect::<HashSet<_>>();
+                completions.extend(
+                    commands
+                        .iter()
+                        .filter(|command| !own.contains(&command.name))
+                        .map(|command| {
+                            (
+                                command.name.clone(),
+                                command.description.clone(),
+                                command.argument_hint.clone(),
+                            )
+                        }),
+                );
             }
             let completions = completions
                 .into_iter()
@@ -2444,6 +2770,123 @@ pub(crate) fn worktree_branch_name(prompt: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn attachments_over_paseos_limit_are_refused() {
+        let path = Path::new("/tmp/disk.img");
+        assert!(check_attachment_size(path, MAX_ATTACHMENT_BYTES).is_ok());
+        let error =
+            check_attachment_size(path, MAX_ATTACHMENT_BYTES + 1).expect_err("over the limit");
+        assert_eq!(error.to_string(), "disk.img is too large (max 50MB)");
+    }
+
+    #[test]
+    fn attached_images_and_files_route_by_type() {
+        let format = |name: &str| attachable_image_format(Path::new(name));
+        assert_eq!(format("shot.PNG"), Some(ImageFormat::Png));
+        assert_eq!(format("photo.jpeg"), Some(ImageFormat::Jpeg));
+        // Formats providers don't take as images upload as files instead.
+        assert_eq!(format("diagram.svg"), None);
+        assert_eq!(format("notes"), None);
+        assert_eq!(file_mime_type(Path::new("report.pdf")), "application/pdf");
+        assert_eq!(file_mime_type(Path::new("main.rs")), "text/plain");
+        assert_eq!(
+            file_mime_type(Path::new("archive.tar.gz")),
+            "application/octet-stream"
+        );
+    }
+
+    #[gpui::test]
+    async fn slash_completions_list_skills(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            crate::PaseoSettings::register(cx);
+        });
+        let names = [
+            "advisor",
+            "clear",
+            "code-review",
+            "plugin-dev:skill-development",
+            "security-review",
+            "simplify",
+            "sr-audit",
+            "sr-build",
+            "sr-debug",
+            "sr-review",
+            "xlsx",
+        ];
+        let store = cx.new(|_| PaseoStore::default());
+        store.update(cx, |store, _| {
+            store.commands.insert(
+                "agent".into(),
+                names
+                    .iter()
+                    .map(|name| paseo_client::AgentCommand {
+                        name: (*name).into(),
+                        description: String::new(),
+                        argument_hint: None,
+                        kind: Some("skill".into()),
+                    })
+                    .collect(),
+            );
+        });
+        let window = cx.add_empty_window();
+        let composer = window.update(|window, cx| {
+            cx.new(|cx| Composer::new(store.clone(), Some("agent".into()), None, window, cx))
+        });
+        let editor = composer.read_with(window, |composer, _| composer.editor.clone());
+        window.update(|window, cx| editor.focus_handle(cx).focus(window, cx));
+        let shown = |window: &mut gpui::VisualTestContext| {
+            editor.read_with(window, |editor, _| {
+                let menu = editor.context_menu().borrow();
+                let Some(editor::code_context_menus::CodeContextMenu::Completions(menu)) =
+                    menu.as_ref()
+                else {
+                    return Vec::new();
+                };
+                let completions = menu.completions.borrow();
+                menu.entries
+                    .borrow()
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        editor::code_context_menus::CompletionMenuEntry::Match(matched) => {
+                            Some(completions[matched.candidate_id].label.text.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        editor.update_in(window, |editor, window, cx| {
+            editor.handle_input("/", window, cx)
+        });
+        window.run_until_parked();
+        let entries = shown(window);
+        assert_eq!(
+            entries.iter().filter(|entry| *entry == "/clear").count(),
+            1,
+            "the daemon's /clear doesn't repeat Zaseo's"
+        );
+        // The menu opens on "/" alone; letters typed after it must narrow it.
+        for typed in ["s", "r"] {
+            editor.update_in(window, |editor, window, cx| {
+                editor.handle_input(typed, window, cx)
+            });
+            window.run_until_parked();
+        }
+        let entries = shown(window);
+        let skills = names.iter().filter(|name| name.starts_with("sr-")).count();
+        assert!(
+            entries
+                .iter()
+                .take(skills)
+                .all(|entry| entry.starts_with("/sr-")),
+            "the closest matches come first: {entries:?}"
+        );
+    }
 
     fn provider() -> Provider {
         Provider {

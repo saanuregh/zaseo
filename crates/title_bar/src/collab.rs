@@ -559,12 +559,12 @@ impl TitleBar {
                     let folder_list = folder_names.join(", ");
 
                     let unshare_meta: SharedString = if folder_list.is_empty() {
-                        "Stop sharing project with call participants".into()
+                        "Stop sharing folder with call participants".into()
                     } else {
                         format!("Stop sharing {folder_list} with call participants").into()
                     };
                     let share_meta: SharedString = if folder_list.is_empty() {
-                        "Share active project with call participants".into()
+                        "Share active folder with call participants".into()
                     } else {
                         format!("Share {folder_list} with call participants").into()
                     };
@@ -578,7 +578,7 @@ impl TitleBar {
                                 if is_shared {
                                     this.tooltip(move |_, cx| {
                                         Tooltip::with_meta(
-                                            "Unshare Project",
+                                            "Unshare Folder",
                                             None,
                                             unshare_meta.clone(),
                                             cx,
@@ -591,12 +591,12 @@ impl TitleBar {
                                     ))
                                 } else if is_sharing_disabled {
                                     this.disabled(true).tooltip(Tooltip::text(
-                                        "This project may not be shared in a public channel.",
+                                        "This folder may not be shared in a public channel.",
                                     ))
                                 } else {
                                     this.tooltip(move |_, cx| {
                                         Tooltip::with_meta(
-                                            "Share Project",
+                                            "Share Folder",
                                             None,
                                             share_meta.clone(),
                                             cx,

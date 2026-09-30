@@ -1,20 +1,23 @@
 use gpui::{
-    AnyElement, App, Context, FontWeight, IntoElement, SharedString, TaskExt, Window, prelude::*,
-    relative,
+    Animation, AnimationExt as _, AnyElement, App, Context, ElementId, FontWeight, HighlightStyle,
+    Hsla, IntoElement, Pixels, SharedString, SpringAnimation, SpringConfig, StyledText, TaskExt,
+    Transformation, Window, ease_out_quint, prelude::*, relative,
 };
 use markdown::{MarkdownFont, MarkdownStyle};
 use paseo_client::{PermissionRequest, RewindMode};
 use serde_json::Value;
+use std::ops::Range;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use ui::{
-    CommonAnimationExt, ContextMenu, ContextMenuEntry, CopyButton, IconButton, PopoverMenu,
-    Tooltip, prelude::*,
+    CommonAnimationExt, ContextMenu, ContextMenuEntry, CopyButton, ElevationIndex, IconButton,
+    PopoverMenu, Tooltip, prelude::*,
 };
 
 use settings::Settings as _;
 use theme_settings::ThemeSettings;
 
-use crate::agent_view::{AgentView, CONTENT_MAX_WIDTH, Row};
+use crate::agent_view::{AgentView, OpenedSection, Row, RowIdentity, content_max_width};
 use crate::timeline::{
     DiffLineKind, FileChange, NoticeLevel, StreamContent, StreamItem, ToolCall, ToolKind,
     ToolStatus, diff_stat, edit_diff_lines, format_duration, format_message_time,
@@ -24,6 +27,157 @@ use crate::timeline::{
 const MARKDOWN_BODY: u8 = 0;
 const MARKDOWN_DETAIL: u8 = 1;
 const DETAIL_MAX_HEIGHT: f32 = 400.;
+/// Corner radius, in pixels at the chat's font size, of the chat's standalone blocks: the
+/// composer, message bubbles, images and cards. Pieces inside a block use `rounded_md`.
+pub(crate) const CARD_RADIUS: f32 = 12.;
+/// Text size of every step line between messages: tool groups, thinking, working, turn folds and
+/// the subagent track, so none reads louder than another.
+pub(crate) const STEP_LABEL_SIZE: LabelSize = LabelSize::Small;
+
+/// How long something that just appeared takes to fade in.
+pub(crate) const ENTRANCE: Duration = Duration::from_millis(180);
+/// A quick spring with a hint of settle, for chevrons turning as their section opens or closes.
+const CHEVRON_SPRING: SpringConfig = SpringConfig::new(420., 34., 1.);
+/// How long the shimmer's bright band takes to cross a working label.
+const SHIMMER_SWEEP: Duration = Duration::from_millis(2000);
+/// Half the width, in characters, of the shimmer's bright band.
+const SHIMMER_HALF_WIDTH: f32 = 5.;
+
+/// Fades `element` in and lifts it by `rise` when `appeared_at` is recent, and renders it still
+/// otherwise. Lists only render visible rows, so an animation keyed by id alone would replay each
+/// time a row scrolls back into view; gating on when it appeared plays it once.
+pub(crate) fn fade_in_since<E: Styled + IntoElement + 'static>(
+    element: E,
+    id: impl Into<ElementId>,
+    appeared_at: Option<Instant>,
+    rise: Pixels,
+) -> AnyElement {
+    // Twice the duration, so a first frame drawn a little late still finishes its animation.
+    match appeared_at.filter(|appeared_at| appeared_at.elapsed() < ENTRANCE * 2) {
+        Some(_) => element
+            .relative()
+            .with_animation(
+                id,
+                Animation::new(ENTRANCE).with_easing(ease_out_quint()),
+                move |element, delta| element.opacity(delta).top(rise * (1. - delta)),
+            )
+            .into_any_element(),
+        None => element.into_any_element(),
+    }
+}
+
+/// A stable id for a row's entrance animation, so a row keeps its animation when rows are
+/// inserted above it.
+fn entrance_key(identity: Option<RowIdentity>) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    identity.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// A chevron that turns by `turn` of a full rotation as its section opens. A spring starts at its
+/// target when first drawn, so it only moves when the user toggles it.
+pub(crate) fn rotating_chevron(
+    id: impl Into<ElementId>,
+    icon: IconName,
+    size: IconSize,
+    open: bool,
+    turn: f32,
+    cx: &App,
+) -> impl IntoElement {
+    // An svg rather than an `Icon`, whose transform setter is private to the ui crate.
+    gpui::svg()
+        .path(icon.path())
+        .size(size.rems())
+        .flex_none()
+        .text_color(Color::Muted.color(cx))
+        .with_spring(
+            id,
+            SpringAnimation::new(CHEVRON_SPRING)
+                .to(if open { 1_f32 } else { 0. })
+                .with_epsilon(0.01),
+            move |icon, progress| {
+                icon.with_transformation(Transformation::rotate(chevron_rotation(progress, turn)))
+            },
+        )
+}
+
+/// The chevron's angle `progress` of the way to `turn` of a full rotation. In radians rather than
+/// `percentage`, which asserts 0..=1 and so rejects a spring's overshoot past its target.
+fn chevron_rotation(progress: f32, turn: f32) -> gpui::Radians {
+    gpui::radians(progress * turn * std::f32::consts::TAU)
+}
+
+/// A step label with a bright band sweeping across it, for work in progress. Reduced motion
+/// shows the band's start, off the text, so the label reads plain.
+pub(crate) fn shimmer_label(id: impl Into<ElementId>, text: SharedString, cx: &App) -> AnyElement {
+    let colors = cx.theme().colors();
+    // From the placeholder tone, since themes often set muted text close to full text, which
+    // hides the band.
+    let (base, bright) = (colors.text_placeholder, colors.text);
+    div()
+        .text_ui_sm(cx)
+        .text_color(base)
+        .with_animation(
+            id,
+            Animation::new(SHIMMER_SWEEP).repeat(),
+            move |label, delta| {
+                label.child(
+                    StyledText::new(text.clone())
+                        .with_highlights(shimmer_highlights(&text, delta, base, bright)),
+                )
+            },
+        )
+        .into_any_element()
+}
+
+/// Colours for each character under the shimmer's band at `progress` through a sweep: brightest
+/// at the band's centre, fading to `base` at its edges. The band starts and ends off the text.
+fn shimmer_highlights(
+    text: &str,
+    progress: f32,
+    base: Hsla,
+    bright: Hsla,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    let length = text.chars().count() as f32;
+    let centre = progress * (length + SHIMMER_HALF_WIDTH * 2.) - SHIMMER_HALF_WIDTH;
+    text.char_indices()
+        .enumerate()
+        .filter_map(|(position, (start, character))| {
+            let strength = 1. - (position as f32 - centre).abs() / SHIMMER_HALF_WIDTH;
+            (strength > 0.).then(|| {
+                let color = base.blend(bright.opacity(strength));
+                (
+                    start..start + character.len_utf8(),
+                    HighlightStyle {
+                        color: Some(color),
+                        ..Default::default()
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
+/// Raises a standalone block one level above the chat: the theme's elevated tone, a hairline
+/// border and a soft shadow. Step details and code blocks sit a level lower, on the surface tone.
+pub(crate) fn raised_card<E: Styled>(element: E, cx: &App) -> E {
+    let colors = cx.theme().colors();
+    element
+        .bg(colors.elevated_surface_background)
+        .border_1()
+        .border_color(colors.border)
+        .shadow(ElevationIndex::ElevatedSurface.shadow(cx))
+}
+
+/// How an expandable row draws: a tool group's header is always filled and has no body of its
+/// own; Thinking opens into one filled box, like Paseo; other details open in a bordered box.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExpandableStyle {
+    Bordered,
+    Filled,
+    ToolGroup,
+}
 
 /// Items that render as a collapsed summary row with expandable details.
 pub(crate) fn is_expandable(item: &StreamItem) -> bool {
@@ -40,7 +194,7 @@ fn tool_icon(kind: ToolKind) -> IconName {
         ToolKind::Edit | ToolKind::Write => IconName::ToolPencil,
         ToolKind::Search => IconName::ToolSearch,
         ToolKind::Fetch => IconName::ToolWeb,
-        ToolKind::SubAgent => IconName::ZedAgent,
+        ToolKind::SubAgent => IconName::ListTree,
         ToolKind::Plan => IconName::ListTodo,
         ToolKind::Thinking => IconName::ToolThink,
         ToolKind::Other => IconName::ToolHammer,
@@ -298,8 +452,35 @@ impl AgentView {
     }
 
     fn markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
+        let font_size = crate::chat_font_size(cx);
+        let chat = &crate::PaseoSettings::get_global(cx).chat;
         let mut style = MarkdownStyle::themed(MarkdownFont::Editor, window, cx);
-        style.base_text_style.font_size = crate::chat_font_size(cx).into();
+        style.base_text_style.font_size = font_size.into();
+        if let Some(font_family) = chat.font_family.clone() {
+            style.base_text_style.font_family = font_family;
+        }
+        // Prose reads best at about one and a half lines, with paragraphs set apart by more
+        // than a line gap; the markdown defaults are tighter for tooltips and hovers.
+        style.base_text_style.line_height = relative(chat.line_height);
+        style.paragraph_line_height = relative(chat.line_height);
+        style.paragraph_spacing = font_size * 0.7;
+        style.list_spacing = font_size * 0.35;
+        // Prose and code share a monospace font here, so inline code needs its own colour to
+        // stand out; the theme's function colour reads as code in any theme.
+        let colors = cx.theme().colors();
+        style.inline_code.color = cx
+            .theme()
+            .syntax()
+            .style_for_name("function")
+            .and_then(|highlight| highlight.color)
+            .or(Some(colors.text_accent));
+        style.inline_code.background_color = Some(colors.editor_foreground.opacity(0.1));
+        // A symbol span stays styled as code; it is a link only to its click.
+        style.link_callback = Some(std::rc::Rc::new(|url, _| {
+            url.starts_with(crate::agent_view::SYMBOL_LINK_SCHEME)
+                .then(gpui::TextStyleRefinement::default)
+        }));
+        style.code_block = style.code_block.rounded_md().bg(colors.surface_background);
         style
     }
 
@@ -312,6 +493,7 @@ impl AgentView {
         let Some(row) = self.rows.get(index).cloned() else {
             return div().into_any_element();
         };
+        let identity = row.identity();
         let content = match row {
             Row::LoadOlder { loading } => h_flex()
                 .w_full()
@@ -343,33 +525,55 @@ impl AgentView {
                 streaming,
                 ..
             } => self.render_item(&item, expanded, streaming, window, cx),
+            Row::ToolGroup {
+                key,
+                label,
+                running,
+                failed,
+                expanded,
+            } => self.render_expandable(
+                key,
+                IconName::ToolHammer,
+                label.into(),
+                None,
+                None,
+                running,
+                failed,
+                expanded,
+                None,
+                ExpandableStyle::ToolGroup,
+                cx,
+            ),
             Row::TurnFooter {
                 turn,
                 duration_seconds,
                 finished_at,
+                ..
             } => self.render_turn_footer(turn, duration_seconds, finished_at, cx),
-            Row::Working { since } => {
+            Row::Working { since, spinner } => {
                 let elapsed = since
                     .map(|since| (chrono::Utc::now() - since).num_seconds())
                     .filter(|seconds| *seconds >= 0)
                     .map(format_duration);
                 h_flex()
-                    .py_2()
-                    .gap_2()
-                    .child(
-                        Icon::new(IconName::LoadCircle)
-                            .size(IconSize::Small)
-                            .color(Color::Muted)
-                            .with_rotate_animation(2),
-                    )
-                    .child(
-                        Label::new(match elapsed {
-                            Some(elapsed) => format!("Working · {elapsed}"),
+                    .py_1p5()
+                    .gap_1p5()
+                    .when(spinner, |this| {
+                        this.child(
+                            Icon::new(IconName::LoadCircle)
+                                .size(IconSize::Small)
+                                .color(Color::Muted)
+                                .with_rotate_animation(2),
+                        )
+                    })
+                    .child(shimmer_label(
+                        "paseo-working-shimmer",
+                        match elapsed {
+                            Some(elapsed) => format!("Working · {elapsed}").into(),
                             None => "Working".into(),
-                        })
-                        .size(LabelSize::Default)
-                        .color(Color::Muted),
-                    )
+                        },
+                        cx,
+                    ))
                     .when(!self.is_subagent(), |this| {
                         this.child(
                             Label::new("Esc to interrupt")
@@ -385,17 +589,61 @@ impl AgentView {
                 show_all,
             } => self.render_changes(&files, &expanded, show_all, cx),
             Row::Spacer => div().h(rems_from_px(16_f32)).into_any_element(),
+            Row::TurnFold {
+                key,
+                duration_seconds,
+                expanded,
+            } => self.render_turn_fold(key, duration_seconds, expanded, cx),
         };
-        h_flex()
-            .w_full()
-            .justify_center()
-            .px_4()
-            .child(
+        let appeared_at =
+            identity.and_then(|identity| self.row_appeared_at.get(&identity).copied());
+        fade_in_since(
+            h_flex().w_full().justify_center().px_4().child(
                 v_flex()
                     .w_full()
-                    .max_w(rems_from_px(CONTENT_MAX_WIDTH))
+                    .max_w(content_max_width(cx))
                     .min_w_0()
                     .child(content),
+            ),
+            ("paseo-row-entrance", entrance_key(identity)),
+            appeared_at,
+            px(4.),
+        )
+    }
+
+    /// A finished turn's "Worked for" line: a click shows or hides the steps before its answer.
+    fn render_turn_fold(
+        &mut self,
+        key: u64,
+        duration_seconds: Option<i64>,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = match duration_seconds {
+            Some(seconds) => format!("Worked for {}", format_duration(seconds)),
+            None => "Worked".to_owned(),
+        };
+        v_flex()
+            .pt_2()
+            .pb_1()
+            .mb_1()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(
+                h_flex()
+                    .id(("paseo-turn-fold", key))
+                    .gap_1p5()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |view, _, _, cx| view.toggle_turn(key, cx)))
+                    .child(Label::new(label).size(STEP_LABEL_SIZE).color(Color::Muted))
+                    .child(rotating_chevron(
+                        ("paseo-turn-fold-chevron", key),
+                        IconName::ChevronDown,
+                        IconSize::Small,
+                        expanded,
+                        0.5,
+                        cx,
+                    )),
             )
             .into_any_element()
     }
@@ -435,6 +683,7 @@ impl AgentView {
                     .cloned()
                     .unwrap_or_default();
                 let show_bubble = !text.trim().is_empty() || sent_images.is_empty();
+                let fixed_width = needs_fixed_bubble_width(text);
                 v_flex()
                     .id(("paseo-user-message", item.key))
                     .group(group.clone())
@@ -451,7 +700,7 @@ impl AgentView {
                                 .max_w(relative(0.85))
                                 .children(sent_images.into_iter().map(|image| {
                                     div()
-                                        .rounded_lg()
+                                        .rounded(rems_from_px(CARD_RADIUS))
                                         .overflow_hidden()
                                         .border_1()
                                         .border_color(colors.border)
@@ -469,11 +718,12 @@ impl AgentView {
                             div()
                                 .min_w_0()
                                 .max_w(relative(0.85))
+                                .when(fixed_width, |bubble| bubble.w(relative(0.85)))
                                 .px_4()
                                 .py_2p5()
-                                .rounded(rems_from_px(16_f32))
+                                .rounded(rems_from_px(CARD_RADIUS))
                                 .rounded_tr(rems_from_px(4_f32))
-                                .bg(colors.element_active)
+                                .map(|bubble| raised_card(bubble, cx))
                                 .child(
                                     self.markdown_element(
                                         markdown,
@@ -509,11 +759,6 @@ impl AgentView {
                     .into_any_element()
             }
             StreamContent::Reasoning { text } => {
-                let summary = text
-                    .lines()
-                    .map(str::trim)
-                    .find(|line| !line.is_empty())
-                    .map(|line| line.trim_matches('*').to_owned());
                 let body = expanded.then(|| {
                     let markdown = self.markdown_for(item.key, MARKDOWN_DETAIL, text, cx);
                     let mut style = Self::markdown_style(window, cx);
@@ -526,12 +771,13 @@ impl AgentView {
                     item.key,
                     IconName::ToolThink,
                     "Thinking".into(),
-                    summary,
+                    None,
                     None,
                     streaming,
                     false,
                     expanded,
                     body,
+                    ExpandableStyle::Filled,
                     cx,
                 )
             }
@@ -591,6 +837,7 @@ impl AgentView {
                     false,
                     expanded,
                     body,
+                    ExpandableStyle::Bordered,
                     cx,
                 )
             }
@@ -671,11 +918,17 @@ impl AgentView {
         failed: bool,
         expanded: bool,
         body: Option<AnyElement>,
+        style: ExpandableStyle,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
-        let group = SharedString::from(format!("paseo-row-{key}"));
-        let has_body = body.is_some() || !expanded;
+        let is_group = style == ExpandableStyle::ToolGroup;
+        let group = SharedString::from(if is_group {
+            format!("paseo-tool-group-{key}")
+        } else {
+            format!("paseo-row-{key}")
+        });
+        let has_body = is_group || body.is_some() || !expanded;
         let icon_element = if running {
             Icon::new(IconName::LoadCircle)
                 .size(IconSize::Small)
@@ -693,7 +946,14 @@ impl AgentView {
             .py_0p5()
             .child(
                 h_flex()
-                    .id(("paseo-row", key))
+                    .id((
+                        if is_group {
+                            "paseo-tool-group"
+                        } else {
+                            "paseo-row"
+                        },
+                        key,
+                    ))
                     .group(group.clone())
                     .w_full()
                     .min_w_0()
@@ -703,32 +963,50 @@ impl AgentView {
                     .ml(rems_from_px(-8_f32))
                     .mr(rems_from_px(-8_f32))
                     .rounded_md()
-                    .when(expanded, |this| {
+                    .when(expanded && !is_group, |this| {
                         this.bg(colors.surface_background).rounded_b_none()
                     })
                     .when(has_body, |this| {
                         this.cursor_pointer()
                             .hover(|style| style.bg(colors.ghost_element_hover))
-                            .on_click(
-                                cx.listener(move |view, _, _, cx| view.toggle_expanded(key, cx)),
-                            )
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                if is_group {
+                                    view.toggle_group(key, cx)
+                                } else {
+                                    view.toggle_expanded(key, cx)
+                                }
+                            }))
                     })
                     .child(div().flex_none().child(icon_element))
-                    .child(
+                    .child(if running {
+                        shimmer_label(
+                            (
+                                if is_group {
+                                    "paseo-tool-group-shimmer"
+                                } else {
+                                    "paseo-row-shimmer"
+                                },
+                                key,
+                            ),
+                            label,
+                            cx,
+                        )
+                    } else {
+                        // A tool group is a quiet line between the agent's messages, as in T3 Code.
                         Label::new(label)
-                            .size(LabelSize::Default)
-                            .weight(FontWeight::MEDIUM)
-                            .color(if expanded || running {
+                            .size(STEP_LABEL_SIZE)
+                            .color(if expanded {
                                 Color::Default
                             } else {
                                 Color::Muted
-                            }),
-                    )
+                            })
+                            .into_any_element()
+                    })
                     .when_some(summary, |this, summary| {
                         this.child(
                             div().min_w_0().flex_shrink_1().child(
                                 Label::new(summary)
-                                    .size(LabelSize::Default)
+                                    .size(STEP_LABEL_SIZE)
                                     .color(Color::Muted)
                                     .truncate(),
                             ),
@@ -747,19 +1025,26 @@ impl AgentView {
                         div()
                             .flex_none()
                             .when(!expanded, |this| this.visible_on_hover(group))
-                            .child(
-                                Icon::new(if expanded {
-                                    IconName::ChevronUp
-                                } else {
-                                    IconName::ChevronDown
-                                })
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
-                            ),
+                            .child(rotating_chevron(
+                                (
+                                    if is_group {
+                                        "paseo-tool-group-chevron"
+                                    } else {
+                                        "paseo-row-chevron"
+                                    },
+                                    key,
+                                ),
+                                IconName::ChevronDown,
+                                IconSize::Small,
+                                expanded,
+                                0.5,
+                                cx,
+                            )),
                     ),
             )
             .when_some(body, |this, body| {
-                this.child(
+                let opened_at = self.opened_at.get(&OpenedSection::Step(key)).copied();
+                this.child(fade_in_since(
                     div()
                         .id(("paseo-row-detail", key))
                         .ml(rems_from_px(-8_f32))
@@ -768,10 +1053,15 @@ impl AgentView {
                         .overflow_y_scroll()
                         .p_2()
                         .rounded_b_md()
-                        .border_1()
-                        .border_color(colors.border_variant)
+                        .map(|this| match style {
+                            ExpandableStyle::Filled => this.bg(colors.surface_background),
+                            _ => this.border_1().border_color(colors.border_variant),
+                        })
                         .child(body),
-                )
+                    ("paseo-row-detail-fade", key),
+                    opened_at,
+                    px(0.),
+                ))
             })
             .into_any_element()
     }
@@ -879,6 +1169,7 @@ impl AgentView {
             call.status == ToolStatus::Failed,
             expanded,
             body,
+            ExpandableStyle::Bordered,
             cx,
         )
     }
@@ -1108,16 +1399,14 @@ impl AgentView {
             .id("paseo-turn-changes")
             .w_full()
             .my_1()
-            .rounded(rems_from_px(8_f32))
-            .border_1()
-            .border_color(colors.border_variant)
+            .rounded(rems_from_px(CARD_RADIUS))
+            .map(|card| raised_card(card, cx))
             .overflow_hidden()
             .child(
                 h_flex()
                     .px_3()
                     .py_1p5()
                     .gap_2()
-                    .bg(colors.element_background)
                     .child(
                         Icon::new(IconName::FileDiff)
                             .size(IconSize::Small)
@@ -1148,6 +1437,10 @@ impl AgentView {
                 let path = file.path.clone();
                 let display = crate::timeline::relative_path(&file.path, cwd.as_deref());
                 let absolute = PathBuf::from(&file.path);
+                let opened_at = self
+                    .opened_at
+                    .get(&OpenedSection::Change(file.path.clone()))
+                    .copied();
                 v_flex()
                     .w_full()
                     .border_t_1()
@@ -1161,15 +1454,14 @@ impl AgentView {
                             .gap_1p5()
                             .cursor_pointer()
                             .hover(|this| this.bg(colors.ghost_element_hover))
-                            .child(
-                                Icon::new(if is_expanded {
-                                    IconName::ChevronDown
-                                } else {
-                                    IconName::ChevronRight
-                                })
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
-                            )
+                            .child(rotating_chevron(
+                                ("paseo-turn-change-chevron", index),
+                                IconName::ChevronRight,
+                                IconSize::Small,
+                                is_expanded,
+                                0.25,
+                                cx,
+                            ))
                             .child(
                                 div().flex_1().min_w_0().child(
                                     Label::new(display)
@@ -1200,12 +1492,13 @@ impl AgentView {
                             .on_click(cx.listener(move |view, _, _, cx| {
                                 if !view.expanded_changes.remove(&path) {
                                     view.expanded_changes.insert(path.clone());
+                                    view.mark_opened(OpenedSection::Change(path.clone()));
                                 }
                                 view.rebuild(cx);
                             })),
                     )
                     .when(is_expanded, |this| {
-                        this.child(
+                        this.child(fade_in_since(
                             div()
                                 .id(("paseo-turn-change-diff", index))
                                 .max_h(rems_from_px(DETAIL_MAX_HEIGHT))
@@ -1213,7 +1506,10 @@ impl AgentView {
                                 .py_1()
                                 .bg(colors.editor_background)
                                 .child(render_diff_lines(file.lines.clone(), cx)),
-                        )
+                            ("paseo-turn-change-diff-fade", index),
+                            opened_at,
+                            px(0.),
+                        ))
                     })
             }))
             .when(files.len() > COLLAPSED_FILES, |this| {
@@ -1347,5 +1643,78 @@ pub(crate) fn permission_preview(request: &PermissionRequest, cx: &App) -> Optio
             Some(mono_block(text, cx))
         }
         None => None,
+    }
+}
+
+/// Markdown lists lay out at zero width until given one (see `push_markdown_list_item`), and
+/// tables and code blocks fill their container, so a bubble sized to its content would squeeze
+/// them to the width of its plain lines.
+fn needs_fixed_bubble_width(text: &str) -> bool {
+    text.lines().map(str::trim_start).any(|line| {
+        let after_number = line.trim_start_matches(|character: char| character.is_ascii_digit());
+        let numbered = after_number.len() < line.len()
+            && (after_number.starts_with(". ") || after_number.starts_with(") "));
+        numbered
+            || ["- ", "* ", "+ ", "```", "~~~", "|"]
+                .iter()
+                .any(|marker| line.starts_with(marker))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chevron_rotation_accepts_spring_overshoot() {
+        // A spring passes its target before settling; `percentage` panics outside 0..=1.
+        assert!(chevron_rotation(1.08, 0.5).0 > std::f32::consts::PI);
+        assert!(chevron_rotation(-0.05, 0.25).0 < 0.);
+        assert_eq!(chevron_rotation(1., 0.25).0, std::f32::consts::FRAC_PI_2);
+    }
+
+    #[test]
+    fn shimmer_band_brightens_the_characters_under_it() {
+        let base = gpui::hsla(0., 0., 0.4, 1.);
+        let bright = gpui::hsla(0., 0., 0.9, 1.);
+        let text = "Working · 3m";
+        let length = text.chars().count() as f32;
+        let band_on =
+            |position: f32| (position + SHIMMER_HALF_WIDTH) / (length + SHIMMER_HALF_WIDTH * 2.);
+
+        assert!(shimmer_highlights(text, 0., base, bright).is_empty());
+        assert!(shimmer_highlights(text, 1., base, bright).is_empty());
+
+        let highlights = shimmer_highlights(text, band_on(2.), base, bright);
+        let lightness = |byte: usize| {
+            highlights
+                .iter()
+                .find(|(range, _)| range.start == byte)
+                .and_then(|(_, style)| style.color)
+                .map(|color| color.l)
+        };
+        let centre = lightness(2).expect("the band's centre is highlighted");
+        assert!((centre - bright.l).abs() < 0.01);
+        assert!(lightness(4).expect("inside the band") < centre);
+        assert!(lightness(0).is_some());
+        // "·" is two bytes; ranges follow characters, not bytes.
+        assert!(highlights.iter().all(
+            |(range, _)| text.is_char_boundary(range.start) && text.is_char_boundary(range.end)
+        ));
+        assert!(highlights.iter().all(|(range, _)| range.start < 8));
+    }
+
+    #[test]
+    fn block_markdown_gets_a_fixed_width_bubble() {
+        assert!(!needs_fixed_bubble_width("couple of issues"));
+        assert!(!needs_fixed_bubble_width("fix 2.5 things\nand -dash words"));
+        assert!(needs_fixed_bubble_width(
+            "couple of issues\n1. the side bar is buggy\n2. archived error"
+        ));
+        assert!(needs_fixed_bubble_width("notes:\n  - nested bullet"));
+        assert!(needs_fixed_bubble_width("see\n* star bullet"));
+        assert!(needs_fixed_bubble_width("run\n```\ncargo test\n```"));
+        assert!(needs_fixed_bubble_width("| a | b |\n|---|---|"));
+        assert!(needs_fixed_bubble_width("3) paren list"));
     }
 }

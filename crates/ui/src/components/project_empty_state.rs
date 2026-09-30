@@ -68,7 +68,7 @@ impl RenderOnce for ProjectEmptyState {
                             .child(Label::new(label).size(LabelSize::Small).color(Color::Muted)),
                     )
                     .child(
-                        Button::new("open_project", "Open Project")
+                        Button::new("open_project", "Open Folder")
                             .full_width()
                             .key_binding(self.open_project_key_binding)
                             .when_some(self.on_open_project, |button, handler| {

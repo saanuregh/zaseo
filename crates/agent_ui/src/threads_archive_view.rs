@@ -1448,7 +1448,7 @@ impl PickerDelegate for ProjectPickerDelegate {
         };
 
         if has_recent_to_show {
-            entries.push(ProjectPickerEntry::Header("Recent Projects".into()));
+            entries.push(ProjectPickerEntry::Header("Recent Folders".into()));
 
             if is_empty_query {
                 for (id, workspace) in self.workspaces.iter().enumerate() {

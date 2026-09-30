@@ -26,7 +26,7 @@ use client::{Client, UserStore, zed_urls};
 use command_palette_hooks::CommandPaletteFilter;
 
 use gpui::{
-    Action, Anchor, Animation, AnimationExt, AnyElement, App, Context, Element, Entity,
+    Action, Anchor, Animation, AnimationExt, AnyElement, AnyView, App, Context, Element, Entity,
     InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
     StatefulInteractiveElement, Styled, Subscription, TaskExt, WeakEntity, Window, actions, div,
     pulsating_between,
@@ -219,6 +219,8 @@ pub struct TitleBar {
     update_version: Entity<UpdateVersion>,
     screen_share_popover_handle: PopoverMenuHandle<ContextMenu>,
     _diagnostics_subscription: Option<gpui::Subscription>,
+    after_project_item: Option<AnyView>,
+    end_item: Option<AnyView>,
 }
 
 impl Render for TitleBar {
@@ -334,6 +336,7 @@ impl Render for TitleBar {
                                         .children(self.render_project_host(cx))
                                         .children(self.render_project_name(project_name))
                                 })
+                                .children(self.after_project_item.clone())
                                 .when_some(
                                     repository.filter(|_| is_git_enabled),
                                     |title_bar, repository| {
@@ -379,6 +382,7 @@ impl Render for TitleBar {
                 .pr_1()
                 .gap_1()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .children(self.end_item.clone())
                 .child(self.render_call_controls(window, cx))
                 .children(self.render_connection_status(status))
                 .child(self.update_version.clone())
@@ -447,6 +451,18 @@ impl Render for TitleBar {
 }
 
 impl TitleBar {
+    /// Shows `item` after the project name, for an embedder's own context.
+    pub fn set_after_project_item(&mut self, item: AnyView, cx: &mut Context<Self>) {
+        self.after_project_item = Some(item);
+        cx.notify();
+    }
+
+    /// Shows `item` first in the right-hand group, for an embedder's own status.
+    pub fn set_end_item(&mut self, item: AnyView, cx: &mut Context<Self>) {
+        self.end_item = Some(item);
+        cx.notify();
+    }
+
     pub fn new(
         id: impl Into<ElementId>,
         workspace: &Workspace,
@@ -533,6 +549,8 @@ impl TitleBar {
             update_version,
             screen_share_popover_handle: PopoverMenuHandle::default(),
             _diagnostics_subscription: None,
+            after_project_item: None,
+            end_item: None,
         };
 
         this.observe_diagnostics(cx);
@@ -612,15 +630,15 @@ impl TitleBar {
         let (nickname, tooltip_title, icon) = match options {
             RemoteConnectionOptions::Ssh(options) => (
                 options.nickname.map(|nick| nick.into()),
-                "Remote Project",
+                "Remote Folder",
                 IconName::Server,
             ),
-            RemoteConnectionOptions::Wsl(_) => (None, "Remote Project", IconName::Linux),
+            RemoteConnectionOptions::Wsl(_) => (None, "Remote Folder", IconName::Linux),
             RemoteConnectionOptions::Docker(_dev_container_connection) => {
                 (None, "Dev Container", IconName::Box)
             }
             #[cfg(any(test, feature = "test-support"))]
-            RemoteConnectionOptions::Mock(_) => (None, "Mock Remote Project", IconName::Server),
+            RemoteConnectionOptions::Mock(_) => (None, "Mock Remote Folder", IconName::Server),
         };
 
         let nickname = nickname.unwrap_or_else(|| host.clone());
@@ -717,7 +735,7 @@ impl TitleBar {
                 Tooltip::with_meta(
                     "You're in Restricted Mode",
                     Some(&ToggleWorktreeSecurity),
-                    "Mark this project as trusted and unlock all features",
+                    "Mark this folder as trusted and unlock all features",
                     cx,
                 )
             })
@@ -769,7 +787,7 @@ impl TitleBar {
                 .tab_index(0isize)
                 .tooltip(move |_, cx| {
                     let tooltip_title = format!(
-                        "{} is sharing this project. Click to follow.",
+                        "{} is sharing this folder. Click to follow.",
                         host_user.username
                     );
 

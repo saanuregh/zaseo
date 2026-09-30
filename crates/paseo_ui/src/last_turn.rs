@@ -274,12 +274,16 @@ impl LastTurnView {
     }
 
     fn title(&self, cx: &App) -> SharedString {
-        let agent_title = self
-            .store
-            .read(cx)
+        let store = self.store.read(cx);
+        let agent_title = store
             .agent(&self.agent_id)
-            .and_then(|agent| agent.title.clone())
-            .filter(|title| !title.is_empty());
+            .filter(|agent| {
+                agent
+                    .title
+                    .as_deref()
+                    .is_some_and(|title| !title.is_empty())
+            })
+            .map(|agent| store.display_title(agent));
         match agent_title {
             Some(agent_title) => format!("Last turn · {agent_title}").into(),
             None => "Last turn".into(),

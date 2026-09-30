@@ -28,9 +28,9 @@ use feature_flags::{
     AgentThreadWorktreeLabel, AgentThreadWorktreeLabelFlag, FeatureFlag, FeatureFlagAppExt as _,
 };
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Decorations, DismissEvent, Entity, EntityId,
-    FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task,
-    TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle, linear_color_stop,
+    AnyElement, App, ClickEvent, Context, Decorations, DismissEvent, Entity, EntityId, FocusHandle,
+    Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task, TaskExt,
+    WeakEntity, Window, WindowBackgroundAppearance, WindowHandle, linear_color_stop,
     linear_gradient, list, prelude::*, px,
 };
 use itertools::Itertools;
@@ -58,9 +58,9 @@ use std::sync::Arc;
 use theme::{ActiveTheme, CLIENT_SIDE_DECORATION_ROUNDING};
 use ui::{
     AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, Divider, GradientFade,
-    HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, ScrollAxes,
-    Scrollbars, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar,
-    prelude::*, render_modifiers, right_click_menu,
+    HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, ScrollAxes, Scrollbars, Tab,
+    ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar, prelude::*,
+    render_modifiers, right_click_menu,
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 use util::ResultExt as _;
@@ -856,7 +856,7 @@ impl Sidebar {
         let filter_placeholder = if AgentSettings::get_global(cx).enabled(cx) {
             "Search threads…"
         } else {
-            "Search projects…"
+            "Search folders…"
         };
         let filter_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
@@ -2308,7 +2308,7 @@ impl Sidebar {
                         .size(IconSize::XSmall)
                         .color(Color::Muted),
                 )
-                .tooltip(Tooltip::text("Remote Project"))
+                .tooltip(Tooltip::text("Remote Folder"))
                 .into_any_element(),
         )
     }
@@ -2929,7 +2929,7 @@ impl Sidebar {
 
                         let menu = menu.when(show_multi_project_entries, |this| {
                             this.entry(
-                                "Open Project in New Window",
+                                "Open Folder in New Window",
                                 Some(Box::new(workspace::MoveProjectToNewWindow)),
                                 {
                                     let project_group_key = project_group_key.clone();
@@ -2967,9 +2967,9 @@ impl Sidebar {
                                             .child(Label::new("-click").color(Color::Muted));
 
                                         let label = if has_threads {
-                                            "Focus Last Project"
+                                            "Focus Last Folder"
                                         } else {
-                                            "Focus Project"
+                                            "Focus Folder"
                                         };
 
                                         h_flex()
@@ -7261,7 +7261,7 @@ impl Sidebar {
     fn render_no_results(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let has_query = self.has_filter_query(cx);
         let message = if !AgentSettings::get_global(cx).enabled(cx) {
-            "No projects match your search."
+            "No folders match your search."
         } else if has_query {
             "No threads match your search."
         } else {
@@ -7291,7 +7291,7 @@ impl Sidebar {
             .items_center()
             .justify_center()
             .child(
-                Label::new("Open a Paseo agent to open its project.")
+                Label::new("Open a Paseo agent to open its folder.")
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )

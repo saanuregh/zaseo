@@ -8,8 +8,10 @@ use gpui::{Image, ImageFormat, ImageSource, Resource, SharedUri};
 use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use paseo_client::{PermissionRequest, PermissionResponse};
 use serde_json::Value;
+use settings::Settings as _;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -21,23 +23,61 @@ use ui::{
 use workspace::{
     Item, ItemId, SerializableItem, Workspace, WorkspaceId,
     item::{ItemEvent, TabContentParams},
+    notifications::NotifyTaskExt as _,
 };
 
 use crate::composer::{Composer, ComposerEvent};
+use crate::sidebar::{AgentAlert, pulse_in_alert_color};
 use crate::store::{
     AgentBucket, PaseoStore, StoreEvent, agent_branch, agent_bucket, agent_is_running,
-    agent_project_name, agent_provider, agent_title, agent_turn_started_at, subagent_bucket,
-    subagent_title,
+    agent_project_name, agent_provider, agent_turn_started_at, agent_worktree_name,
+    subagent_bucket, subagent_title,
 };
 use crate::timeline::{
-    FileChange, StreamItem, Turn, group_turns, parse_timestamp, project_items, turn_changes,
+    FileChange, Segment, StreamContent, StreamItem, ToolStatus, Turn, group_turns, parse_timestamp,
+    project_items, tool_group_label, tool_runs, turn_changes,
 };
 use crate::{
-    ArchiveAgent, CopyAgentId, FocusComposer, RenameAgent, ScrollToBottom, connection_picker,
-    open_draft, store,
+    ArchiveAgent, CopyAgentId, FocusComposer, RenameAgent, ScrollToBottom, connection_picker, store,
 };
+use editor::Editor;
 
-pub(crate) const CONTENT_MAX_WIDTH: f32 = 920.;
+/// The chat column's widest: the configured number of characters at the chat's size, taking a
+/// character as a monospace font's 0.6 em, so it grows with zoom. Longer lines are slower to read.
+pub(crate) fn content_max_width(cx: &App) -> Pixels {
+    let characters = crate::PaseoSettings::get_global(cx).chat.line_length as f32;
+    crate::chat_font_size(cx) * (characters * 0.6)
+}
+
+/// Whether an item is the agent thinking, which the chat can hide outside an open fold.
+fn is_thinking(item: &StreamItem) -> bool {
+    match &item.content {
+        StreamContent::Reasoning { .. } => true,
+        StreamContent::Tool(call) => {
+            crate::timeline::tool_display(call, None).kind == crate::timeline::ToolKind::Thinking
+        }
+        _ => false,
+    }
+}
+
+/// The steps of a finished turn that its "Worked for" line folds away: everything between the
+/// user's message and the agent's final answer, or after the message when no answer came.
+/// `None` when there is nothing between them.
+pub(crate) fn folded_work(items: &[StreamItem], turn: Range<usize>) -> Option<Range<usize>> {
+    let is_user = |index: &usize| {
+        items
+            .get(*index)
+            .is_some_and(|item| matches!(item.content, StreamContent::User { .. }))
+    };
+    let work_start = turn.clone().find(|index| !is_user(index))?;
+    let final_answer = (work_start..turn.end).rev().find(|index| {
+        items.get(*index).is_some_and(|item| {
+            matches!(&item.content, StreamContent::Assistant { text } if !text.trim().is_empty())
+        })
+    });
+    let work = work_start..final_answer.unwrap_or(turn.end);
+    (!work.is_empty()).then_some(work)
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Row {
@@ -50,13 +90,30 @@ pub(crate) enum Row {
         expanded: bool,
         streaming: bool,
     },
+    ToolGroup {
+        key: u64,
+        label: String,
+        running: bool,
+        failed: bool,
+        expanded: bool,
+    },
+    /// A finished turn's "Worked for" line, which folds its steps before the final answer.
+    TurnFold {
+        key: u64,
+        duration_seconds: Option<i64>,
+        expanded: bool,
+    },
     TurnFooter {
         turn: usize,
+        /// The key of the turn's first item, which stays put when older turns load above.
+        first_item_key: Option<u64>,
         duration_seconds: Option<i64>,
         finished_at: Option<chrono::DateTime<Utc>>,
     },
     Working {
         since: Option<chrono::DateTime<Utc>>,
+        /// Off when the step just above already spins, so one spinner shows the work.
+        spinner: bool,
     },
     /// The files the latest finished turn changed, like waku's changed-files card.
     Changes {
@@ -65,6 +122,71 @@ pub(crate) enum Row {
         show_all: bool,
     },
     Spacer,
+}
+
+/// What a row shows, stable while its content changes (streaming text, a timer ticking), so a
+/// row counts as new only when it first appears.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum RowIdentity {
+    Item(u64),
+    ToolGroup(u64),
+    TurnFold(u64),
+    TurnFooter(Option<u64>),
+    Working,
+    Changes,
+}
+
+impl Row {
+    pub(crate) fn identity(&self) -> Option<RowIdentity> {
+        match self {
+            Row::Item { item, .. } => Some(RowIdentity::Item(item.key)),
+            Row::ToolGroup { key, .. } => Some(RowIdentity::ToolGroup(*key)),
+            Row::TurnFold { key, .. } => Some(RowIdentity::TurnFold(*key)),
+            Row::TurnFooter { first_item_key, .. } => {
+                Some(RowIdentity::TurnFooter(*first_item_key))
+            }
+            Row::Working { .. } => Some(RowIdentity::Working),
+            Row::Changes { .. } => Some(RowIdentity::Changes),
+            Row::LoadOlder { .. } | Row::Spacer => None,
+        }
+    }
+}
+
+/// More rows than this arriving at once is a load (opening a chat, its history arriving), not
+/// the conversation moving, so they appear without animating.
+const MAX_ANIMATED_ARRIVALS: usize = 8;
+
+/// The rows in `new` that should ease in: ones `old` didn't have, except on the first build,
+/// for older history loaded above the rows already shown, and for bulk loads.
+pub(crate) fn arriving_rows(old: &[Row], new: &[Row]) -> Vec<RowIdentity> {
+    let old_identities = old.iter().filter_map(Row::identity).collect::<HashSet<_>>();
+    if old_identities.is_empty() {
+        return Vec::new();
+    }
+    let first_kept = new.iter().position(|row| {
+        row.identity()
+            .is_some_and(|identity| old_identities.contains(&identity))
+    });
+    let arriving = new
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| first_kept.is_some_and(|first_kept| *index > first_kept))
+        .filter_map(|(_, row)| row.identity())
+        .filter(|identity| !old_identities.contains(identity))
+        .collect::<Vec<_>>();
+    if arriving.len() > MAX_ANIMATED_ARRIVALS {
+        Vec::new()
+    } else {
+        arriving
+    }
+}
+
+/// A section the user opened, whose body fades in.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum OpenedSection {
+    Step(u64),
+    Change(String),
+    Subagents,
 }
 
 pub struct AgentView {
@@ -78,13 +200,25 @@ pub struct AgentView {
     pub(crate) turns: Vec<Turn>,
     pub(crate) markdown: HashMap<(u64, u8), Entity<Markdown>>,
     pub(crate) expanded: HashSet<u64>,
+    /// Open tool groups, keyed by their first call's key. Kept apart from `expanded`, which holds
+    /// that call's own open state under the same key.
+    pub(crate) expanded_groups: HashSet<u64>,
+    /// Finished turns the user opened or closed away from the setting's default, keyed by the
+    /// first folded item.
+    pub(crate) expanded_turns: HashSet<u64>,
     pub(crate) expanded_changes: HashSet<String>,
     pub(crate) show_all_changes: bool,
     subagents_expanded: bool,
+    /// When each row that arrived while the chat was open appeared, so it eases in once.
+    pub(crate) row_appeared_at: HashMap<RowIdentity, Instant>,
+    /// When each section was last opened, so its body fades in once.
+    pub(crate) opened_at: HashMap<OpenedSection, Instant>,
     /// The agent's directory, whose daemon terminals this view keeps listed.
     terminal_directory: Option<String>,
     pub(crate) workspace: Option<WeakEntity<Workspace>>,
     question_answers: HashMap<(String, usize), Vec<String>>,
+    question_index: HashMap<String, usize>,
+    question_inputs: RefCell<HashMap<(String, usize), (Entity<Editor>, Subscription)>>,
     ticker: Option<Task<()>>,
     title: SharedString,
     bucket: Option<AgentBucket>,
@@ -104,6 +238,8 @@ pub struct AgentView {
     subagent_scroll: ScrollHandle,
     /// Per permission request, so each preview keeps its own scroll position.
     permission_scrolls: RefCell<HashMap<String, ScrollHandle>>,
+    /// The chat settings the rows were last built with.
+    chat_settings: Option<crate::ChatSettings>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -118,6 +254,7 @@ struct RebuildInputs {
     has_older: bool,
     loading_older: bool,
     has_permission: bool,
+    title: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -150,6 +287,7 @@ impl AgentView {
         list_state.set_follow_mode(gpui::FollowMode::Tail);
         let mut subscriptions = vec![
             cx.observe(&store, |view: &mut Self, _, cx| {
+                view.forget_resolved_questions(cx);
                 view.rebuild_if_inputs_changed(cx)
             }),
             cx.subscribe(&store, |view: &mut Self, _, event: &StoreEvent, cx| {
@@ -160,6 +298,14 @@ impl AgentView {
                 }
             }),
             cx.subscribe_in(&composer, window, Self::handle_composer_event),
+            // Folding and thinking settings change which rows exist.
+            cx.observe_global::<settings::SettingsStore>(|view: &mut Self, cx| {
+                let chat = crate::PaseoSettings::get_global(cx).chat.clone();
+                if view.chat_settings.as_ref() != Some(&chat) {
+                    view.chat_settings = Some(chat);
+                    view.rebuild(cx);
+                }
+            }),
         ];
         let focus_handle = cx.focus_handle();
         subscriptions.push(
@@ -217,15 +363,22 @@ impl AgentView {
             subagent_scroll: ScrollHandle::new(),
             permission_scrolls: RefCell::default(),
             expanded: HashSet::new(),
+            expanded_groups: HashSet::new(),
+            expanded_turns: HashSet::new(),
             expanded_changes: HashSet::new(),
             show_all_changes: false,
             subagents_expanded: false,
+            row_appeared_at: HashMap::new(),
+            opened_at: HashMap::new(),
             terminal_directory: None,
             workspace,
             question_answers: HashMap::new(),
+            question_index: HashMap::new(),
+            question_inputs: RefCell::default(),
             ticker: None,
             title: "New agent".into(),
             bucket: None,
+            chat_settings: None,
             _subscriptions: subscriptions,
         };
         view.rebuild(cx);
@@ -326,11 +479,23 @@ impl AgentView {
                     });
                 }
             }
-            ComposerEvent::ClearRequested { directory } => {
-                let directory = directory.clone();
+            ComposerEvent::ClearRequested {
+                directory,
+                workspace_id,
+            } => {
+                let (directory, workspace_id) = (directory.clone(), workspace_id.clone());
                 if let Some(workspace) = self.workspace.as_ref().and_then(WeakEntity::upgrade) {
-                    workspace.update(cx, |workspace, cx| {
-                        open_draft(workspace, directory, window, cx);
+                    // Deferred because showing the workspace's tabs reads this view.
+                    window.defer(cx, move |window, cx| {
+                        workspace.update(cx, |workspace, cx| {
+                            crate::open_draft_joining(
+                                workspace,
+                                directory,
+                                workspace_id,
+                                window,
+                                cx,
+                            );
+                        });
                     });
                 }
             }
@@ -354,11 +519,33 @@ impl AgentView {
         }
     }
 
+    pub(crate) fn toggle_turn(&mut self, key: u64, cx: &mut Context<Self>) {
+        if !self.expanded_turns.remove(&key) {
+            self.expanded_turns.insert(key);
+        }
+        self.rebuild(cx);
+    }
+
+    pub(crate) fn toggle_group(&mut self, key: u64, cx: &mut Context<Self>) {
+        if !self.expanded_groups.remove(&key) {
+            self.expanded_groups.insert(key);
+        }
+        self.rebuild(cx);
+    }
+
     pub(crate) fn toggle_expanded(&mut self, key: u64, cx: &mut Context<Self>) {
         if !self.expanded.remove(&key) {
             self.expanded.insert(key);
+            self.mark_opened(OpenedSection::Step(key));
         }
         self.rebuild(cx);
+    }
+
+    pub(crate) fn mark_opened(&mut self, section: OpenedSection) {
+        let now = Instant::now();
+        self.opened_at
+            .retain(|_, opened_at| now.duration_since(*opened_at) < crate::stream::ENTRANCE * 2);
+        self.opened_at.insert(section, now);
     }
 
     /// Recomputes the display rows from the store and splices only the rows that changed, so the
@@ -388,6 +575,9 @@ impl AgentView {
                 .permissions
                 .values()
                 .any(|request| request.agent_id == agent_id),
+            title: store
+                .agent(agent_id)
+                .map(|agent| store.display_title(agent)),
         })
     }
 
@@ -418,7 +608,7 @@ impl AgentView {
                 paging.is_some_and(|paging| paging.has_older),
                 paging.is_some_and(|paging| paging.loading_older),
                 agent
-                    .map(agent_title)
+                    .map(|agent| store.display_title(agent))
                     .or_else(|| subagent.map(subagent_title)),
                 agent
                     .map(|agent| agent_bucket(agent, has_permission))
@@ -441,22 +631,95 @@ impl AgentView {
                 loading: loading_older,
             });
         }
+        let chat = crate::PaseoSettings::get_global(cx).chat.clone();
+        let fold_by_default = chat.fold_finished_turns;
         let last_turn = turns.len().saturating_sub(1);
         let last_finished_turn = crate::timeline::latest_finished_turn(turns.len(), running);
         for (turn_index, turn) in turns.iter().enumerate() {
             let live_turn = running && turn_index == last_turn;
-            for index in turn.items.clone() {
-                let Some(item) = items.get(index) else {
-                    continue;
-                };
-                let streaming = live_turn && index + 1 == turn.items.end;
-                rows.push(Row::Item {
+            let item_row = |index: usize| {
+                let item = items.get(index)?;
+                Some(Row::Item {
                     index,
                     expanded: crate::stream::is_expandable(item)
                         && self.expanded.contains(&item.key),
                     item: item.clone(),
-                    streaming,
+                    streaming: live_turn && index + 1 == turn.items.end,
+                })
+            };
+            let fold = if live_turn {
+                None
+            } else {
+                folded_work(&items, turn.items.clone())
+            };
+            let duration_seconds = turn
+                .started_at
+                .zip(turn.ended_at)
+                .map(|(start, end)| (end - start).num_seconds())
+                .filter(|seconds| *seconds > 0);
+            let fold_key = fold
+                .as_ref()
+                .and_then(|work| items.get(work.start))
+                .map(|item| item.key);
+            let fold_open =
+                fold_key.is_some_and(|key| self.expanded_turns.contains(&key) == fold_by_default);
+            for segment in tool_runs(&items, turn.items.clone()) {
+                let start = match &segment {
+                    Segment::Item(index) => *index,
+                    Segment::ToolRun(run) => run.start,
+                };
+                let in_open_fold = fold
+                    .as_ref()
+                    .is_some_and(|work| work.contains(&start) && fold_open);
+                if let (Some(work), Some(key)) = (&fold, fold_key) {
+                    if start == work.start {
+                        rows.push(Row::TurnFold {
+                            key,
+                            duration_seconds,
+                            expanded: fold_open,
+                        });
+                    }
+                    if work.contains(&start) && !fold_open {
+                        continue;
+                    }
+                }
+                if !chat.show_thinking
+                    && !in_open_fold
+                    && matches!(&segment, Segment::Item(index) if items.get(*index).is_some_and(is_thinking))
+                {
+                    continue;
+                }
+                let run = match segment {
+                    Segment::Item(index) => {
+                        rows.extend(item_row(index));
+                        continue;
+                    }
+                    Segment::ToolRun(run) => run,
+                };
+                let Some(run_items) = items.get(run.clone()) else {
+                    continue;
+                };
+                let Some(key) = run_items.first().map(|item| item.key) else {
+                    continue;
+                };
+                let calls = run_items
+                    .iter()
+                    .filter_map(|item| match &item.content {
+                        StreamContent::Tool(call) => Some(call),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let expanded = self.expanded_groups.contains(&key);
+                rows.push(Row::ToolGroup {
+                    key,
+                    label: tool_group_label(calls.iter().copied()),
+                    running: calls.iter().any(|call| call.status == ToolStatus::Running),
+                    failed: calls.iter().any(|call| call.status == ToolStatus::Failed),
+                    expanded,
                 });
+                if expanded {
+                    rows.extend(run.filter_map(item_row));
+                }
             }
             if Some(turn_index) == last_finished_turn {
                 let files = items
@@ -475,20 +738,29 @@ impl AgentView {
                 }
             }
             if !live_turn {
-                let duration_seconds = turn
-                    .started_at
-                    .zip(turn.ended_at)
-                    .map(|(start, end)| (end - start).num_seconds())
-                    .filter(|seconds| *seconds > 0);
                 rows.push(Row::TurnFooter {
                     turn: turn_index,
-                    duration_seconds,
+                    first_item_key: items.get(turn.items.start).map(|item| item.key),
+                    // The fold line above already says how long the turn took.
+                    duration_seconds: duration_seconds.filter(|_| fold.is_none()),
                     finished_at: turn.ended_at,
                 });
             }
         }
         if running {
+            let step_spins = rows.last().is_some_and(|row| match row {
+                Row::ToolGroup { running, .. } => *running,
+                Row::Item {
+                    item, streaming, ..
+                } => match &item.content {
+                    StreamContent::Tool(call) => call.status == ToolStatus::Running,
+                    StreamContent::Reasoning { .. } => *streaming,
+                    _ => false,
+                },
+                _ => false,
+            });
             rows.push(Row::Working {
+                spinner: !step_spins,
                 since: turn_started.or_else(|| turns.last().and_then(|turn| turn.started_at)),
             });
         }
@@ -527,6 +799,13 @@ impl AgentView {
             .position(|(old, new)| old != new)
             .unwrap_or(self.rows.len().min(rows.len()));
         if first_changed < self.rows.len() || rows.len() != self.rows.len() {
+            let now = Instant::now();
+            self.row_appeared_at.retain(|_, appeared_at| {
+                now.duration_since(*appeared_at) < crate::stream::ENTRANCE * 2
+            });
+            for identity in arriving_rows(&self.rows, &rows) {
+                self.row_appeared_at.insert(identity, now);
+            }
             self.list_state
                 .splice(first_changed..self.rows.len(), rows.len() - first_changed);
             self.rows = rows;
@@ -577,6 +856,8 @@ impl AgentView {
         text: &str,
         cx: &mut Context<Self>,
     ) -> Entity<Markdown> {
+        let text = separate_images(text);
+        let text = text.as_ref();
         if let Some(markdown) = self.markdown.get(&(key, role)) {
             let source = markdown.read(cx).source();
             if source.as_ref() != text {
@@ -590,7 +871,13 @@ impl AgentView {
             }
             return markdown.clone();
         }
-        let markdown = cx.new(|cx| Markdown::new(text.to_owned().into(), None, None, cx));
+        // The editor's language registry highlights code blocks the way the editor does.
+        let languages = self
+            .workspace
+            .as_ref()
+            .and_then(WeakEntity::upgrade)
+            .map(|workspace| workspace.read(cx).app_state().languages.clone());
+        let markdown = cx.new(|cx| Markdown::new(text.to_owned().into(), languages, None, cx));
         self.markdown.insert((key, role), markdown.clone());
         self.unparsed_markdown.insert((key, role));
         self.load_images(text, cx);
@@ -692,9 +979,8 @@ impl AgentView {
         ) else {
             return;
         };
-        let current = self.title.to_string();
         workspace.update(cx, |workspace, cx| {
-            connection_picker::open_rename(workspace, agent_id, current, window, cx);
+            connection_picker::open_rename(workspace, agent_id, window, cx);
         });
     }
 
@@ -703,14 +989,34 @@ impl AgentView {
         cx.notify();
     }
 
+    /// Whether the composer holds text the user hasn't sent.
+    pub(crate) fn has_unsent_text(&self, cx: &App) -> bool {
+        !self.composer.read(cx).text(cx).trim().is_empty()
+    }
+
     pub(crate) fn toggle_answer(
         &mut self,
         request_id: &str,
         question: usize,
         label: String,
-        multi_select: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let request = self
+            .store
+            .read(cx)
+            .state
+            .permissions
+            .get(request_id)
+            .cloned();
+        let multi_select = request
+            .as_ref()
+            .and_then(|request| {
+                questions(request)
+                    .get(question)
+                    .map(|question| question.multi_select)
+            })
+            .unwrap_or(false);
         let answers = self
             .question_answers
             .entry((request_id.to_owned(), question))
@@ -722,6 +1028,25 @@ impl AgentView {
         } else {
             *answers = vec![label];
         }
+        let picked = !answers.is_empty();
+        // Like Paseo and Claude Code, a single-choice pick and an Other answer replace each
+        // other, and a pick moves on to the next question.
+        if !multi_select && picked {
+            let input = self
+                .question_inputs
+                .borrow()
+                .get(&(request_id.to_owned(), question))
+                .map(|(editor, _)| editor.clone());
+            if let Some(editor) = input {
+                editor.update(cx, |editor, cx| editor.set_text("", window, cx));
+            }
+            if let Some(request) = request.filter(Self::uses_question_steps) {
+                let count = questions(&request).len();
+                if self.current_question(request_id, count) == question && question + 1 < count {
+                    self.advance_question(&request, window, cx);
+                }
+            }
+        }
         cx.notify();
     }
 
@@ -732,8 +1057,30 @@ impl AgentView {
         action_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        let response = self.permission_response(request, allow, action_id, cx);
+        let request_id = request.request_id.clone();
+        self.store.update(cx, |store, cx| {
+            store.respond_permission(request_id, response, cx)
+        });
+    }
+
+    fn permission_response(
+        &self,
+        request: &PermissionRequest,
+        allow: bool,
+        action_id: Option<String>,
+        cx: &App,
+    ) -> PermissionResponse {
         let is_question = request.extra.get("kind").and_then(Value::as_str) == Some("question");
-        let response = if allow {
+        let questions = questions(request);
+        // Like Paseo, dismissing a form of optional free-text questions submits it empty, with
+        // no action, since the dismiss action would deny it.
+        let (allow, action_id) = if !allow && is_question && submit_empty_on_dismiss(&questions) {
+            (true, None)
+        } else {
+            (allow, action_id)
+        };
+        if allow {
             let updated_input = is_question.then(|| {
                 let mut input = request
                     .extra
@@ -741,15 +1088,11 @@ impl AgentView {
                     .cloned()
                     .filter(Value::is_object)
                     .unwrap_or_else(|| Value::Object(Default::default()));
-                let mut answers = serde_json::Map::new();
-                for (index, question) in questions(request).iter().enumerate() {
-                    if let Some(selected) = self
-                        .question_answers
-                        .get(&(request.request_id.clone(), index))
-                    {
-                        answers.insert(question.header.clone(), Value::String(selected.join(", ")));
-                    }
-                }
+                let answers = build_answers(
+                    &questions,
+                    |index| self.question_selected(&request.request_id, index),
+                    |index| self.question_text(&request.request_id, index, cx),
+                );
                 if let Some(object) = input.as_object_mut() {
                     object.insert("answers".into(), Value::Object(answers));
                 }
@@ -771,13 +1114,7 @@ impl AgentView {
                     .into(),
                 ),
             }
-        };
-        let request_id = request.request_id.clone();
-        self.question_answers
-            .retain(|(id, _), _| id != &request.request_id);
-        self.store.update(cx, |store, cx| {
-            store.respond_permission(request_id, response, cx)
-        });
+        }
     }
 
     fn primary_permission(&self, cx: &App) -> Option<PermissionRequest> {
@@ -789,8 +1126,190 @@ impl AgentView {
             .next()
     }
 
-    fn allow_first(&mut self, _: &crate::AllowPermission, _: &mut Window, cx: &mut Context<Self>) {
+    /// Answers stay until the daemon resolves the request, so a failed submit keeps what was
+    /// typed.
+    fn forget_resolved_questions(&mut self, cx: &App) {
+        let store = self.store.read(cx);
+        let pending = |request_id: &str| store.state.permissions.contains_key(request_id);
+        self.question_answers
+            .retain(|(request_id, _), _| pending(request_id));
+        self.question_index
+            .retain(|request_id, _| pending(request_id));
+        self.question_inputs
+            .borrow_mut()
+            .retain(|(request_id, _), _| pending(request_id));
+    }
+
+    fn question_selected(&self, request_id: &str, index: usize) -> Vec<String> {
+        self.question_answers
+            .get(&(request_id.to_owned(), index))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn question_text(&self, request_id: &str, index: usize, cx: &App) -> String {
+        self.question_inputs
+            .borrow()
+            .get(&(request_id.to_owned(), index))
+            .map(|(editor, _)| editor.read(cx).text(cx))
+            .unwrap_or_default()
+    }
+
+    fn current_question(&self, request_id: &str, count: usize) -> usize {
+        self.question_index
+            .get(request_id)
+            .copied()
+            .unwrap_or(0)
+            .min(count.saturating_sub(1))
+    }
+
+    fn question_is_answered(
+        &self,
+        request_id: &str,
+        index: usize,
+        question: &Question,
+        cx: &App,
+    ) -> bool {
+        is_answered(
+            question,
+            &self.question_selected(request_id, index),
+            &self.question_text(request_id, index, cx),
+        )
+    }
+
+    /// Whether the card walks through its questions with Next, which it does unless the daemon
+    /// supplied its own actions for the request.
+    fn uses_question_steps(request: &PermissionRequest) -> bool {
+        request.extra.get("kind").and_then(Value::as_str) == Some("question")
+            && request
+                .extra
+                .get("actions")
+                .and_then(Value::as_array)
+                .is_none_or(|actions| actions.is_empty())
+    }
+
+    /// Next on a question that isn't the last, Submit on the last once every question is
+    /// answered.
+    fn advance_question(
+        &mut self,
+        request: &PermissionRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let questions = questions(request);
+        let request_id = request.request_id.clone();
+        let index = self.current_question(&request_id, questions.len());
+        let Some(question) = questions.get(index) else {
+            self.respond(request, true, Some("accept".into()), cx);
+            return;
+        };
+        if index + 1 < questions.len() {
+            if self.question_is_answered(&request_id, index, question, cx) {
+                self.question_index.insert(request_id.clone(), index + 1);
+                if let Some(next) = questions
+                    .get(index + 1)
+                    .filter(|next| shows_text_input(next))
+                {
+                    self.question_input(
+                        &request_id,
+                        index + 1,
+                        &question_placeholder(next),
+                        window,
+                        cx,
+                    );
+                }
+                self.focus_question_input(&request_id, index + 1, window, cx);
+                cx.notify();
+            }
+            return;
+        }
+        let all_answered = questions
+            .iter()
+            .enumerate()
+            .all(|(index, question)| self.question_is_answered(&request_id, index, question, cx));
+        if all_answered {
+            self.respond(request, true, Some("accept".into()), cx);
+        }
+    }
+
+    fn focus_question_input(
+        &self,
+        request_id: &str,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = self
+            .question_inputs
+            .borrow()
+            .get(&(request_id.to_owned(), index))
+            .map(|(editor, _)| editor.clone());
+        match editor {
+            Some(editor) => window.focus(&editor.focus_handle(cx), cx),
+            None => window.focus(&self.focus_handle, cx),
+        }
+    }
+
+    fn question_input(
+        &self,
+        request_id: &str,
+        index: usize,
+        placeholder: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Editor> {
+        let key = (request_id.to_owned(), index);
+        if let Some((editor, _)) = self.question_inputs.borrow().get(&key) {
+            return editor.clone();
+        }
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text(placeholder, window, cx);
+            editor
+        });
+        // Next and Submit enable as the answer is typed, and typed text replaces a single-choice
+        // pick.
+        let subscription = cx.subscribe(&editor, {
+            let key = key.clone();
+            move |view, editor, event: &editor::EditorEvent, cx| {
+                if !matches!(event, editor::EditorEvent::BufferEdited) {
+                    return;
+                }
+                let multi_select = view
+                    .store
+                    .read(cx)
+                    .state
+                    .permissions
+                    .get(&key.0)
+                    .and_then(|request| {
+                        questions(request)
+                            .get(key.1)
+                            .map(|question| question.multi_select)
+                    })
+                    .unwrap_or(false);
+                if !multi_select && !editor.read(cx).text(cx).trim().is_empty() {
+                    view.question_answers.remove(&key);
+                }
+                cx.notify();
+            }
+        });
+        self.question_inputs
+            .borrow_mut()
+            .insert(key, (editor.clone(), subscription));
+        editor
+    }
+
+    fn allow_first(
+        &mut self,
+        _: &crate::AllowPermission,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(request) = self.primary_permission(cx) {
+            if Self::uses_question_steps(&request) {
+                self.advance_question(&request, window, cx);
+                return;
+            }
             let action = permission_actions(&request)
                 .into_iter()
                 .find(|action| action.allow);
@@ -844,20 +1363,13 @@ impl AgentView {
                 .iter()
                 .enumerate()
                 .map(|(index, subagent)| {
-                    let detail = if compact {
-                        subagent
-                            .tool_call_id
-                            .as_deref()
-                            .and_then(|tool_call_id| self.latest_subagent_action(tool_call_id))
-                            .or_else(|| subagent.subtitle.clone())
-                    } else {
-                        subagent.subtitle.clone()
-                    };
+                    // The provider's own summary (for Claude: type, model, effort and tokens),
+                    // shown as given; Paseo's schema asks clients not to parse it.
+                    let detail = subagent.subtitle.clone();
                     let timeline_id =
                         paseo_client::subagent_timeline_id(&parent_agent_id, &subagent.id);
                     let open = (parent_agent_id.clone(), subagent.id.clone());
-                    let updated = parse_timestamp(&subagent.updated_at)
-                        .map(|time| crate::timeline::format_relative(time, now));
+                    let run_time = subagent_run_time(subagent, now);
                     h_flex()
                         .id(("paseo-subagent-row", index))
                         .group("paseo-subagent-row")
@@ -893,8 +1405,8 @@ impl AgentView {
                                     )
                                 })),
                         )
-                        .children(updated.map(|updated| {
-                            Label::new(updated)
+                        .children(run_time.map(|run_time| {
+                            Label::new(run_time)
                                 .size(LabelSize::Small)
                                 .color(Color::Muted)
                         }))
@@ -925,31 +1437,38 @@ impl AgentView {
                 .collect::<Vec<_>>()
         });
         Some(
+            // A tab on the composer's top edge, narrower than it, so the two read as one piece.
             v_flex()
                 .id("paseo-subagent-track")
-                .w_full()
-                .rounded(rems_from_px(8_f32))
+                .mx_3()
+                .rounded_t(rems_from_px(crate::stream::CARD_RADIUS))
                 .border_1()
-                .border_color(colors.border_variant)
+                .border_b_0()
+                .border_color(colors.border)
+                .bg(colors.elevated_surface_background)
                 .overflow_hidden()
                 .child(
                     h_flex()
                         .id("paseo-subagent-track-header")
                         .px_3()
-                        .py_1p5()
-                        .gap_2()
+                        .py_1()
+                        .gap_1p5()
                         .cursor_pointer()
-                        .bg(colors.element_background)
                         .on_click(cx.listener(|view, _, _, cx| {
                             view.subagents_expanded = !view.subagents_expanded;
+                            view.mark_opened(OpenedSection::Subagents);
                             cx.notify();
                         }))
                         .child(
-                            Icon::new(IconName::ZedAgent)
+                            Icon::new(IconName::ListTree)
                                 .size(IconSize::Small)
                                 .color(Color::Muted),
                         )
-                        .child(Label::new(summary).size(LabelSize::Default))
+                        .child(
+                            Label::new(summary)
+                                .size(crate::stream::STEP_LABEL_SIZE)
+                                .color(Color::Muted),
+                        )
                         .child(div().flex_1())
                         .when(self.subagents_expanded && !finished.is_empty(), |this| {
                             this.child(
@@ -971,18 +1490,17 @@ impl AgentView {
                                 )),
                             )
                         })
-                        .child(
-                            Icon::new(if self.subagents_expanded {
-                                IconName::ChevronDown
-                            } else {
-                                IconName::ChevronUp
-                            })
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                        ),
+                        .child(crate::stream::rotating_chevron(
+                            "paseo-subagent-chevron",
+                            IconName::ChevronUp,
+                            IconSize::Small,
+                            self.subagents_expanded,
+                            0.5,
+                            cx,
+                        )),
                 )
                 .when_some(rows, |this, rows| {
-                    this.child(
+                    this.child(crate::stream::fade_in_since(
                         v_flex()
                             .id("paseo-subagent-rows")
                             .max_h(rems_from_px(240_f32))
@@ -990,26 +1508,13 @@ impl AgentView {
                             .track_scroll(&self.subagent_scroll)
                             .children(rows)
                             .vertical_scrollbar_for(&self.subagent_scroll, window, cx),
-                    )
+                        "paseo-subagent-rows-fade",
+                        self.opened_at.get(&OpenedSection::Subagents).copied(),
+                        px(0.),
+                    ))
                 })
                 .into_any_element(),
         )
-    }
-
-    /// The latest `[Tool] summary` line the subagent's tool call has logged in this thread.
-    fn latest_subagent_action(&self, tool_call_id: &str) -> Option<String> {
-        let call = self
-            .items
-            .iter()
-            .rev()
-            .find_map(|item| match &item.content {
-                crate::timeline::StreamContent::Tool(call) if call.call_id == tool_call_id => {
-                    Some(call)
-                }
-                _ => None,
-            })?;
-        let log = call.detail.get("log").and_then(Value::as_str)?;
-        Some(crate::timeline::parse_subagent_log(log).0.pop()?.describe())
     }
 
     fn render_subagent_header(&self, cx: &Context<Self>) -> Option<AnyElement> {
@@ -1048,100 +1553,51 @@ impl AgentView {
             return self.render_subagent_header(cx);
         }
         let agent = self.agent(cx)?;
-        let provider = self.store.read(cx).provider(agent_provider(agent));
-        let subtitle = header_subtitle(agent, provider);
-        let directory = agent
-            .directory
-            .as_ref()
-            .map(|directory| directory.display().to_string());
-        let focus = self.focus_handle.clone();
         let bucket = self.bucket.unwrap_or(AgentBucket::Done);
-        let this = cx.weak_entity();
+        let notice = if crate::store::agent_provider_unavailable(agent) {
+            Some((
+                Color::Warning,
+                format!(
+                    "The {} provider isn't available on this host, so this agent can't take messages.",
+                    agent_provider(agent)
+                ),
+            ))
+        } else if bucket == AgentBucket::Failed {
+            crate::store::agent_last_error(agent)
+                .map(|error| (Color::Error, format!("Failed: {error}")))
+        } else {
+            None
+        };
+        // The tab, the title bar and the checkout footer show what this header used to.
+        let (color, message) = notice?;
+        let colors = cx.theme().colors();
         Some(
-            h_flex()
-                .h(rems_from_px(36_f32))
+            v_flex()
                 .flex_none()
-                .px_3()
-                .gap_2()
-                .border_b_1()
-                .border_color(cx.theme().colors().border_variant)
-                .child(bucket_indicator(bucket))
                 .child(
                     h_flex()
-                        .min_w_0()
-                        .flex_1()
+                        .px_3()
+                        .py_1()
                         .gap_2()
+                        .items_start()
+                        .border_b_1()
+                        .border_color(colors.border_variant)
+                        .bg(color.color(cx).opacity(0.08))
                         .child(
-                            div()
-                                .id("paseo-agent-title")
-                                .min_w_0()
-                                .cursor_pointer()
-                                .tooltip({
-                                    let title = self.title.clone();
-                                    move |_window, cx| {
-                                        Tooltip::with_meta(
-                                            title.clone(),
-                                            None,
-                                            "Click to rename",
-                                            cx,
-                                        )
-                                    }
-                                })
-                                .on_click(cx.listener(|view, _, window, cx| {
-                                    view.rename(&RenameAgent, window, cx)
-                                }))
-                                .child(Label::new(self.title.clone()).truncate()),
+                            div().pt_0p5().child(
+                                Icon::new(IconName::Warning)
+                                    .size(IconSize::Small)
+                                    .color(color),
+                            ),
                         )
                         .child(
                             div()
-                                .id("paseo-agent-subtitle")
+                                .flex_1()
                                 .min_w_0()
-                                // The title gives way first so the project, model and mode stay visible.
-                                .flex_shrink_0()
-                                .max_w(relative(0.6))
-                                .when_some(directory, |this, directory| {
-                                    this.tooltip(Tooltip::text(directory))
-                                })
-                                .child(
-                                    Label::new(subtitle)
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted)
-                                        .truncate(),
-                                ),
+                                .line_clamp(3)
+                                .text_ellipsis()
+                                .child(Label::new(message).size(LabelSize::Small).color(color)),
                         ),
-                )
-                .child(
-                    PopoverMenu::new("paseo-agent-menu")
-                        .trigger(
-                            IconButton::new("paseo-agent-menu-button", IconName::Ellipsis)
-                                .icon_size(IconSize::Small)
-                                .icon_color(Color::Muted),
-                        )
-                        .anchor(gpui::Anchor::TopRight)
-                        .menu(move |window, cx| {
-                            let focus = focus.clone();
-                            let this = this.clone();
-                            Some(ContextMenu::build(window, cx, move |menu, _, _| {
-                                let reload = this.clone();
-                                menu.context(focus)
-                                    .action("Rename Agent", RenameAgent.boxed_clone())
-                                    .action("Copy Agent ID", CopyAgentId.boxed_clone())
-                                    .action("Fork Agent", crate::ForkAgent.boxed_clone())
-                                    .entry("Reload Agent", None, move |_, cx| {
-                                        if let Err(error) = reload.update(cx, |view, cx| {
-                                            if let Some(agent_id) = view.agent_id.clone() {
-                                                view.store.update(cx, |store, cx| {
-                                                    store.load_tail(agent_id, cx)
-                                                });
-                                            }
-                                        }) {
-                                            log::debug!("Paseo agent view released: {error}");
-                                        }
-                                    })
-                                    .separator()
-                                    .action("Archive Agent", ArchiveAgent.boxed_clone())
-                            }))
-                        }),
                 )
                 .into_any_element(),
         )
@@ -1200,9 +1656,8 @@ impl AgentView {
             .w_full()
             .p_3()
             .gap_2()
-            .rounded_lg()
-            .bg(colors.surface_background)
-            .border_1()
+            .rounded(rems_from_px(crate::stream::CARD_RADIUS))
+            .map(|card| crate::stream::raised_card(card, cx))
             .border_color(if primary {
                 cx.theme().status().warning.opacity(0.5)
             } else {
@@ -1237,7 +1692,7 @@ impl AgentView {
                 )
             });
         if kind == "question" {
-            card = card.child(self.render_questions(&request, cx));
+            card = card.child(self.render_questions(&request, window, cx));
         } else if let Some(preview) = crate::stream::permission_preview(&request, cx) {
             let scroll = self
                 .permission_scrolls
@@ -1263,6 +1718,22 @@ impl AgentView {
             );
         }
         let actions = permission_actions(&request);
+        let question_steps = Self::uses_question_steps(&request);
+        let step = question_steps.then(|| {
+            let questions = questions(&request);
+            let index = self.current_question(&request_id, questions.len());
+            let is_last = index + 1 >= questions.len();
+            let ready = if is_last {
+                questions.iter().enumerate().all(|(index, question)| {
+                    self.question_is_answered(&request_id, index, question, cx)
+                })
+            } else {
+                questions.get(index).is_some_and(|question| {
+                    self.question_is_answered(&request_id, index, question, cx)
+                })
+            };
+            (is_last, ready)
+        });
         let mut buttons = h_flex().gap_1p5().flex_wrap();
         let first_allow = actions.iter().position(|action| action.allow);
         let first_deny = actions.iter().position(|action| !action.allow);
@@ -1280,11 +1751,17 @@ impl AgentView {
                 None
             };
             let focus = self.focus_handle.clone();
+            let steps_here = step.filter(|_| allow);
+            let label = match steps_here {
+                Some((false, _)) => "Next".to_owned(),
+                _ => action.label,
+            };
             buttons = buttons.child(
                 ui::Button::new(
                     SharedString::from(format!("paseo-permission-{}-{}", request_id, action.id)),
-                    action.label,
+                    label,
                 )
+                .disabled(steps_here.is_some_and(|(_, ready)| !ready))
                 .label_size(LabelSize::Default)
                 .style(match action.variant.as_deref() {
                     Some("primary") => ButtonStyle::Filled,
@@ -1310,8 +1787,12 @@ impl AgentView {
                             .size(rems_from_px(10_f32)),
                     )
                 })
-                .on_click(cx.listener(move |view, _, _, cx| {
-                    view.respond(&request, allow, Some(action_id.clone()), cx);
+                .on_click(cx.listener(move |view, _, window, cx| {
+                    if steps_here.is_some() {
+                        view.advance_question(&request, window, cx);
+                    } else {
+                        view.respond(&request, allow, Some(action_id.clone()), cx);
+                    }
                 })),
             );
         }
@@ -1328,97 +1809,177 @@ impl AgentView {
         .into_any_element()
     }
 
-    fn render_questions(&self, request: &PermissionRequest, cx: &Context<Self>) -> AnyElement {
+    /// One question at a time, like Paseo: header tabs, the question's options, and a free-text
+    /// field when the question offers one.
+    fn render_questions(
+        &self,
+        request: &PermissionRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let request_id = request.request_id.clone();
+        let questions = questions(request);
+        let index = self.current_question(&request_id, questions.len());
+        let input = questions
+            .get(index)
+            .filter(|question| shows_text_input(question))
+            .map(|question| {
+                self.question_input(
+                    &request_id,
+                    index,
+                    &question_placeholder(question),
+                    window,
+                    cx,
+                )
+            });
         let colors = cx.theme().colors();
+        let tabs = (questions.len() > 1).then(|| {
+            h_flex()
+                .gap_1()
+                .flex_wrap()
+                .children(questions.iter().enumerate().map(|(tab_index, question)| {
+                    let answered = self.question_is_answered(&request_id, tab_index, question, cx);
+                    let is_current = tab_index == index;
+                    let label = if question.header.is_empty() {
+                        format!("Question {}", tab_index + 1)
+                    } else {
+                        question.header.clone()
+                    };
+                    let request_id = request_id.clone();
+                    h_flex()
+                        .id(SharedString::from(format!(
+                            "paseo-question-tab-{request_id}-{tab_index}"
+                        )))
+                        .gap_1()
+                        .px_2()
+                        .py_0p5()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(if is_current {
+                            colors.border_focused
+                        } else {
+                            colors.border_variant
+                        })
+                        .when(is_current, |this| this.bg(colors.element_selected))
+                        .hover(|style| style.bg(colors.element_hover))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |view, _, window, cx| {
+                            view.question_index.insert(request_id.clone(), tab_index);
+                            view.focus_question_input(&request_id, tab_index, window, cx);
+                            cx.notify();
+                        }))
+                        .when(answered, |this| {
+                            this.child(
+                                Icon::new(IconName::Check)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Accent),
+                            )
+                        })
+                        .child(
+                            Label::new(label)
+                                .size(LabelSize::Small)
+                                .color(if is_current {
+                                    Color::Default
+                                } else {
+                                    Color::Muted
+                                }),
+                        )
+                }))
+        });
+        let Some(question) = questions.into_iter().nth(index) else {
+            return v_flex().into_any_element();
+        };
+        let selected = self.question_selected(&request_id, index);
+        let multi_select = question.multi_select;
+        // A lone question has no tabs, so its header sits above it instead.
+        let show_header = tabs.is_none() && !question.header.is_empty();
         v_flex()
-            .gap_2()
+            .gap_1()
+            .children(tabs)
+            .when(show_header, |this| {
+                this.child(
+                    Label::new(question.header.clone())
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .child(Label::new(question.question.clone()).size(LabelSize::Default))
             .children(
-                questions(request)
+                question
+                    .options
                     .into_iter()
                     .enumerate()
-                    .map(|(index, question)| {
-                        let selected = self
-                            .question_answers
-                            .get(&(request.request_id.clone(), index))
-                            .cloned()
-                            .unwrap_or_default();
-                        v_flex()
-                            .gap_1()
-                            .when(!question.header.is_empty(), |this| {
-                                this.child(
-                                    Label::new(question.header.clone())
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                )
+                    .map(|(option_index, option)| {
+                        let is_selected = selected.contains(&option.0);
+                        let request_id = request_id.clone();
+                        let label = option.0.clone();
+                        h_flex()
+                            .id(SharedString::from(format!(
+                                "paseo-question-{request_id}-{index}-{option_index}"
+                            )))
+                            .gap_2()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(if is_selected {
+                                colors.border_focused
+                            } else {
+                                colors.border_variant
                             })
-                            .child(Label::new(question.question.clone()).size(LabelSize::Default))
-                            .children(question.options.into_iter().enumerate().map(
-                                |(option_index, option)| {
-                                    let is_selected = selected.contains(&option.0);
-                                    let request_id = request.request_id.clone();
-                                    let label = option.0.clone();
-                                    let multi_select = question.multi_select;
-                                    h_flex()
-                                        .id(SharedString::from(format!(
-                                            "paseo-question-{request_id}-{index}-{option_index}"
-                                        )))
-                                        .gap_2()
-                                        .px_2()
-                                        .py_1()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(if is_selected {
-                                            colors.border_focused
-                                        } else {
-                                            colors.border_variant
-                                        })
-                                        .when(is_selected, |this| this.bg(colors.element_selected))
-                                        .hover(|style| style.bg(colors.element_hover))
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(move |view, _, _, cx| {
-                                            view.toggle_answer(
-                                                &request_id,
-                                                index,
-                                                label.clone(),
-                                                multi_select,
-                                                cx,
-                                            )
-                                        }))
-                                        .child(
-                                            Icon::new(if is_selected {
-                                                IconName::Check
-                                            } else if multi_select {
-                                                IconName::SquarePlus
-                                            } else {
-                                                IconName::Circle
-                                            })
-                                            .size(IconSize::Small)
-                                            .color(
-                                                if is_selected {
-                                                    Color::Accent
-                                                } else {
-                                                    Color::Muted
-                                                },
-                                            ),
+                            .when(is_selected, |this| this.bg(colors.element_selected))
+                            .hover(|style| style.bg(colors.element_hover))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                view.toggle_answer(&request_id, index, label.clone(), window, cx)
+                            }))
+                            .child(
+                                Icon::new(if is_selected {
+                                    IconName::Check
+                                } else if multi_select {
+                                    IconName::SquarePlus
+                                } else {
+                                    IconName::Circle
+                                })
+                                .size(IconSize::Small)
+                                .color(if is_selected {
+                                    Color::Accent
+                                } else {
+                                    Color::Muted
+                                }),
+                            )
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .child(Label::new(option.0).size(LabelSize::Default))
+                                    .when_some(option.1, |this, description| {
+                                        this.child(
+                                            Label::new(description)
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
                                         )
-                                        .child(
-                                            v_flex()
-                                                .min_w_0()
-                                                .child(
-                                                    Label::new(option.0).size(LabelSize::Default),
-                                                )
-                                                .when_some(option.1, |this, description| {
-                                                    this.child(
-                                                        Label::new(description)
-                                                            .size(LabelSize::Small)
-                                                            .color(Color::Muted),
-                                                    )
-                                                }),
-                                        )
-                                },
-                            ))
+                                    }),
+                            )
                     }),
             )
+            .when_some(input, |this, input| {
+                let request = request.clone();
+                this.child(
+                    div()
+                        .px_2()
+                        .py_1p5()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border_variant)
+                        .bg(colors.editor_background)
+                        .on_action(cx.listener(move |view, _: &menu::Confirm, window, cx| {
+                            if Self::uses_question_steps(&request) {
+                                view.advance_question(&request, window, cx);
+                            }
+                        }))
+                        .child(input),
+                )
+            })
             .into_any_element()
     }
 
@@ -1434,90 +1995,6 @@ impl AgentView {
             .as_ref()
             .map(|directory| directory.to_string_lossy().into_owned());
         let status = self.store.read(cx).status;
-        let isolation = composer.can_create_worktree(cx).then(|| {
-            let new_worktree = composer.uses_new_worktree(cx);
-            let option = |id: &'static str, label: &'static str, icon: IconName, selected: bool| {
-                ui::Button::new(id, label)
-                    .style(if selected {
-                        ButtonStyle::Filled
-                    } else {
-                        ButtonStyle::Subtle
-                    })
-                    .toggle_state(selected)
-                    .label_size(LabelSize::Small)
-                    .start_icon(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
-            };
-            h_flex()
-                .gap_1()
-                .child(
-                    Label::new("Isolation")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .child(
-                    option(
-                        "paseo-isolation-local",
-                        "Local",
-                        IconName::Folder,
-                        !new_worktree,
-                    )
-                    .tooltip(Tooltip::text("Work directly in the project directory"))
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.composer
-                            .update(cx, |composer, cx| composer.set_new_worktree(false, cx));
-                    })),
-                )
-                .child(
-                    option(
-                        "paseo-isolation-worktree",
-                        "New worktree",
-                        IconName::GitBranch,
-                        new_worktree,
-                    )
-                    .tooltip(Tooltip::text(
-                        "Start the agent on a new branch in its own git worktree",
-                    ))
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.composer
-                            .update(cx, |composer, cx| composer.set_new_worktree(true, cx));
-                    })),
-                )
-                .when(new_worktree, |row| {
-                    let base = composer.worktree_base();
-                    let label = base
-                        .map(|base| base.label.clone())
-                        .unwrap_or_else(|| "Default branch".into());
-                    let tooltip = base
-                        .map(|base| format!("Branch off {}", base.ref_name))
-                        .unwrap_or_else(|| "Branch off the repository's default branch".into());
-                    row.child(
-                        Label::new("Base")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .ml_2(),
-                    )
-                    .child(
-                        ui::Button::new("paseo-worktree-base", label)
-                            .style(ButtonStyle::Outlined)
-                            .label_size(LabelSize::Small)
-                            .start_icon(
-                                Icon::new(IconName::GitBranch)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                            .end_icon(
-                                Icon::new(IconName::ChevronDown)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                            .disabled(directory.is_none())
-                            .tooltip(Tooltip::text(tooltip))
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.choose_worktree_base(window, cx);
-                            })),
-                    )
-                })
-        });
         v_flex()
             .size_full()
             .items_center()
@@ -1547,7 +2024,6 @@ impl AgentView {
                         view.choose_directory(window, cx);
                     })),
             )
-            .children(isolation)
             .child(
                 Label::new(if status == crate::store::ConnectionStatus::Connected {
                     "Describe the task. The first message starts the agent."
@@ -1557,6 +2033,172 @@ impl AgentView {
                 .size(LabelSize::Small)
                 .color(Color::Muted),
             )
+            .into_any_element()
+    }
+
+    /// An archived agent is one the store knows only as archived, not among the host's agents.
+    fn is_archived(&self, cx: &App) -> bool {
+        let Some(agent_id) = self.agent_id.as_deref() else {
+            return false;
+        };
+        let store = self.store.read(cx);
+        !store.state.agents.iter().any(|agent| agent.id == agent_id)
+            && store
+                .archived
+                .iter()
+                .flatten()
+                .any(|agent| agent.id == agent_id)
+    }
+
+    fn render_archived_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.is_archived(cx) {
+            return None;
+        }
+        Some(
+            h_flex()
+                .w_full()
+                .px_4()
+                .py_3()
+                .gap_2()
+                .rounded(rems_from_px(crate::stream::CARD_RADIUS))
+                .map(|notice| crate::stream::raised_card(notice, cx))
+                .child(
+                    Icon::new(IconName::Archive)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .child(Label::new("This agent is archived").color(Color::Muted)),
+                )
+                .child(
+                    ui::Button::new("paseo-unarchive-agent", "Unarchive")
+                        .style(ButtonStyle::Filled)
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            if let Some(agent_id) = view.agent_id.clone() {
+                                view.store
+                                    .update(cx, |store, cx| store.unarchive(&agent_id, cx));
+                            }
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// A tab under the composer naming where the agent works and its branch. Drafts pick there
+    /// between the project's checkout and a new worktree, and the new worktree's base.
+    fn render_checkout_footer(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let store = self.store.read(cx);
+        let (location, branch) = match self.agent_id.as_deref() {
+            Some(agent_id) => {
+                let agent = store.agent(agent_id)?;
+                let location = match agent_worktree_name(agent) {
+                    Some(name) => checkout_label(IconName::GitWorktree, name),
+                    None => checkout_label(IconName::Folder, "Local checkout".into()),
+                };
+                let branch =
+                    agent_branch(agent).map(|branch| checkout_label(IconName::GitBranch, branch));
+                (location, branch)
+            }
+            None => {
+                let composer = self.composer.read(cx);
+                let directory = composer.draft_directory.as_deref()?;
+                let current_branch = store
+                    .state
+                    .workspaces
+                    .values()
+                    .find(|workspace| workspace.directory == directory)
+                    .and_then(|workspace| workspace.current_branch.clone())
+                    .map(|branch| checkout_label(IconName::GitBranch, branch));
+                if !composer.can_create_worktree(cx) {
+                    (
+                        checkout_label(IconName::Folder, "Local checkout".into()),
+                        current_branch,
+                    )
+                } else if composer.uses_new_worktree(cx) {
+                    let base = composer.worktree_base();
+                    let label = base
+                        .map(|base| base.label.clone())
+                        .unwrap_or_else(|| "Default branch".into());
+                    let tooltip = base
+                        .map(|base| format!("Branch off {}", base.ref_name))
+                        .unwrap_or_else(|| "Branch off the repository's default branch".into());
+                    let base =
+                        checkout_picker("paseo-worktree-base", IconName::GitBranch, label.into())
+                            .tooltip(Tooltip::text(tooltip))
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.choose_worktree_base(window, cx);
+                            }))
+                            .into_any_element();
+                    (self.render_isolation_menu(true), Some(base))
+                } else {
+                    (self.render_isolation_menu(false), current_branch)
+                }
+            }
+        };
+        let colors = cx.theme().colors();
+        Some(
+            h_flex()
+                .id("paseo-checkout-footer")
+                .mx_3()
+                .px_2()
+                .py_0p5()
+                .gap_2()
+                .justify_between()
+                .rounded_b(rems_from_px(crate::stream::CARD_RADIUS))
+                .border_1()
+                .border_t_0()
+                .border_color(colors.border)
+                .bg(colors.elevated_surface_background)
+                .child(location)
+                .children(branch)
+                .into_any_element(),
+        )
+    }
+
+    fn render_isolation_menu(&self, new_worktree: bool) -> AnyElement {
+        let composer = self.composer.downgrade();
+        let (icon, label) = if new_worktree {
+            (IconName::GitWorktree, "New worktree")
+        } else {
+            (IconName::Folder, "Local checkout")
+        };
+        PopoverMenu::new("paseo-isolation-menu")
+            .trigger_with_tooltip(
+                checkout_picker("paseo-isolation", icon, label.into()),
+                Tooltip::text("Where the new agent works"),
+            )
+            .anchor(gpui::Anchor::BottomLeft)
+            .menu(move |window, cx| {
+                let composer = composer.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    let choose = |new_worktree: bool| {
+                        let composer = composer.clone();
+                        move |_: &mut Window, cx: &mut App| {
+                            if let Err(error) = composer.update(cx, |composer, cx| {
+                                composer.set_new_worktree(new_worktree, cx)
+                            }) {
+                                log::debug!("Paseo composer released: {error}");
+                            }
+                        }
+                    };
+                    menu.toggleable_entry(
+                        "Local checkout",
+                        !new_worktree,
+                        IconPosition::Start,
+                        None,
+                        choose(false),
+                    )
+                    .toggleable_entry(
+                        "New worktree",
+                        new_worktree,
+                        IconPosition::Start,
+                        None,
+                        choose(true),
+                    )
+                }))
+            })
             .into_any_element()
     }
 
@@ -1672,7 +2314,10 @@ pub(crate) fn permission_actions(request: &PermissionRequest) -> Vec<PermissionA
         PermissionActionChoice {
             id: "reject".into(),
             label: if kind == Some("question") {
-                "Dismiss".into()
+                questions(request)
+                    .into_iter()
+                    .find_map(|question| question.dismiss_label)
+                    .unwrap_or_else(|| "Dismiss".into())
             } else {
                 "Deny".into()
             },
@@ -1697,6 +2342,76 @@ pub(crate) struct Question {
     pub question: String,
     pub options: Vec<(String, Option<String>)>,
     pub multi_select: bool,
+    /// Offers a free-text answer. The daemon sets `allowOther` on Claude's questions, since
+    /// Claude expects the host to provide "Other"; Codex questions use `isOther`.
+    pub allow_other: bool,
+    pub allow_empty: bool,
+    pub placeholder: Option<String>,
+    pub dismiss_label: Option<String>,
+}
+
+/// Paseo's rules for the question form, so answers reach the agent in the same shape as from
+/// the Paseo app.
+fn question_placeholder(question: &Question) -> String {
+    question.placeholder.clone().unwrap_or_else(|| {
+        if question.options.is_empty() {
+            "Type your answer...".to_owned()
+        } else {
+            "Other...".to_owned()
+        }
+    })
+}
+
+pub(crate) fn shows_text_input(question: &Question) -> bool {
+    question.options.is_empty() || question.allow_other
+}
+
+pub(crate) fn is_answered(question: &Question, selected: &[String], text: &str) -> bool {
+    if !selected.is_empty() {
+        return true;
+    }
+    shows_text_input(question) && (!text.trim().is_empty() || question.allow_empty)
+}
+
+/// Answers keyed by header. Typed text replaces a single choice and joins multiple choices.
+pub(crate) fn build_answers(
+    questions: &[Question],
+    selected: impl Fn(usize) -> Vec<String>,
+    text: impl Fn(usize) -> String,
+) -> serde_json::Map<String, Value> {
+    let mut answers = serde_json::Map::new();
+    for (index, question) in questions.iter().enumerate() {
+        let mut chosen = selected(index);
+        if shows_text_input(question) {
+            let typed = text(index).trim().to_owned();
+            if !typed.is_empty() {
+                let answer = if question.multi_select {
+                    chosen.push(typed);
+                    chosen.join(", ")
+                } else {
+                    typed
+                };
+                answers.insert(question.header.clone(), Value::String(answer));
+                continue;
+            }
+            if question.allow_empty && question.options.is_empty() {
+                answers.insert(question.header.clone(), Value::String(String::new()));
+                continue;
+            }
+        }
+        if !chosen.is_empty() {
+            answers.insert(question.header.clone(), Value::String(chosen.join(", ")));
+        }
+    }
+    answers
+}
+
+/// Dismissing a form of only optional free-text questions submits it empty instead of denying.
+pub(crate) fn submit_empty_on_dismiss(questions: &[Question]) -> bool {
+    !questions.is_empty()
+        && questions
+            .iter()
+            .all(|question| question.allow_empty && question.options.is_empty())
 }
 
 pub(crate) fn questions(request: &PermissionRequest) -> Vec<Question> {
@@ -1734,6 +2449,18 @@ pub(crate) fn questions(request: &PermissionRequest) -> Vec<Question> {
                 })
                 .collect(),
             multi_select: question.get("multiSelect").and_then(Value::as_bool) == Some(true),
+            allow_other: ["allowOther", "isOther"]
+                .iter()
+                .any(|key| question.get(*key).and_then(Value::as_bool) == Some(true)),
+            allow_empty: question.get("allowEmpty").and_then(Value::as_bool) == Some(true),
+            placeholder: question
+                .get("placeholder")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            dismiss_label: question
+                .get("dismissLabel")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         })
         .collect()
 }
@@ -1742,12 +2469,12 @@ pub(crate) fn bucket_indicator(bucket: AgentBucket) -> AnyElement {
     match bucket {
         AgentBucket::Running => Icon::new(IconName::LoadCircle)
             .size(IconSize::XSmall)
-            .color(Color::Info)
+            .color(Color::Accent)
             .with_rotate_animation(2)
             .into_any_element(),
         AgentBucket::NeedsInput => Indicator::dot().color(Color::Warning).into_any_element(),
         AgentBucket::Failed => Indicator::dot().color(Color::Error).into_any_element(),
-        AgentBucket::Attention => Indicator::dot().color(Color::Success).into_any_element(),
+        AgentBucket::Attention => Indicator::dot().color(Color::Accent).into_any_element(),
         AgentBucket::Done => Indicator::dot().color(Color::Muted).into_any_element(),
     }
 }
@@ -1880,7 +2607,7 @@ impl Render for AgentView {
                     h_flex().w_full().justify_center().px_4().pb_3().child(
                         v_flex()
                             .w_full()
-                            .max_w(rems_from_px(CONTENT_MAX_WIDTH))
+                            .max_w(content_max_width(cx))
                             .gap_2()
                             .when_some(error, |this, error| {
                                 this.child(
@@ -1913,9 +2640,20 @@ impl Render for AgentView {
                                 )
                             })
                             .when(!self.is_subagent(), |this| {
-                                this.children(self.render_subagent_track(window, cx))
-                                    .children(self.render_permissions(window, cx))
-                                    .child(self.composer.clone())
+                                match self.render_archived_notice(cx) {
+                                    // Paseo swaps the composer for this notice until the agent is
+                                    // unarchived.
+                                    Some(notice) => this.child(notice),
+                                    None => {
+                                        this.children(self.render_permissions(window, cx)).child(
+                                            v_flex()
+                                                .w_full()
+                                                .children(self.render_subagent_track(window, cx))
+                                                .child(self.composer.clone())
+                                                .children(self.render_checkout_footer(cx)),
+                                        )
+                                    }
+                                }
                             }),
                     ),
                 ),
@@ -1923,8 +2661,90 @@ impl Render for AgentView {
     }
 }
 
+/// Drives a question card the way clicks and typing do, for tests.
+#[cfg(any(test, feature = "test-support"))]
+impl AgentTab {
+    pub fn test_select_answer(
+        tab: &Entity<Self>,
+        request_id: &str,
+        question: usize,
+        label: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let view = tab.read(cx).view.clone();
+        view.update(cx, |view, cx| {
+            view.toggle_answer(request_id, question, label.to_owned(), window, cx)
+        });
+    }
+
+    /// The picked options and the typed text of one question.
+    pub fn test_answer(
+        tab: &Entity<Self>,
+        request_id: &str,
+        question: usize,
+        cx: &App,
+    ) -> (Vec<String>, String) {
+        let view = tab.read(cx).view.read(cx);
+        (
+            view.question_selected(request_id, question),
+            view.question_text(request_id, question, cx),
+        )
+    }
+
+    pub fn test_current_question(tab: &Entity<Self>, cx: &App) -> Option<usize> {
+        let view = tab.read(cx).view.read(cx);
+        let request = view.primary_permission(cx)?;
+        Some(view.current_question(&request.request_id, questions(&request).len()))
+    }
+
+    pub fn test_type_answer(
+        tab: &Entity<Self>,
+        request_id: &str,
+        question: usize,
+        text: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let view = tab.read(cx).view.clone();
+        view.update(cx, |view, cx| {
+            let editor = view.question_input(request_id, question, "", window, cx);
+            editor.update(cx, |editor, cx| editor.set_text(text, window, cx));
+        });
+    }
+
+    /// Presses Next or Submit; returns the question shown afterwards.
+    pub fn test_advance_question(
+        tab: &Entity<Self>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<usize> {
+        let view = tab.read(cx).view.clone();
+        view.update(cx, |view, cx| {
+            let request = view.primary_permission(cx)?;
+            view.advance_question(&request, window, cx);
+            view.question_index.get(&request.request_id).copied()
+        })
+    }
+
+    pub fn test_view_id(tab: &Entity<Self>, cx: &App) -> gpui::EntityId {
+        tab.read(cx).view.entity_id()
+    }
+
+    /// What Submit would send for the agent's first pending request.
+    pub fn test_question_response(tab: &Entity<Self>, cx: &App) -> Option<PermissionResponse> {
+        let view = tab.read(cx).view.read(cx);
+        let request = view.primary_permission(cx)?;
+        Some(view.permission_response(&request, true, Some("accept".into()), cx))
+    }
+}
+
 pub struct AgentTab {
     view: Entity<AgentView>,
+    /// Set on a restored tab until its workspace has checked that the agent belongs there.
+    pub(crate) owner_check_pending: bool,
+    /// Set when the tab is removed to move or hide its chat, which isn't the user closing it.
+    pub(crate) leaving: bool,
     _subscription: Subscription,
 }
 
@@ -1937,13 +2757,51 @@ impl AgentTab {
         cx: &mut Context<Self>,
     ) -> Self {
         let view = cx.new(|cx| AgentView::new(agent_id, directory, workspace, window, cx));
+        Self::wrapping(view, cx)
+    }
+
+    /// A tab rebuilt from a saved workspace. Its workspace checks the agent once it is known,
+    /// because a saved tab may belong to another workspace's agent.
+    pub(crate) fn restored(
+        agent_id: String,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            owner_check_pending: true,
+            ..Self::new(Some(agent_id), None, Some(workspace), window, cx)
+        }
+    }
+
+    fn wrapping(view: Entity<AgentView>, cx: &mut Context<Self>) -> Self {
         let subscription = cx.subscribe(&view, |_, _, event: &AgentViewEvent, cx| match event {
             AgentViewEvent::TabChanged => cx.emit(ItemEvent::UpdateTab),
         });
         Self {
             view,
+            owner_check_pending: false,
+            leaving: false,
             _subscription: subscription,
         }
+    }
+
+    /// A new tab showing `view`, for moving a chat into `workspace`. A moved tab keeps a pending
+    /// ownership check, so its new workspace checks it once the agent is known.
+    pub(crate) fn for_view(
+        view: Entity<AgentView>,
+        workspace: WeakEntity<Workspace>,
+        owner_check_pending: bool,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        view.update(cx, |view, cx| {
+            view.workspace = Some(workspace);
+            cx.notify();
+        });
+        cx.new(|cx| Self {
+            owner_check_pending,
+            ..Self::wrapping(view, cx)
+        })
     }
 
     pub fn agent_id(&self, cx: &App) -> Option<String> {
@@ -1958,9 +2816,61 @@ impl AgentTab {
         &self.view
     }
 
+    /// Where the agent works, when its tab is in an editor window for other folders.
+    fn away_suffix(&self, cx: &App) -> Option<String> {
+        let view = self.view.read(cx);
+        let agent = view.agent(cx)?;
+        let directory = agent.directory.as_ref()?;
+        let workspace = view.workspace.as_ref()?.upgrade()?;
+        let at_home = workspace
+            .read(cx)
+            .root_paths(cx)
+            .iter()
+            .any(|root| directory.starts_with(root));
+        (!at_home).then(|| {
+            crate::store::agent_worktree_name(agent).unwrap_or_else(|| agent_project_name(agent))
+        })
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn composer_text(&self, cx: &App) -> String {
         self.view.read(cx).composer.read(cx).text(cx)
+    }
+
+    /// Marks a draft as sent, for tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_begin_creating(tab: &Entity<Self>, cx: &mut App) {
+        let composer = tab.read(cx).view.read(cx).composer.clone();
+        composer.update(cx, |composer, _| composer.begin_creating_for_test());
+    }
+
+    /// Finishes a sent draft as if the daemon created `agent_id`, for tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_finish_creating(tab: &Entity<Self>, agent_id: &str, cx: &mut App) {
+        let composer = tab.read(cx).view.read(cx).composer.clone();
+        composer.update(cx, |composer, cx| {
+            composer.finish_creating_for_test(agent_id.to_owned(), cx)
+        });
+    }
+
+    /// Sends the composer's text, for tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_submit(tab: &Entity<Self>, cx: &mut App) {
+        let composer = tab.read(cx).view.read(cx).composer.clone();
+        composer.update(cx, |composer, cx| composer.submit(false, cx));
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_type_in_composer(
+        tab: &Entity<Self>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let composer = tab.read(cx).view.read(cx).composer.clone();
+        composer.update(cx, |composer, cx| {
+            composer.set_text_for_test(text, window, cx)
+        });
     }
 }
 
@@ -1985,9 +2895,31 @@ impl Item for AgentTab {
         f(*event)
     }
 
+    fn on_removed(&self, cx: &mut Context<Self>) {
+        if self.leaving {
+            return;
+        }
+        let view = self.view.read(cx);
+        let workspace_id = view
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.entity_id());
+        if let (Some(workspace_id), Some(agent_id)) = (workspace_id, view.agent_id.clone()) {
+            crate::workspace_tabs::tab_closed(workspace_id, agent_id, cx);
+        }
+    }
+
     fn tab_content(&self, params: TabContentParams, _window: &Window, cx: &App) -> AnyElement {
         let view = self.view.read(cx);
-        h_flex()
+        let alert = view.bucket.and_then(AgentAlert::for_bucket);
+        let underline = div()
+            .absolute()
+            .left_0()
+            .right_0()
+            .bottom(px(-3.))
+            .h(px(2.))
+            .rounded_sm();
+        let content = h_flex()
             .gap_1p5()
             .child(match view.bucket {
                 Some(bucket) => bucket_indicator(bucket),
@@ -2001,6 +2933,19 @@ impl Item for AgentTab {
                     .single_line()
                     .color(params.text_color()),
             )
+            .when_some(self.away_suffix(cx), |this, suffix| {
+                this.child(Label::new(suffix).single_line().color(Color::Muted))
+            });
+        div()
+            .relative()
+            .child(content)
+            .child(pulse_in_alert_color(
+                underline,
+                alert,
+                ("paseo-tab-alert", self.view.entity_id()),
+                |underline, color| underline.bg(color),
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -2014,7 +2959,7 @@ impl Item for AgentTab {
         Some(
             format!(
                 "{} · {}",
-                agent_title(agent),
+                view.store.read(cx).display_title(agent),
                 agent
                     .directory
                     .as_ref()
@@ -2054,9 +2999,7 @@ impl SerializableItem for AgentTab {
             let agent_id = db
                 .get_agent_tab(item_id, workspace_id)?
                 .ok_or_else(|| anyhow::anyhow!("No Paseo agent tab to restore"))?;
-            cx.update(|window, cx| {
-                cx.new(|cx| AgentTab::new(Some(agent_id), None, Some(workspace), window, cx))
-            })
+            cx.update(|window, cx| cx.new(|cx| AgentTab::restored(agent_id, workspace, window, cx)))
         })
     }
 
@@ -2131,30 +3074,148 @@ mod persistence {
     }
 }
 
+/// Ends the paragraph after each markdown image that text follows. The markdown renderer lays out
+/// a paragraph's first line after an image against the wrong width, so it runs past the column.
+/// Growing text keeps its earlier output as a prefix, so streamed chunks still append.
+fn separate_images(text: &str) -> std::borrow::Cow<'_, str> {
+    let images = markdown_images(text);
+    if images.is_empty() {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut separated = String::with_capacity(text.len() + 8);
+    let mut copied = 0;
+    for image in images {
+        separated.push_str(&text[copied..image.end]);
+        copied = image.end;
+        let rest = &text[image.end..];
+        let newlines = rest.bytes().take_while(|byte| *byte == b'\n').count();
+        if newlines < 2 && rest.len() > newlines {
+            separated.push_str(&"\n".repeat(2 - newlines));
+        }
+    }
+    separated.push_str(&text[copied..]);
+    std::borrow::Cow::Owned(separated)
+}
+
 /// The link targets of markdown images (`![alt](target)`) in `text`.
 fn image_destinations(text: &str) -> Vec<&str> {
-    let mut destinations = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find("![") {
-        rest = &rest[start + 2..];
-        let Some(close) = rest.find("](") else {
-            break;
-        };
-        rest = &rest[close + 2..];
-        let Some(end) = rest.find(')') else {
-            break;
-        };
-        let target = rest[..end].trim();
-        let target = match target.strip_prefix('<') {
-            Some(bracketed) => bracketed.split('>').next().unwrap_or(""),
-            None => target.split_whitespace().next().unwrap_or(""),
-        };
-        if !target.is_empty() {
-            destinations.push(target);
+    markdown_images(text)
+        .into_iter()
+        .map(|image| &text[image.destination])
+        .filter(|destination| !destination.is_empty())
+        .collect()
+}
+
+/// A markdown image outside code: where its destination is and where the image ends.
+struct MarkdownImage {
+    destination: std::ops::Range<usize>,
+    end: usize,
+}
+
+/// The images in `text`, skipping code blocks and code spans. A destination may be wrapped in
+/// `<…>` or hold balanced parentheses, as in `/tmp/Screenshot (1).png`.
+fn markdown_images(text: &str) -> Vec<MarkdownImage> {
+    let code = code_ranges(text);
+    let mut images = Vec::new();
+    let mut search_from = 0;
+    while let Some(found) = text.get(search_from..).and_then(|rest| rest.find("![")) {
+        let start = search_from + found;
+        if let Some(range) = code.iter().find(|range| range.contains(&start)) {
+            search_from = range.end;
+            continue;
         }
-        rest = &rest[end + 1..];
+        let Some(image) = image_at(text, start) else {
+            search_from = start + 2;
+            continue;
+        };
+        search_from = image.end;
+        images.push(image);
     }
-    destinations
+    images
+}
+
+fn image_at(text: &str, start: usize) -> Option<MarkdownImage> {
+    let open = start + text.get(start..)?.find("](")? + 2;
+    let after = text.get(open..)?;
+    let leading = after.len() - after.trim_start().len();
+    let (destination, close) = if let Some(bracketed) = after[leading..].strip_prefix('<') {
+        let end = open + leading + 1 + bracketed.find('>')?;
+        let close = end + text.get(end..)?.find(')')?;
+        (open + leading + 1..end, close)
+    } else {
+        let mut depth = 0usize;
+        let close = open
+            + after
+                .char_indices()
+                .find_map(|(offset, character)| match character {
+                    '(' => {
+                        depth += 1;
+                        None
+                    }
+                    ')' if depth == 0 => Some(offset),
+                    ')' => {
+                        depth -= 1;
+                        None
+                    }
+                    _ => None,
+                })?;
+        let inside = &text[open..close];
+        let target_start = open + leading;
+        let target_length = inside
+            .trim_start()
+            .split_whitespace()
+            .next()
+            .map_or(0, str::len);
+        (target_start..target_start + target_length, close)
+    };
+    Some(MarkdownImage {
+        destination,
+        end: close + 1,
+    })
+}
+
+/// Byte ranges of fenced code blocks and code spans. An unclosed fence runs to the end, so text
+/// streaming into it stays code.
+fn code_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut fence_start = None;
+    let mut line_start = 0;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let is_fence = trimmed.starts_with("```") || trimmed.starts_with("~~~");
+        match (is_fence, fence_start) {
+            (true, None) => fence_start = Some(line_start),
+            (true, Some(start)) => {
+                ranges.push(start..line_start + line.len());
+                fence_start = None;
+            }
+            (false, None) => {
+                let mut offset = 0;
+                while let Some(open) = line[offset..].find('`') {
+                    let open = offset + open;
+                    let ticks = line[open..]
+                        .bytes()
+                        .take_while(|byte| *byte == b'`')
+                        .count();
+                    let marker = &line[open..open + ticks];
+                    match line[open + ticks..].find(marker) {
+                        Some(close) => {
+                            let close = open + ticks + close + ticks;
+                            ranges.push(line_start + open..line_start + close);
+                            offset = close;
+                        }
+                        None => break,
+                    }
+                }
+            }
+            (false, Some(_)) => {}
+        }
+        line_start += line.len();
+    }
+    if let Some(start) = fence_start {
+        ranges.push(start..text.len());
+    }
+    ranges
 }
 
 /// The absolute path on the daemon's host for an image link, resolving relative links against
@@ -2193,6 +3254,94 @@ fn track_subagents<'a>(
         .collect()
 }
 
+fn checkout_label(icon: IconName, text: String) -> AnyElement {
+    h_flex()
+        .min_w_0()
+        .gap_1()
+        .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+        .child(
+            Label::new(text)
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .truncate(),
+        )
+        .into_any_element()
+}
+
+fn checkout_picker(id: &'static str, icon: IconName, label: SharedString) -> ui::Button {
+    ui::Button::new(id, label)
+        .style(ButtonStyle::Subtle)
+        .label_size(LabelSize::Small)
+        .color(Color::Muted)
+        .start_icon(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+        .end_icon(
+            Icon::new(IconName::ChevronDown)
+                .size(IconSize::XSmall)
+                .color(Color::Muted),
+        )
+}
+
+/// The agent's ⋯ menu for the right of the tab bar, when `item` is an agent's tab.
+pub fn agent_tab_menu(item: &dyn workspace::ItemHandle, cx: &App) -> Option<AnyElement> {
+    let tab = item.to_any_view().downcast::<AgentTab>().ok()?;
+    let view = tab.read(cx).view().clone();
+    let agent_view = view.read(cx);
+    if agent_view.is_subagent() || agent_view.agent_id.is_none() {
+        return None;
+    }
+    let focus = agent_view.focus_handle.clone();
+    let this = view.downgrade();
+    Some(
+        PopoverMenu::new("paseo-agent-menu")
+            .trigger(
+                IconButton::new("paseo-agent-menu-button", IconName::Ellipsis)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted),
+            )
+            .anchor(gpui::Anchor::TopRight)
+            .menu(move |window, cx| {
+                let focus = focus.clone();
+                let this = this.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    let reload = this.clone();
+                    menu.context(focus)
+                        .action("Rename Agent", RenameAgent.boxed_clone())
+                        .action("Copy Agent ID", CopyAgentId.boxed_clone())
+                        .action("Fork Agent", crate::ForkAgent.boxed_clone())
+                        .entry("Reload Agent", None, move |_, cx| {
+                            if let Err(error) = reload.update(cx, |view, cx| {
+                                if let Some(agent_id) = view.agent_id.clone() {
+                                    view.store
+                                        .update(cx, |store, cx| store.load_tail(agent_id, cx));
+                                }
+                            }) {
+                                log::debug!("Paseo agent view released: {error}");
+                            }
+                        })
+                        .separator()
+                        .action("Archive Agent", ArchiveAgent.boxed_clone())
+                }))
+            })
+            .into_any_element(),
+    )
+}
+
+/// How long a subagent has run: until now while it runs, until its last update once it stopped.
+fn subagent_run_time(
+    subagent: &paseo_client::ProviderSubagent,
+    now: chrono::DateTime<Utc>,
+) -> Option<String> {
+    let started = parse_timestamp(&subagent.created_at)?;
+    let ended = if subagent.status == "running" {
+        now
+    } else {
+        parse_timestamp(&subagent.updated_at)?
+    };
+    Some(crate::timeline::format_duration(
+        (ended - started).num_seconds(),
+    ))
+}
+
 /// Paseo's track pill text: `3 subagents · 1 working · 1 failed`.
 fn subagent_track_summary(subagents: &[&paseo_client::ProviderSubagent]) -> String {
     let count = |status: &str| {
@@ -2211,55 +3360,6 @@ fn subagent_track_summary(subagents: &[&paseo_client::ProviderSubagent]) -> Stri
     std::iter::once(total)
         .chain((working > 0).then(|| format!("{working} working")))
         .chain((failed > 0).then(|| format!("{failed} failed")))
-        .collect::<Vec<_>>()
-        .join(" · ")
-}
-
-/// The header's `project › worktree · branch · provider · model · mode` line, with labels from the
-/// provider snapshot where it has them.
-fn header_subtitle(
-    agent: &paseo_client::AgentSummary,
-    provider: Option<&paseo_client::Provider>,
-) -> String {
-    let project = match crate::store::agent_worktree_name(agent) {
-        Some(worktree) => format!("{} › {worktree}", agent_project_name(agent)),
-        None => agent_project_name(agent),
-    };
-    let text = |key: &str| {
-        agent
-            .extra
-            .get(key)
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-    };
-    let provider_label = provider
-        .and_then(|provider| provider.label.clone())
-        .filter(|label| !label.is_empty())
-        .or_else(|| text("provider").map(str::to_owned));
-    let model = text("model").or_else(|| {
-        agent
-            .extra
-            .get("runtimeInfo")
-            .and_then(|runtime| runtime.get("model"))
-            .and_then(Value::as_str)
-    });
-    let model_label = model.map(|model| {
-        provider
-            .map(crate::composer::provider_models)
-            .and_then(|models| models.into_iter().find(|choice| choice.id == model))
-            .map_or_else(|| model.to_owned(), |choice| choice.label)
-    });
-    let mode_label = text("currentModeId").map(|mode| {
-        crate::composer::choices(agent.extra.get("availableModes"))
-            .into_iter()
-            .find(|choice| choice.id == mode)
-            .map_or_else(|| mode.to_owned(), |choice| choice.label)
-    });
-    std::iter::once(project)
-        .chain(agent_branch(agent))
-        .chain(provider_label)
-        .chain(model_label)
-        .chain(mode_label)
         .collect::<Vec<_>>()
         .join(" · ")
 }
@@ -2288,14 +3388,14 @@ impl ThreadLinks {
         self.workspace.as_ref().and_then(WeakEntity::upgrade)
     }
 
-    /// Code spans become links only when they name a file in the open project, because this
-    /// runs on every render of every span.
     /// Code spans become links when they name an existing file or project folder, as a `file://`
-    /// URL with the line, so a click opens the file the span resolved to.
+    /// URL with the line, so a click opens the file the span resolved to, or when they name a
+    /// code symbol, resolved only on click. This runs on every render of every span.
     fn code_span_link(&self, text: &str, cx: &App) -> Option<SharedString> {
         let text = text.trim();
         if !is_path_like(text) {
-            return None;
+            // Looked up only when clicked, since resolving asks the language servers.
+            return is_symbol_like(text).then(|| format!("{SYMBOL_LINK_SCHEME}{text}").into());
         }
         if let Some(cached) = self.code_spans.borrow().get(text) {
             return cached.clone();
@@ -2323,11 +3423,15 @@ impl ThreadLinks {
             {
                 target.path
             }
-            // Agents often name a file without its folders, like `producer.rs:83`.
-            None if !text.contains(['/', '\\']) => {
-                unique_project_file(project, target.path.file_name()?.to_str()?, cx)?
+            // Agents often name a file without its folders, like `producer.rs:83`, or relative
+            // to a folder inside the project, like `phantom-bin/src/engine/book.rs`.
+            None => {
+                let relative = util::paths::PathWithPosition::parse_str(text).path;
+                if relative.is_absolute() {
+                    return None;
+                }
+                unique_project_file(project, relative.to_str()?, cx)?
             }
-            None => return None,
         };
         let mut url = url::Url::from_file_path(&path).ok()?;
         if let Some(row) = target.row {
@@ -2336,7 +3440,94 @@ impl ThreadLinks {
         Some(url.to_string().into())
     }
 
+    fn find_text(&self, name: &str, window: &mut Window, cx: &mut App) {
+        let Some(workspace) = self.workspace() else {
+            return;
+        };
+        let query = symbol_segments(name)
+            .last()
+            .copied()
+            .unwrap_or(name)
+            .to_owned();
+        workspace.update(cx, |workspace, cx| {
+            search::text_finder::TextFinder::open_with_query(workspace, query, window, cx).detach();
+        });
+    }
+
+    /// Opens the definition of the symbol a code span names, asking the project's language
+    /// servers the way Zed's Go to Symbol in Project does: one match opens, several open that
+    /// picker with the name typed, none searches the project for the name.
+    fn open_symbol(&self, name: &str, window: &mut Window, cx: &mut App) {
+        let Some(workspace) = self.workspace() else {
+            return;
+        };
+        let query = symbol_segments(name)
+            .last()
+            .copied()
+            .unwrap_or(name)
+            .to_owned();
+        let task = workspace.update(cx, |workspace, cx| {
+            workspace
+                .project()
+                .update(cx, |project, cx| project.symbols(&query, cx))
+        });
+        let name = name.to_owned();
+        let notify = workspace.downgrade();
+        window
+            .spawn(cx, async move |cx| {
+                let symbols = task.await?;
+                workspace.update_in(cx, |workspace, window, cx| {
+                    let keys = symbols
+                        .iter()
+                        .map(|symbol| (symbol.name.as_str(), symbol.container_name.as_deref()))
+                        .collect::<Vec<_>>();
+                    match pick_symbol(&name, &keys) {
+                        SymbolPick::One(index) => {
+                            open_symbol_definition(workspace, symbols[index].clone(), window, cx)
+                        }
+                        SymbolPick::Several => {
+                            window
+                                .dispatch_action(workspace::ToggleProjectSymbols.boxed_clone(), cx);
+                            let workspace = cx.weak_entity();
+                            window.defer(cx, move |window, cx| {
+                                let picker = workspace.upgrade().and_then(|workspace| {
+                                    workspace.read(cx).active_modal::<picker::Picker<
+                                        project_symbols::ProjectSymbolsDelegate,
+                                    >>(cx)
+                                });
+                                if let Some(picker) = picker {
+                                    picker.update(cx, |picker, cx| {
+                                        picker.set_query(&query, window, cx)
+                                    });
+                                }
+                            });
+                        }
+                        SymbolPick::None => window.dispatch_action(
+                            workspace::pane::DeploySearch {
+                                query: Some(query.clone()),
+                                case_sensitive: Some(true),
+                                whole_word: Some(true),
+                                ..Default::default()
+                            }
+                            .boxed_clone(),
+                            cx,
+                        ),
+                    }
+                })
+            })
+            .detach_and_notify_err(notify, window, cx);
+    }
+
     fn open(&self, url: &str, window: &mut Window, cx: &mut App) {
+        if let Some(name) = url.strip_prefix(SYMBOL_LINK_SCHEME) {
+            // Ctrl-click (Cmd on macOS) finds the name's uses in Zed's Text Finder.
+            if window.modifiers().secondary() {
+                self.find_text(name, window, cx);
+            } else {
+                self.open_symbol(name, window, cx);
+            }
+            return;
+        }
         let Some(target) = link_target(url, self.directory(cx).as_deref()) else {
             // Web, mail and other scheme links go to the system; a scheme is at least two
             // characters, so a Windows drive letter is not one.
@@ -2453,12 +3644,22 @@ impl ThreadLinks {
 }
 
 /// The project's only file with this name, or `None` when there is none or more than one.
-fn unique_project_file(project: &project::Project, file_name: &str, cx: &App) -> Option<PathBuf> {
+fn unique_project_file(project: &project::Project, relative: &str, cx: &App) -> Option<PathBuf> {
+    let relative = relative.trim_start_matches("./").replace('\\', "/");
+    let file_name = relative.rsplit('/').next()?.to_owned();
+    // Whole folder names only: `c/mod_a/lib.rs` must not match `src/mod_a/lib.rs`.
+    let ends_with_relative = |path: &str| {
+        path == relative
+            || path
+                .strip_suffix(relative.as_str())
+                .is_some_and(|parent| parent.ends_with('/'))
+    };
     let mut matches = project.visible_worktrees(cx).flat_map(|worktree| {
         let worktree = worktree.read(cx);
         worktree
             .files(false, 0)
-            .filter(|entry| entry.path.file_name() == Some(file_name))
+            .filter(|entry| entry.path.file_name() == Some(file_name.as_str()))
+            .filter(|entry| ends_with_relative(entry.path.as_unix_str()))
             .take(2)
             .map(|entry| worktree.absolutize(&entry.path))
             .collect::<Vec<_>>()
@@ -2514,6 +3715,123 @@ fn fragment_line(fragment: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
+/// The link a symbol code span carries until it is clicked.
+pub(crate) const SYMBOL_LINK_SCHEME: &str = "zaseo-symbol:";
+
+/// A name's path segments, `store::bucket()` as `["store", "bucket"]`.
+fn symbol_segments(name: &str) -> Vec<&str> {
+    name.strip_suffix("()")
+        .unwrap_or(name)
+        .split("::")
+        .collect()
+}
+
+/// Whether a code span reads as a code name: a path like `store::bucket`, a `snake_case` or
+/// `SCREAMING_CASE` name, or a `CamelCase` one. Single words stay plain, since `main` or `true`
+/// are more often prose than a symbol to jump to.
+fn is_symbol_like(text: &str) -> bool {
+    let segments = symbol_segments(text);
+    let valid_segment = |segment: &&str| {
+        !segment.is_empty()
+            && segment
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+            && !segment.starts_with(|character: char| character.is_ascii_digit())
+    };
+    if text.len() < 3 || !segments.iter().all(valid_segment) {
+        return false;
+    }
+    let Some(last) = segments.last() else {
+        return false;
+    };
+    let inner_underscore = last.trim_matches('_').contains('_');
+    let camel = last
+        .chars()
+        .zip(last.chars().skip(1))
+        .any(|(first, second)| first.is_ascii_lowercase() && second.is_ascii_uppercase());
+    segments.len() > 1 || inner_underscore || camel
+}
+
+#[derive(Debug, PartialEq)]
+enum SymbolPick {
+    One(usize),
+    Several,
+    None,
+}
+
+/// Which of the symbols (name, container) a clicked name means: those with its last segment as
+/// their name, narrowed by the segment before it when that matches a container.
+fn pick_symbol(name: &str, symbols: &[(&str, Option<&str>)]) -> SymbolPick {
+    let segments = symbol_segments(name);
+    let Some(last) = segments.last() else {
+        return SymbolPick::None;
+    };
+    let named = (0..symbols.len())
+        .filter(|index| symbols[*index].0 == *last)
+        .collect::<Vec<_>>();
+    let qualified = segments
+        .len()
+        .checked_sub(2)
+        .and_then(|index| segments.get(index))
+        .map(|qualifier| {
+            named
+                .iter()
+                .copied()
+                .filter(|index| {
+                    symbols[*index]
+                        .1
+                        .is_some_and(|container| container.contains(qualifier))
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|qualified| !qualified.is_empty());
+    match qualified.as_deref().unwrap_or(&named) {
+        [] => SymbolPick::None,
+        [only] => SymbolPick::One(*only),
+        _ => SymbolPick::Several,
+    }
+}
+
+/// Opens a symbol's file at its start, as Zed's Go to Symbol in Project does.
+fn open_symbol_definition(
+    workspace: &mut Workspace,
+    symbol: project::Symbol,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let buffer = workspace.project().update(cx, |project, cx| {
+        project.open_buffer_for_symbol(&symbol, cx)
+    });
+    cx.spawn_in(window, async move |workspace, cx| {
+        let buffer = buffer.await?;
+        workspace.update_in(cx, |workspace, window, cx| {
+            let position = buffer
+                .read(cx)
+                .clip_point_utf16(symbol.range.start, text::Bias::Left);
+            let editor = workspace
+                .open_project_item::<Editor>(None, buffer, true, true, true, true, window, cx);
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let Some(buffer_snapshot) = snapshot.as_singleton() else {
+                    return;
+                };
+                let Some(anchor) =
+                    snapshot.anchor_in_buffer(buffer_snapshot.anchor_before(position))
+                else {
+                    return;
+                };
+                editor.change_selections(
+                    editor::SelectionEffects::scroll(editor::scroll::Autoscroll::center()),
+                    window,
+                    cx,
+                    |selections| selections.select_ranges([anchor..anchor]),
+                );
+            });
+        })
+    })
+    .detach_and_notify_err(cx.weak_entity(), window, cx);
+}
+
 fn is_path_like(text: &str) -> bool {
     if text.len() < 3
         || text.contains("://")
@@ -2535,6 +3853,185 @@ fn is_path_like(text: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn only_rows_arriving_during_the_conversation_ease_in() {
+        let group = |key| Row::ToolGroup {
+            key,
+            label: String::new(),
+            running: false,
+            failed: false,
+            expanded: false,
+        };
+        let footer = |turn: usize| Row::TurnFooter {
+            turn,
+            first_item_key: Some(1000 + turn as u64),
+            duration_seconds: None,
+            finished_at: None,
+        };
+        let working = Row::Working {
+            since: None,
+            spinner: true,
+        };
+
+        let opened = vec![group(1), footer(0)];
+        assert!(arriving_rows(&[], &opened).is_empty());
+
+        let running = vec![group(1), footer(0), group(2), working];
+        assert_eq!(
+            arriving_rows(&opened, &running),
+            vec![RowIdentity::ToolGroup(2), RowIdentity::Working]
+        );
+
+        let ticking = vec![
+            group(1),
+            footer(0),
+            group(2),
+            Row::Working {
+                since: Some(Utc::now()),
+                spinner: false,
+            },
+        ];
+        assert!(arriving_rows(&running, &ticking).is_empty());
+
+        let older_loaded = vec![group(7), group(8), group(1), footer(0)];
+        assert!(arriving_rows(&opened, &older_loaded).is_empty());
+
+        // An older turn loading above shifts every turn's index, not its first item.
+        let older_turn = Row::TurnFooter {
+            turn: 0,
+            first_item_key: Some(1),
+            duration_seconds: None,
+            finished_at: None,
+        };
+        let shifted = Row::TurnFooter {
+            turn: 1,
+            first_item_key: Some(1000),
+            duration_seconds: None,
+            finished_at: None,
+        };
+        assert!(arriving_rows(&opened, &[group(6), older_turn, group(1), shifted]).is_empty());
+
+        let unfolded = vec![group(1), group(3), group(4), footer(0)];
+        assert_eq!(
+            arriving_rows(&opened, &unfolded),
+            vec![RowIdentity::ToolGroup(3), RowIdentity::ToolGroup(4)]
+        );
+
+        let bulk = std::iter::once(group(1))
+            .chain((10..10 + MAX_ANIMATED_ARRIVALS as u64 + 1).map(group))
+            .collect::<Vec<_>>();
+        assert!(arriving_rows(&opened, &bulk).is_empty());
+    }
+
+    fn item_row(key: u64, content: StreamContent) -> Row {
+        Row::Item {
+            index: key as usize,
+            item: StreamItem {
+                key,
+                timestamp: None,
+                last_timestamp: None,
+                content,
+            },
+            expanded: false,
+            streaming: false,
+        }
+    }
+
+    fn text(key: u64) -> Row {
+        item_row(
+            key,
+            StreamContent::Assistant {
+                text: format!("text {key}"),
+            },
+        )
+    }
+
+    #[test]
+    fn images_end_their_paragraph() {
+        assert_eq!(separate_images("no images"), "no images");
+        assert_eq!(
+            separate_images("![shot](/tmp/a.png)That grab"),
+            "![shot](/tmp/a.png)\n\nThat grab"
+        );
+        assert_eq!(
+            separate_images("![shot](/tmp/a.png)\nThat grab"),
+            "![shot](/tmp/a.png)\n\nThat grab"
+        );
+        assert_eq!(
+            separate_images("![shot](/tmp/a.png)\n\nThat"),
+            "![shot](/tmp/a.png)\n\nThat"
+        );
+        assert_eq!(
+            separate_images("![shot](/tmp/a.png)"),
+            "![shot](/tmp/a.png)"
+        );
+        let partial = separate_images("![shot](/tmp/a.png)\n").into_owned();
+        assert!(separate_images("![shot](/tmp/a.png)\nmore").starts_with(&partial));
+    }
+
+    #[test]
+    fn image_links_keep_parentheses_and_code_intact() {
+        assert_eq!(
+            separate_images("![a](/tmp/a(1).png)Then"),
+            "![a](/tmp/a(1).png)\n\nThen"
+        );
+        assert_eq!(
+            separate_images("![s](</tmp/Screenshot (1).png>)Then"),
+            "![s](</tmp/Screenshot (1).png>)\n\nThen"
+        );
+        let fenced = "```md\n![x](y)text\n```\n";
+        assert_eq!(separate_images(fenced), fenced);
+        let inline = "use `![x](y)z` here";
+        assert_eq!(separate_images(inline), inline);
+        assert_eq!(
+            image_destinations("![a](/tmp/a(1).png) ![s](</tmp/S (1).png>) `![c](code.png)`"),
+            vec!["/tmp/a(1).png", "/tmp/S (1).png"]
+        );
+    }
+
+    #[test]
+    fn a_finished_turn_folds_its_steps_before_the_answer() {
+        let user = |key| {
+            item_row(
+                key,
+                StreamContent::User {
+                    text: "go".into(),
+                    message_id: None,
+                },
+            )
+        };
+        let reasoning = |key| item_row(key, StreamContent::Reasoning { text: "hmm".into() });
+        let items = [
+            user(0),
+            text(1),
+            reasoning(2),
+            text(3),
+            user(4),
+            reasoning(5),
+        ]
+        .into_iter()
+        .filter_map(|row| match row {
+            Row::Item { item, .. } => Some(item),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(
+            folded_work(&items, 0..4),
+            Some(1..3),
+            "narration and thinking fold"
+        );
+        assert_eq!(
+            folded_work(&items, 4..6),
+            Some(5..6),
+            "no answer: everything after the message"
+        );
+        assert_eq!(
+            folded_work(&items, 0..2),
+            None,
+            "only an answer: nothing to fold"
+        );
+    }
+
     fn subagent(id: &str, status: &str) -> paseo_client::ProviderSubagent {
         paseo_client::ProviderSubagent {
             id: id.into(),
@@ -2550,6 +4047,24 @@ mod tests {
             cwd: None,
             subtitle: None,
         }
+    }
+
+    #[test]
+    fn subagent_run_time_counts_to_now_while_running_and_to_the_end_after() {
+        let now = "2026-09-28T10:05:30Z"
+            .parse::<chrono::DateTime<Utc>>()
+            .expect("time");
+        let mut running = subagent("a", "running");
+        running.updated_at = "2026-09-28T10:01:00Z".into();
+        assert_eq!(subagent_run_time(&running, now).as_deref(), Some("5m 30s"));
+
+        let mut finished = subagent("b", "completed");
+        finished.updated_at = "2026-09-28T10:02:00Z".into();
+        assert_eq!(subagent_run_time(&finished, now).as_deref(), Some("2m"));
+
+        let mut unparsed = subagent("c", "running");
+        unparsed.created_at = "soon".into();
+        assert_eq!(subagent_run_time(&unparsed, now), None);
     }
 
     #[test]
@@ -2580,46 +4095,6 @@ mod tests {
                 .map(|subagent| subagent.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["b"]
-        );
-    }
-
-    #[test]
-    fn header_subtitle_names_worktree_provider_model_and_mode() {
-        let agent = paseo_client::AgentSummary {
-            id: "agent".into(),
-            title: None,
-            status: "idle".into(),
-            directory: Some(PathBuf::from(
-                "/home/me/.paseo/worktrees/abc/prolific-snake",
-            )),
-            project: Some(serde_json::json!({
-                "projectName": "axon",
-                "checkout": {
-                    "currentBranch": "feature",
-                    "isPaseoOwnedWorktree": true,
-                    "worktreeRoot": "/home/me/.paseo/worktrees/abc/prolific-snake",
-                },
-            })),
-            extra: serde_json::json!({
-                "provider": "claude",
-                "model": "opus",
-                "currentModeId": "plan",
-                "availableModes": [{"id": "plan", "label": "Plan"}],
-            }),
-        };
-        let provider = paseo_client::Provider {
-            id: "claude".into(),
-            label: Some("Claude".into()),
-            status: "ready".into(),
-            extra: serde_json::json!({"models": [{"id": "opus", "label": "Opus 4.1"}]}),
-        };
-        assert_eq!(
-            header_subtitle(&agent, Some(&provider)),
-            "axon › prolific-snake · feature · Claude · Opus 4.1 · Plan"
-        );
-        assert_eq!(
-            header_subtitle(&agent, None),
-            "axon › prolific-snake · feature · claude · opus · Plan"
         );
     }
 
@@ -2681,7 +4156,62 @@ mod tests {
             );
             assert_eq!(unique_project_file(project, "lib.rs", cx), None);
             assert_eq!(unique_project_file(project, "missing.rs", cx), None);
+            // A path relative to some folder inside the project, like
+            // `phantom-bin/src/engine/book.rs` for `axon-rs/crates/phantom/phantom-bin/…`.
+            assert_eq!(
+                unique_project_file(project, "mod_a/lib.rs", cx),
+                Some(PathBuf::from("/repo/src/mod_a/lib.rs"))
+            );
+            assert_eq!(
+                unique_project_file(project, "./src/mod_b/lib.rs", cx),
+                Some(PathBuf::from("/repo/src/mod_b/lib.rs"))
+            );
+            // Folder names match whole, so `c/mod_a` is not the end of `src/mod_a`.
+            assert_eq!(unique_project_file(project, "c/mod_a/lib.rs", cx), None);
         });
+    }
+
+    #[test]
+    fn symbol_like_spans_are_code_names_not_words() {
+        for name in [
+            "CommandPaletteSources",
+            "open_agent",
+            "store::bucket",
+            "PaseoStore::bucket()",
+            "MAX_PLACE_RESULTS",
+        ] {
+            assert!(is_symbol_like(name), "{name}");
+        }
+        for text in [
+            "main",
+            "Rakka",
+            "true",
+            "a_",
+            "ctrl-k",
+            "Vec<String>",
+            "src/main.rs",
+            "x y",
+            "12_000",
+        ] {
+            assert!(!is_symbol_like(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_clicked_name_picks_the_symbol_it_names() {
+        let symbols = [
+            ("bucket", Some("PaseoStore")),
+            ("bucket", Some("Sidebar")),
+            ("open_agent", None),
+            ("open_agent_here", None),
+        ];
+        assert_eq!(pick_symbol("open_agent", &symbols), SymbolPick::One(2));
+        assert_eq!(pick_symbol("bucket", &symbols), SymbolPick::Several);
+        assert_eq!(
+            pick_symbol("PaseoStore::bucket()", &symbols),
+            SymbolPick::One(0)
+        );
+        assert_eq!(pick_symbol("missing", &symbols), SymbolPick::None);
     }
 
     #[test]
@@ -2754,6 +4284,48 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert!(parsed[0].multi_select);
         assert_eq!(parsed[0].options[1].1.as_deref(), Some("Calm"));
+    }
+
+    #[test]
+    fn question_answers_follow_paseo_rules() {
+        let parsed = questions(&request(json!({"kind":"question","input":{"questions":[
+            {"header":"Color","question":"Pick one","options":[{"label":"Red"},{"label":"Blue"}],"allowOther":true},
+            {"header":"Tags","question":"Pick some","options":[{"label":"a"},{"label":"b"}],"multiSelect":true,"isOther":true},
+            {"header":"Note","question":"Anything else?","options":[],"allowEmpty":true,"dismissLabel":"Skip"},
+            {"header":"Size","question":"Pick a size","options":[{"label":"S"}]}
+        ]}})));
+        assert!(parsed[0].allow_other && parsed[1].allow_other && !parsed[3].allow_other);
+        assert!(shows_text_input(&parsed[0]));
+        assert!(shows_text_input(&parsed[2]));
+        assert!(!shows_text_input(&parsed[3]));
+        assert_eq!(parsed[2].dismiss_label.as_deref(), Some("Skip"));
+
+        assert!(!is_answered(&parsed[0], &[], "  "));
+        assert!(is_answered(&parsed[0], &[], "Green"));
+        assert!(is_answered(&parsed[2], &[], ""));
+        assert!(!is_answered(&parsed[3], &[], "typed but hidden"));
+        assert!(is_answered(&parsed[3], &["S".into()], ""));
+
+        let selected = |index: usize| match index {
+            0 => vec!["Red".to_owned()],
+            1 => vec!["a".to_owned()],
+            _ => Vec::new(),
+        };
+        let text = |index: usize| match index {
+            0 => " Green ".to_owned(),
+            1 => "c".to_owned(),
+            3 => "ignored".to_owned(),
+            _ => String::new(),
+        };
+        let answers = build_answers(&parsed, selected, text);
+        assert_eq!(answers.get("Color"), Some(&json!("Green")));
+        assert_eq!(answers.get("Tags"), Some(&json!("a, c")));
+        assert_eq!(answers.get("Note"), Some(&json!("")));
+        assert_eq!(answers.get("Size"), None);
+
+        assert!(!submit_empty_on_dismiss(&parsed));
+        assert!(submit_empty_on_dismiss(&parsed[2..3]));
+        assert!(!submit_empty_on_dismiss(&[]));
     }
 
     #[gpui::test]

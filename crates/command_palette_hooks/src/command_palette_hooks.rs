@@ -140,14 +140,56 @@ impl GlobalCommandPaletteInterceptor {
         }
     }
 
-    /// Intercepts the given query from the command palette.
+    /// Intercepts the given query from the command palette, adding every
+    /// [`CommandPaletteSources`] source's results after the interceptor's.
     pub fn intercept(
         query: &str,
         workspace: WeakEntity<Workspace>,
         cx: &mut App,
     ) -> Option<Task<CommandInterceptResult>> {
-        let interceptor = cx.try_global::<Self>()?;
-        let handler = interceptor.0.clone();
-        Some(handler(query, workspace, cx))
+        let handler = cx.try_global::<Self>().map(|interceptor| interceptor.0.clone());
+        let sources = cx
+            .try_global::<CommandPaletteSources>()
+            .map(|sources| sources.0.clone())
+            .unwrap_or_default();
+        if handler.is_none() && sources.is_empty() {
+            return None;
+        }
+        let intercepted = handler.map(|handler| handler(query, workspace.clone(), cx));
+        let added = sources
+            .iter()
+            .map(|source| source(query, workspace.clone(), cx))
+            .collect::<Vec<_>>();
+        Some(cx.spawn(async move |_| {
+            let mut result = match intercepted {
+                Some(intercepted) => intercepted.await,
+                None => CommandInterceptResult::default(),
+            };
+            for added in added {
+                result.results.extend(added.await);
+            }
+            result
+        }))
+    }
+}
+
+type CommandPaletteSource =
+    Rc<dyn Fn(&str, WeakEntity<Workspace>, &mut App) -> Task<Vec<CommandInterceptItem>>>;
+
+/// Extra results for the command palette, alongside the one interceptor, which Vim sets and
+/// clears as it is turned on and off.
+#[derive(Clone, Default)]
+pub struct CommandPaletteSources(Vec<CommandPaletteSource>);
+
+impl Global for CommandPaletteSources {}
+
+impl CommandPaletteSources {
+    /// Adds a source whose results for a query show before the palette's own matches.
+    pub fn add(
+        cx: &mut App,
+        source: impl Fn(&str, WeakEntity<Workspace>, &mut App) -> Task<Vec<CommandInterceptItem>>
+        + 'static,
+    ) {
+        cx.default_global::<Self>().0.push(Rc::new(source));
     }
 }

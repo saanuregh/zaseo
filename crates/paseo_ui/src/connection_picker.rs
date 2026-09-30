@@ -37,8 +37,16 @@ pub(super) fn parse_target(profile: &PaseoConnectionProfile) -> Result<Connectio
     {
         bail!("Paseo URL must be ws:// or wss:// with a host and /ws path, without credentials");
     }
-    if let Some(editor_ssh) = &profile.editor_ssh_uri {
-        paseo_client::parse_ssh_uri(editor_ssh)?;
+    match &profile.editor_ssh_uri {
+        Some(editor_ssh) => {
+            paseo_client::parse_ssh_uri(editor_ssh)?;
+        }
+        // Zaseo opens each agent in an editor workspace for its folder, which a remote daemon's
+        // folders only get through SSH.
+        None if !is_loopback(&url) => {
+            bail!("A remote Paseo daemon needs an editor SSH mapping to open its folders")
+        }
+        None => {}
     }
     Ok(ConnectionTarget::Direct {
         websocket_url: profile.target_uri.clone(),
@@ -46,10 +54,21 @@ pub(super) fn parse_target(profile: &PaseoConnectionProfile) -> Result<Connectio
     })
 }
 
-fn is_unencrypted_remote(target_uri: &str) -> bool {
-    Url::parse(target_uri).ok().is_some_and(|url| {
-        url.scheme() == "ws" && !matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+/// Whether a daemon URL points at this machine.
+pub(crate) fn is_loopback(url: &Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
     })
+}
+
+fn is_unencrypted_remote(target_uri: &str) -> bool {
+    Url::parse(target_uri)
+        .ok()
+        .is_some_and(|url| url.scheme() == "ws" && !is_loopback(&url))
 }
 
 pub(crate) fn open_hosts(
@@ -61,13 +80,28 @@ pub(crate) fn open_hosts(
     workspace.toggle_modal(window, cx, |window, cx| HostsModal::new(fs, window, cx));
 }
 
+/// Renames the title an agent shows: its workspace's name when it is alone in one, otherwise its
+/// own title.
 pub(crate) fn open_rename(
     workspace: &mut Workspace,
     agent_id: String,
-    current: String,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    let (lone_workspace, current) = {
+        let store = store(cx).read(cx);
+        let Some(agent) = store.agent(&agent_id) else {
+            return;
+        };
+        (
+            store.lone_agent_workspace(agent).cloned(),
+            crate::store::agent_title(agent),
+        )
+    };
+    if let Some(descriptor) = lone_workspace {
+        crate::workspace_tools::open_workspace_rename(workspace, &descriptor, window, cx);
+        return;
+    }
     crate::workspace_tools::open_text_prompt(
         workspace,
         "Rename agent",
@@ -444,10 +478,40 @@ mod tests {
         let profile = PaseoConnectionProfile {
             name: "Bad".into(),
             target_uri: "ws://user:secret@example.com/ws".into(),
-            editor_ssh_uri: None,
+            editor_ssh_uri: Some("ssh://me@example.com".into()),
             client_id: "client".into(),
         };
-        assert!(parse_target(&profile).is_err());
+        let error = parse_target(&profile).expect_err("credentials in the URL are rejected");
+        assert!(
+            error.to_string().contains("without credentials"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_target_requires_ssh_mapping_for_remote_websocket() {
+        let profile = |target_uri: &str, editor_ssh_uri: Option<&str>| PaseoConnectionProfile {
+            name: "Host".into(),
+            target_uri: target_uri.into(),
+            editor_ssh_uri: editor_ssh_uri.map(Into::into),
+            client_id: "client".into(),
+        };
+        let error = parse_target(&profile("wss://daemon.example/ws", None))
+            .expect_err("a remote daemon needs an editor SSH mapping");
+        assert!(
+            error.to_string().contains("editor SSH mapping"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            parse_target(&profile(
+                "wss://daemon.example/ws",
+                Some("ssh://me@daemon.example")
+            ))
+            .is_ok()
+        );
+        assert!(parse_target(&profile("ws://127.0.0.1:6767/ws", None)).is_ok());
+        assert!(parse_target(&profile("ws://localhost:6767/ws", None)).is_ok());
+        assert!(parse_target(&profile("ws://[::1]:6767/ws", None)).is_ok());
     }
 
     #[test]

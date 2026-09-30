@@ -33,6 +33,12 @@ const DAEMON_UPDATE_TIMEOUT: Duration = Duration::from_secs(300);
 const PROVIDER_REFRESH_TIMEOUT: Duration = Duration::from_secs(120);
 const TERMINAL_RESTORE_SCROLLBACK: usize = 200;
 const DICTATION_FORMAT: &str = "audio/pcm;rate=16000;bits=16";
+/// Paseo's own client uploads in chunks this size.
+const FILE_CHUNK_SIZE: usize = 128 * 1024;
+const FILE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+const FILE_BEGIN: u8 = 16;
+const FILE_CHUNK: u8 = 17;
+const FILE_END: u8 = 18;
 
 enum Command {
     Request {
@@ -43,6 +49,8 @@ enum Command {
     },
     /// A message the daemon never answers, such as terminal input or dictation audio.
     Notify(Value),
+    /// A binary frame, such as part of a file upload.
+    Binary(Vec<u8>),
     /// Releases a terminal output subscription and stops routing its frames.
     ReleaseTerminal {
         terminal_id: String,
@@ -199,6 +207,9 @@ impl PaseoSession {
         if let Some(initial_prompt) = request.initial_prompt {
             message["initialPrompt"] = json!(initial_prompt);
         }
+        if let Some(workspace_id) = request.workspace_id {
+            message["workspaceId"] = json!(workspace_id);
+        }
         if !request.images.is_empty() {
             message["images"] = image_payloads(request.images);
         }
@@ -240,6 +251,7 @@ impl PaseoSession {
             message_id: message_id.to_owned(),
             behavior: None,
             images: Vec::new(),
+            attachments: Vec::new(),
         })
         .await
     }
@@ -257,6 +269,9 @@ impl PaseoSession {
         }
         if !message.images.is_empty() {
             request["images"] = image_payloads(message.images);
+        }
+        if !message.attachments.is_empty() {
+            request["attachments"] = Value::Array(message.attachments);
         }
         let payload = self
             .request(request, "send_agent_message_response", false)
@@ -495,36 +510,31 @@ impl PaseoSession {
         protocol::parse_directory_suggestions(&payload)
     }
 
-    /// Returns archived agents, most recently updated first.
-    pub async fn archived_agents(&self) -> Result<Vec<AgentSummary>> {
-        let mut agents = Vec::new();
-        let mut cursor: Option<String> = None;
-        let mut seen_cursors = HashSet::new();
-        loop {
-            let mut page = json!({"limit":200});
-            if let Some(cursor) = cursor.as_deref() {
-                page["cursor"] = json!(cursor);
-            }
-            let payload = self
-                .request(
-                    json!({"type":"fetch_agent_history_request", "requestId":next_request_id(), "filter":{"includeArchived":true}, "sort":[{"key":"updated_at","direction":"desc"}], "page":page}),
-                    "fetch_agent_history_response",
-                    false,
-                )
-                .await?;
-            agents.extend(
-                protocol::parse_agents(&payload)?
-                    .into_iter()
-                    .filter(|agent| agent.extra["archivedAt"].is_string()),
-            );
-            cursor = next_agents_cursor(&payload)?;
-            if cursor.is_none() {
-                return Ok(agents);
-            }
-            if !seen_cursors.insert(cursor.clone().unwrap_or_default()) {
-                bail!("Paseo history returned a repeated page cursor");
-            }
+    /// One page of the daemon's agent history, active and archived agents together, most
+    /// recently updated first, as Paseo's History screen asks for it: no filter, so the daemon's
+    /// defaults (archived included) apply, and `search` matched by the daemon.
+    pub async fn agent_history(
+        &self,
+        search: &str,
+        cursor: Option<String>,
+    ) -> Result<AgentHistoryPage> {
+        let mut page = json!({"limit":AGENT_HISTORY_PAGE_LIMIT});
+        if let Some(cursor) = cursor {
+            page["cursor"] = json!(cursor);
         }
+        let mut message = json!({"type":"fetch_agent_history_request", "requestId":next_request_id(), "sort":[{"key":"updated_at","direction":"desc"}], "page":page});
+        let search = search.trim();
+        if !search.is_empty() {
+            message["search"] = json!(search);
+        }
+        let payload = self
+            .request(message, "fetch_agent_history_response", false)
+            .await?;
+        Ok(AgentHistoryPage {
+            agents: protocol::parse_agents(&payload)?,
+            next_cursor: next_agents_cursor(&payload)?,
+            search_truncated: payload["searchTruncated"] == true,
+        })
     }
 
     async fn notify(&self, message: Value) -> Result<()> {
@@ -1398,6 +1408,49 @@ impl PaseoSession {
         Ok(())
     }
 
+    /// Uploads a file to the daemon's host: a request, then the bytes as binary frames on the same
+    /// connection, answered once the daemon has stored the file.
+    pub async fn upload_file(&self, upload: FileUpload) -> Result<UploadedFile> {
+        let request_id = next_request_id();
+        let size = upload.bytes.len();
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::Request {
+                message: json!({"type":"file.upload.request", "requestId":request_id, "fileName":upload.file_name, "mimeType":upload.mime_type, "size":size, "modifiedAt":upload.modified_at}),
+                response_type: "file.upload.response",
+                retry_creation: false,
+                reply,
+            })
+            .await
+            .context("Paseo connection closed")?;
+        let metadata = json!({"mime":upload.mime_type, "size":size, "encoding":"binary", "modifiedAt":upload.modified_at, "fileName":upload.file_name}).to_string();
+        let metadata_length =
+            u16::try_from(metadata.len()).context("file upload metadata is too long")?;
+        let mut begin = file_frame_header(FILE_BEGIN, &request_id)?;
+        begin.extend_from_slice(&metadata_length.to_be_bytes());
+        begin.extend_from_slice(metadata.as_bytes());
+        self.send_binary(begin).await?;
+        for chunk in upload.bytes.chunks(FILE_CHUNK_SIZE) {
+            let mut frame = file_frame_header(FILE_CHUNK, &request_id)?;
+            frame.extend_from_slice(chunk);
+            self.send_binary(frame).await?;
+        }
+        self.send_binary(file_frame_header(FILE_END, &request_id)?)
+            .await?;
+        let payload = tokio::time::timeout(FILE_UPLOAD_TIMEOUT, response)
+            .await
+            .map_err(|_| anyhow!("Paseo file upload timed out"))?
+            .context("Paseo connection closed")??;
+        protocol::parse_uploaded_file(&payload)
+    }
+
+    async fn send_binary(&self, frame: Vec<u8>) -> Result<()> {
+        self.commands
+            .send(Command::Binary(frame))
+            .await
+            .context("Paseo connection closed")
+    }
+
     pub async fn close(&self) -> Result<()> {
         let (reply, response) = oneshot::channel();
         self.commands
@@ -1625,8 +1678,28 @@ fn require_accepted(payload: &Value, action: &str) -> Result<()> {
     Ok(())
 }
 
+/// A file transfer frame's opening bytes: the opcode, then the request ID with its length.
+fn file_frame_header(opcode: u8, request_id: &str) -> Result<Vec<u8>> {
+    let length = u8::try_from(request_id.len()).context("file upload request ID is too long")?;
+    let mut frame = vec![opcode, length];
+    frame.extend_from_slice(request_id.as_bytes());
+    Ok(frame)
+}
+
 fn next_request_id() -> String {
     format!("zaseo-{}", NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Agents per history page, as Paseo's History screen asks for.
+const AGENT_HISTORY_PAGE_LIMIT: usize = 200;
+
+/// A page of agent history: its agents, the cursor of the next page if there is one, and whether
+/// an older daemon stopped matching a search early.
+#[derive(Clone, Debug)]
+pub struct AgentHistoryPage {
+    pub agents: Vec<AgentSummary>,
+    pub next_cursor: Option<String>,
+    pub search_truncated: bool,
 }
 
 fn next_agents_cursor(payload: &Value) -> Result<Option<String>> {
@@ -2022,6 +2095,11 @@ async fn run(
                 Some(Command::ReleaseTerminal { terminal_id, subscription_id }) => {
                     terminal_slots.retain(|_, subscribed| *subscribed != terminal_id);
                     if send_message(&mut socket, json!({"type":"subscription.release.request", "requestId":next_request_id(), "subscriptionId":subscription_id})).await.is_err() {
+                        if !reconnect(&mut socket, &target, &ssh_executable, &credentials, &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
+                    }
+                }
+                Some(Command::Binary(frame)) => {
+                    if socket.send(Message::Binary(frame.into())).await.is_err() {
                         if !reconnect(&mut socket, &target, &ssh_executable, &credentials, &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
                     }
                 }
@@ -2470,7 +2548,7 @@ async fn reconnect(
                     deliver(reply, Err(anyhow!("Paseo is reconnecting")));
                     continue;
                 }
-                Some(Command::Notify(_) | Command::ReleaseTerminal { .. }) => continue,
+                Some(Command::Notify(_) | Command::ReleaseTerminal { .. } | Command::Binary(_)) => continue,
                 Some(Command::Close(reply)) => {
                     deliver(reply, Ok(()));
                     return false;
@@ -3290,6 +3368,7 @@ while True:
                 attachments: Vec::new(),
                 worktree: None,
                 idempotency_key: "stable-key".into(),
+                workspace_id: None,
             })
             .await
             .expect("creation replay");
@@ -4175,6 +4254,7 @@ while True:
                 attachments: vec![attachment],
                 worktree: None,
                 idempotency_key: "key".into(),
+                workspace_id: None,
             })
             .await
             .expect("create");
@@ -4438,39 +4518,50 @@ while True:
     }
 
     #[tokio::test]
-    async fn archived_agents_page_through_history_and_skip_active_agents() {
+    async fn agent_history_fetches_one_page_with_search_and_cursor() {
         let archived = json!({"id":"archived-1", "status":"closed", "cwd":"/tmp/project", "archivedAt":"2026-09-01T00:00:00Z"});
         let (session, daemon) = mock_daemon(vec![
             (
                 "fetch_agent_history_response",
-                json!({"entries":[{"agent":agent(),"project":null},{"agent":archived,"project":{"projectKey":"p","projectName":"Project"}}],"pageInfo":{"hasMore":true,"nextCursor":"next","prevCursor":null}}),
+                json!({"entries":[{"agent":agent(),"project":{"projectKey":"p","projectName":"Project","workspaceName":"Fix login"}},{"agent":archived,"project":null}],"pageInfo":{"hasMore":true,"nextCursor":"next","prevCursor":null}}),
             ),
             (
                 "fetch_agent_history_response",
-                json!({"entries":[{"agent":{"id":"archived-2","status":"idle","cwd":"/tmp/project","archivedAt":"2026-08-01T00:00:00Z"}}],"pageInfo":{"hasMore":false,"nextCursor":null,"prevCursor":null}}),
+                json!({"entries":[],"pageInfo":{"hasMore":false,"nextCursor":null,"prevCursor":null},"searchTruncated":true}),
             ),
         ]);
-        let agents = session.archived_agents().await.expect("archived agents");
+        let first = session
+            .agent_history("", None)
+            .await
+            .expect("first history page");
         assert_eq!(
-            agents
+            first
+                .agents
                 .iter()
                 .map(|agent| agent.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["archived-1", "archived-2"]
+            vec!["agent-1", "archived-1"]
         );
-        assert_eq!(
-            agents[0].project.as_ref().expect("project")["projectName"],
-            "Project"
-        );
-        assert_eq!(agents[1].project, None);
+        assert_eq!(first.next_cursor.as_deref(), Some("next"));
+        assert!(!first.search_truncated);
+        let second = session
+            .agent_history("login", Some("next".into()))
+            .await
+            .expect("second history page");
+        assert!(second.agents.is_empty());
+        assert_eq!(second.next_cursor, None);
+        assert!(second.search_truncated);
+
         let messages = daemon.await.expect("daemon task");
         assert_eq!(messages[0]["type"], "fetch_agent_history_request");
-        assert_eq!(messages[0]["filter"], json!({"includeArchived":true}));
+        assert_eq!(messages[0].get("filter"), None);
+        assert_eq!(messages[0].get("search"), None);
         assert_eq!(
             messages[0]["sort"],
             json!([{"key":"updated_at","direction":"desc"}])
         );
         assert_eq!(messages[0]["page"], json!({"limit":200}));
+        assert_eq!(messages[1]["search"], "login");
         assert_eq!(messages[1]["page"], json!({"limit":200,"cursor":"next"}));
     }
 
@@ -4496,6 +4587,7 @@ while True:
                     data_base64: "aGVsbG8=".into(),
                     mime_type: "image/png".into(),
                 }],
+                attachments: vec![json!({"type":"uploaded_file","id":"file-1","fileName":"notes.txt","mimeType":"text/plain","size":2,"path":"/uploads/notes.txt"})],
             })
             .await
             .expect("steer");
@@ -4511,8 +4603,78 @@ while True:
             messages[0]["images"],
             json!([{"data":"aGVsbG8=","mimeType":"image/png"}])
         );
+        assert_eq!(messages[0]["attachments"][0]["path"], "/uploads/notes.txt");
         assert!(messages[1].get("activeTurnBehavior").is_none());
         assert!(messages[1].get("images").is_none());
+        assert!(messages[1].get("attachments").is_none());
+    }
+
+    #[tokio::test]
+    async fn file_upload_sends_request_then_frames() {
+        let (commands, mut receiver) = mpsc::channel(8);
+        let session = PaseoSession { commands };
+        let bytes = vec![7u8; FILE_CHUNK_SIZE + 3];
+        let upload = tokio::spawn(async move {
+            session
+                .upload_file(FileUpload {
+                    file_name: "notes.txt".into(),
+                    mime_type: "text/plain".into(),
+                    modified_at: "2026-09-30T10:00:00Z".into(),
+                    bytes,
+                })
+                .await
+        });
+        let Some(Command::Request {
+            message,
+            response_type,
+            reply,
+            ..
+        }) = receiver.recv().await
+        else {
+            panic!("expected the upload request first")
+        };
+        assert_eq!(message["type"], "file.upload.request");
+        assert_eq!(response_type, "file.upload.response");
+        assert_eq!(message["fileName"], "notes.txt");
+        assert_eq!(message["size"], FILE_CHUNK_SIZE + 3);
+        let request_id = message["requestId"]
+            .as_str()
+            .expect("request ID")
+            .to_owned();
+        let mut frames = Vec::new();
+        for _ in 0..4 {
+            let Some(Command::Binary(frame)) = receiver.recv().await else {
+                panic!("expected a file frame")
+            };
+            frames.push(frame);
+        }
+        let id = request_id.as_bytes();
+        let header = |opcode: u8| [&[opcode, id.len() as u8][..], id].concat();
+        assert!(frames[0].starts_with(&header(16)));
+        let metadata_start = header(16).len() + 2;
+        let metadata: Value =
+            serde_json::from_slice(&frames[0][metadata_start..]).expect("begin metadata");
+        assert_eq!(
+            metadata,
+            json!({"mime":"text/plain","size":FILE_CHUNK_SIZE + 3,"encoding":"binary","modifiedAt":"2026-09-30T10:00:00Z","fileName":"notes.txt"})
+        );
+        assert_eq!(
+            frames[1].len() - header(17).len(),
+            FILE_CHUNK_SIZE,
+            "full first chunk"
+        );
+        assert!(frames[1].starts_with(&header(17)));
+        assert_eq!(frames[2], [header(17), vec![7, 7, 7]].concat());
+        assert_eq!(frames[3], header(18));
+        deliver(
+            reply,
+            Ok(
+                json!({"requestId":request_id,"file":{"type":"uploaded_file","id":"file-1","fileName":"notes.txt","mimeType":"text/plain","size":FILE_CHUNK_SIZE + 3,"path":"/uploads/notes.txt"},"error":null}),
+            ),
+        );
+        let file = upload.await.expect("upload task").expect("uploaded");
+        assert_eq!(file.path, "/uploads/notes.txt");
+        assert_eq!(file.attachment()["type"], "uploaded_file");
     }
 
     #[tokio::test]
@@ -4730,6 +4892,33 @@ while True:
     }
 
     #[tokio::test]
+    async fn create_joins_the_given_workspace() {
+        let (session, daemon) = mock_daemon(vec![(
+            "agent.create.response",
+            json!({"agent":agent(),"error":null}),
+        )]);
+        session
+            .create(CreateAgent {
+                provider: "codex".into(),
+                model: None,
+                directory: "/tmp/project".into(),
+                title: None,
+                initial_prompt: Some("go".into()),
+                mode_id: None,
+                thinking_option_id: None,
+                images: Vec::new(),
+                attachments: Vec::new(),
+                worktree: None,
+                idempotency_key: "key".into(),
+                workspace_id: Some("wks_0123456789abcdef".into()),
+            })
+            .await
+            .expect("create");
+        let messages = daemon.await.expect("daemon task");
+        assert_eq!(messages[0]["workspaceId"], "wks_0123456789abcdef");
+    }
+
+    #[tokio::test]
     async fn worktree_creation_branches_off() {
         let (session, daemon) = mock_daemon(vec![(
             "agent.create.response",
@@ -4751,6 +4940,7 @@ while True:
                     base: Some("refs/remotes/origin/main".into()),
                 }),
                 idempotency_key: "key".into(),
+                workspace_id: None,
             })
             .await
             .expect("create");

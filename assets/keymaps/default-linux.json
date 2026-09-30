@@ -1679,8 +1679,9 @@
     "use_key_equivalents": true,
     "bindings": {
       "ctrl-alt-p": "paseo_ui::TogglePanel",
-      "ctrl-alt-k": "paseo_ui::ToggleCommandCenter",
-      "ctrl-alt-n": "paseo_ui::NewAgent",
+      "ctrl-alt-k": "command_palette::Toggle",
+      "ctrl-alt-n": "paseo_ui::NewAgentWorkspace",
+      "ctrl-alt-t": "paseo_ui::NewAgent",
       "ctrl-alt-]": "paseo_ui::NextAgent",
       "ctrl-alt-[": "paseo_ui::PreviousAgent",
     },
@@ -1689,8 +1690,9 @@
     "context": "PaseoAgentView || PaseoSidebar",
     "use_key_equivalents": true,
     "bindings": {
-      "ctrl-k": "paseo_ui::ToggleCommandCenter",
-      "ctrl-n": "paseo_ui::NewAgent",
+      "ctrl-k": "command_palette::Toggle",
+      "ctrl-n": "paseo_ui::NewAgentWorkspace",
+      "ctrl-t": "paseo_ui::NewAgent",
       "ctrl-shift-backspace": "paseo_ui::ArchiveAgent",
       "ctrl-e": "paseo_ui::ReviewLastTurn",
       "ctrl-shift-t": "paseo_ui::NewTerminal",

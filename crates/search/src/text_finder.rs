@@ -389,6 +389,17 @@ impl TextFinder {
         None
     }
 
+    /// Opens the Text Finder searching for `query`, with the workspace's last-used filters.
+    pub fn open_with_query(
+        workspace: &mut Workspace,
+        query: String,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Task<()> {
+        let options = load_last_search(workspace.database_id(), cx).and_then(|seed| seed.options);
+        Self::open(Some(SearchSeed { query, options }), window, cx)
+    }
+
     pub(crate) fn open(
         seed_query: Option<SearchSeed>,
         window: &mut Window,
@@ -598,6 +609,37 @@ mod tests {
         workspace.update(cx, |workspace, cx| {
             assert!(workspace.active_modal::<TextFinder>(cx).is_none());
         });
+    }
+
+    #[gpui::test]
+    async fn test_open_with_query_types_the_query(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(path!("/dir"), json!({"one.rs": "const ONE: usize = 1;"}))
+            .await;
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                TextFinder::open_with_query(workspace, "ONE".into(), window, cx)
+            })
+            .await;
+
+        let picker = workspace.update(cx, |workspace, cx| {
+            workspace
+                .active_modal::<TextFinder>(cx)
+                .expect("Text Finder should be open")
+                .read(cx)
+                .picker
+                .clone()
+        });
+        picker.update(cx, |picker, cx| assert_eq!(picker.query(cx), "ONE"));
     }
 
     #[gpui::test]

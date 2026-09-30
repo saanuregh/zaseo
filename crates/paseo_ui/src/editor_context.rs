@@ -286,8 +286,8 @@ enum Target {
 }
 
 /// The agent tab activated most recently in this workspace, else the agent last focused in any
-/// Paseo view. Focus alone misses tabs opened from the sidebar that were never clicked into.
-/// A subagent tab is read-only, so its parent agent takes the text.
+/// Paseo view when it belongs to this workspace. Focus alone misses tabs opened from the sidebar
+/// that were never clicked into. A subagent tab is read-only, so its parent agent takes the text.
 fn target(workspace: &Workspace, cx: &App) -> Target {
     let agent_id = match recent_agent_tab(workspace, cx) {
         Some(tab) => match tab.read(cx).agent_id(cx) {
@@ -297,8 +297,8 @@ fn target(workspace: &Workspace, cx: &App) -> Target {
             _ => return Target::Tab(tab),
         },
         None => match crate::store(cx).read(cx).focused_agent.clone() {
-            Some(agent_id) => agent_id,
-            None => return Target::Draft,
+            Some(agent_id) if crate::workspace_owns_agent(workspace, &agent_id, cx) => agent_id,
+            _ => return Target::Draft,
         },
     };
     let agent_id = match paseo_client::parse_subagent_timeline_id(&agent_id) {

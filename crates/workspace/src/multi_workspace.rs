@@ -41,13 +41,13 @@ actions!(
         CloseWorkspaceSidebar,
         /// Moves focus to or from the workspace sidebar without closing it.
         FocusWorkspaceSidebar,
-        /// Activates the next project in the sidebar.
+        /// Activates the next folder in the sidebar.
         NextProject,
-        /// Activates the previous project in the sidebar.
+        /// Activates the previous folder in the sidebar.
         PreviousProject,
-        /// Moves the active project up in the sidebar.
+        /// Moves the active folder up in the sidebar.
         MoveProjectUp,
-        /// Moves the active project down in the sidebar.
+        /// Moves the active folder down in the sidebar.
         MoveProjectDown,
         /// Activates the next thread in sidebar order.
         NextThread,
@@ -55,7 +55,7 @@ actions!(
         PreviousThread,
         /// Creates a new thread in the current workspace.
         NewThread,
-        /// Moves the active project to a new window.
+        /// Moves the active folder to a new window.
         MoveProjectToNewWindow,
     ]
 );

@@ -4,8 +4,8 @@ use crate::{
     FileContent, PaseoWorktree, PermissionRequest, ProjectDescriptor, Provider,
     ProviderAvailability, ProviderSubagent, ProviderUsage, RecoveryState, RelayStatus,
     SetupSnapshot, TerminalInfo, TimelineCursor, TimelineEntry, TimelinePage, TimelinePayload,
-    UsageBalance, UsageDetail, UsageWindow, WorkspaceDescriptor, WorkspaceLabel, WorkspaceScript,
-    subagent_timeline_id,
+    UploadedFile, UsageBalance, UsageDetail, UsageWindow, WorkspaceDescriptor, WorkspaceLabel,
+    WorkspaceScript, subagent_timeline_id,
 };
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;
@@ -100,6 +100,29 @@ pub fn parse_agents(payload: &Value) -> Result<Vec<AgentSummary>> {
             )
         })
         .collect()
+}
+
+pub fn parse_uploaded_file(payload: &Value) -> Result<UploadedFile> {
+    if let Some(error) = payload.get("error").and_then(Value::as_str) {
+        bail!("Paseo couldn't store the file: {error}");
+    }
+    let file = payload
+        .get("file")
+        .filter(|file| !file.is_null())
+        .context("Paseo stored no file")?;
+    let text = |key: &str| {
+        file.get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .with_context(|| format!("uploaded file has no {key}"))
+    };
+    Ok(UploadedFile {
+        id: text("id")?,
+        file_name: text("fileName")?,
+        mime_type: text("mimeType")?,
+        size: file.get("size").and_then(Value::as_u64).unwrap_or_default(),
+        path: text("path")?,
+    })
 }
 
 pub fn parse_commands(payload: &Value) -> Result<Vec<AgentCommand>> {
@@ -231,6 +254,11 @@ pub fn parse_subagent(value: &Value) -> Result<ProviderSubagent> {
 
 pub fn parse_subagents(payload: &Value) -> Result<Vec<ProviderSubagent>> {
     if let Some(error) = payload.get("error").and_then(Value::as_str) {
+        // The daemon refuses to list an archived agent's subagents, and an archived agent has
+        // none running, so a tab of one shows no subagents rather than an error.
+        if error.starts_with("Agent is archived:") {
+            return Ok(Vec::new());
+        }
         bail!("Paseo could not list subagents: {error}");
     }
     required_array(payload, "subagents")?
@@ -333,11 +361,21 @@ pub fn parse_permission(payload: &Value) -> Result<PermissionRequest> {
     })
 }
 
+/// Responses whose parser handles the payload's `error` itself, so it can tell an expected refusal
+/// from a failure.
+const PARSERS_READ_ERROR: &[&str] = &[
+    "agent.provider_subagents.list.response",
+    "agent.provider_subagents.timeline.get.response",
+];
+
 pub fn response_payload(message: &Value, expected_type: &str) -> Result<Value> {
     if required_string(message, "type")? != expected_type {
         bail!("unexpected Paseo response type");
     }
     let payload = message.get("payload").context("missing response payload")?;
+    if PARSERS_READ_ERROR.contains(&expected_type) {
+        return Ok(payload.clone());
+    }
     if let Some(error) = payload.get("error").and_then(Value::as_str) {
         bail!("Paseo request failed: {error}");
     }
@@ -576,6 +614,26 @@ pub fn parse_paseo_worktrees(payload: &Value) -> Result<Vec<PaseoWorktree>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn archived_agents_list_no_subagents() {
+        let list = |error: &str| {
+            let message = json!({
+                "type": "agent.provider_subagents.list.response",
+                "payload": {
+                    "requestId": "request-1", "parentAgentId": "agent-1", "subagents": [],
+                    "error": error
+                }
+            });
+            response_payload(&message, "agent.provider_subagents.list.response")
+                .and_then(|payload| parse_subagents(&payload))
+        };
+        let archived =
+            list("Agent is archived: agent-1").expect("an archived agent is not an error");
+        assert!(archived.is_empty());
+        let failure = list("Provider crashed").expect_err("other failures still surface");
+        assert!(failure.to_string().contains("Provider crashed"));
+    }
 
     #[test]
     fn provider_snapshot_preserves_unknown_optional_fields() {

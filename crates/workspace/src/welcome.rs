@@ -369,7 +369,7 @@ impl WelcomePage {
     ) -> impl IntoElement {
         v_flex()
             .w_full()
-            .child(SectionHeader::new("Recent Projects"))
+            .child(SectionHeader::new("Recent Folders"))
             .children(recent_projects)
     }
 

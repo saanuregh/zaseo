@@ -404,9 +404,9 @@ actions!(
         ActivateNextWindow,
         /// Switches to the previous window.
         ActivatePreviousWindow,
-        /// Adds a folder to the current project.
+        /// Adds a folder to the open folders.
         AddFolderToProject,
-        /// Clears all bookmarks in the project.
+        /// Clears all bookmarks in the open folders.
         ClearBookmarks,
         /// Clears all notifications.
         ClearAllNotifications,
@@ -420,7 +420,7 @@ actions!(
         ToggleAllDocks,
         /// Closes the current window.
         CloseWindow,
-        /// Closes the current project.
+        /// Closes the open folders.
         CloseProject,
         /// Opens the feedback dialog.
         Feedback,
@@ -607,7 +607,7 @@ pub struct SendKeystrokes(pub String);
 actions!(
     project_symbols,
     [
-        /// Toggles the project symbols search.
+        /// Toggles the folder symbols search.
         #[action(name = "Toggle")]
         ToggleProjectSymbols
     ]
@@ -4230,7 +4230,10 @@ impl Workspace {
     ) {
         let project = self.project.read(cx);
         if project.is_via_collab() {
-            self.show_error("You cannot add folders to someone else's project", cx);
+            self.show_error(
+                "You cannot add folders to someone else's shared folders",
+                cx,
+            );
             return;
         }
         let paths = self.prompt_for_open_path(
@@ -6554,7 +6557,7 @@ impl Workspace {
                     cx,
                 )
                 .detach_and_prompt_err(
-                    "Failed to join project",
+                    "Failed to join shared folders",
                     window,
                     cx,
                     |error, _, _| Some(format!("{error:#}")),
@@ -10448,7 +10451,7 @@ actions!(
         Deafen,
         /// Leaves the current call.
         LeaveCall,
-        /// Shares the current project with collaborators.
+        /// Shares the current folder with collaborators.
         ShareProject,
         /// Shares your screen with collaborators.
         ScreenShare,
@@ -10516,7 +10519,7 @@ async fn join_channel_internal(
                     window.prompt(
                         PromptLevel::Warning,
                         "Do you want to switch channels?",
-                        Some("Leaving this call will unshare your current project."),
+                        Some("Leaving this call will unshare your current folder."),
                         &["Yes, Join Channel", "Cancel"],
                         cx,
                     )

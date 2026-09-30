@@ -47,9 +47,9 @@ actions!(
         /// Opens project-specific settings.
         #[action(deprecated_aliases = ["zed_actions::OpenProjectSettings"])]
         OpenProjectSettings,
-        /// Opens the project tasks configuration.
+        /// Opens the folder tasks configuration.
         OpenProjectTasks,
-        /// Opens the project tasks configuration with worktree setup guidance.
+        /// Opens the folder tasks configuration with worktree setup guidance.
         OpenWorktreeSetupTasks,
         /// Opens the default keymap file.
         OpenDefaultKeymap,
@@ -364,11 +364,11 @@ pub mod git {
             /// Opens the git branch selector.
             #[action(deprecated_aliases = ["branches::OpenRecent"])]
             Branch,
-            /// Shows uncommitted changes across the project.
+            /// Shows uncommitted changes across the open folders.
             ViewUncommittedChanges,
-            /// Shows unstaged changes across the project.
+            /// Shows unstaged changes across the open folders.
             ViewUnstagedChanges,
-            /// Shows staged changes across the project.
+            /// Shows staged changes across the open folders.
             ViewStagedChanges,
             /// Opens the git stash selector.
             ViewStash,
@@ -410,7 +410,7 @@ pub mod text_finder {
     actions!(
         text_finder,
         [
-            /// Opens the Project Search Picker.
+            /// Opens the Folder Search Picker.
             Toggle,
         ]
     );
@@ -422,9 +422,9 @@ pub mod project_panel {
     actions!(
         project_panel,
         [
-            /// Toggles the project panel.
+            /// Toggles the folder panel.
             Toggle,
-            /// Toggles focus on the project panel.
+            /// Toggles focus on the folder panel.
             ToggleFocus
         ]
     );
@@ -509,7 +509,7 @@ pub mod icon_theme_selector {
 pub mod search {
     use gpui::{Action, actions};
 
-    /// Opens a new project search filtered down to the given directory.
+    /// Opens a new folder search filtered down to the given directory.
     ///
     /// An internal forwarding action: the user-facing, keybindable entry
     /// point is `project_panel::NewSearchInDirectory`, which resolves the
@@ -700,7 +700,7 @@ pub mod assistant {
             /// Opens the user-global AGENTS.md rules file.
             #[action(name = "OpenGlobalAGENTS.mdRules")]
             OpenGlobalAgentsMdRules,
-            /// Opens the project AGENTS.md rules file.
+            /// Opens the folder AGENTS.md rules file.
             #[action(name = "OpenProjectAGENTS.mdRules")]
             OpenProjectAgentsMdRules,
             /// Opens the skills manager in the settings window.
@@ -868,7 +868,7 @@ actions!(
         ToggleEnableBreakpoint,
         /// Removes a breakpoint.
         UnsetBreakpoint,
-        /// Opens the project debug tasks configuration.
+        /// Opens the folder debug tasks configuration.
         OpenProjectDebugTasks,
     ]
 );

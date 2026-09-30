@@ -39,7 +39,6 @@ use gpui_tokio::Tokio;
 use language::LanguageRegistry;
 use onboarding::{FIRST_OPEN, show_onboarding_view};
 use project_panel::ProjectPanel;
-use prompt_store::PromptBuilder;
 use remote::RemoteConnectionOptions;
 use reqwest_client::ReqwestClient;
 
@@ -623,8 +622,6 @@ fn main() {
         })
         .detach();
 
-        let is_new_install = matches!(&installation_id, Some(IdType::New(_)));
-
         // We should rename these in the future to `first app open`, `first app open for release channel`, and `app open`
         if let (Some(system_id), Some(installation_id)) = (&system_id, &installation_id) {
             match (&system_id, &installation_id) {
@@ -704,20 +701,12 @@ fn main() {
         web_search_providers::init(app_state.client.clone(), app_state.user_store.clone(), cx);
         snippet_provider::init(cx);
         edit_prediction_registry::init(app_state.client.clone(), app_state.user_store.clone(), cx);
-        let prompt_builder = PromptBuilder::load(app_state.fs.clone(), stdout_is_a_pty(), cx);
         project::AgentRegistryStore::init_global(
             cx,
             app_state.fs.clone(),
             app_state.client.http_client(),
         );
-        agent_ui::init(
-            app_state.fs.clone(),
-            prompt_builder,
-            app_state.languages.clone(),
-            is_new_install,
-            false,
-            cx,
-        );
+        // Zed's own agent stays off: Paseo is Zaseo's agent.
         zed::watch_user_agents_md(app_state.fs.clone(), cx);
 
         repl::init(app_state.fs.clone(), cx);
@@ -735,9 +724,13 @@ fn main() {
 
         audio::init(cx);
         workspace::init(app_state.clone(), cx);
+        let release_channel = ReleaseChannel::global(cx);
+        cx.set_app_identity(release_channel.app_id(), release_channel.display_name());
         paseo_ui::init(cx);
-        paseo_ui::set_project_switcher(std::rc::Rc::new(zed::switch_paseo_project), cx);
         zed::hide_zed_only_actions(cx);
+        zed::update_ai_command_palette_filter(cx);
+        cx.observe_global::<SettingsStore>(zed::update_ai_command_palette_filter)
+            .detach();
         paseo_ui::connect_on_startup(cx);
         ui_prompt::init(cx);
 
