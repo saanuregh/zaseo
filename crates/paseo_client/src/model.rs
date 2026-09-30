@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -492,6 +493,8 @@ pub struct CreateAgent {
     /// The Paseo workspace the agent joins. Without one the daemon starts a new workspace, and a
     /// new worktree always gets its own.
     pub workspace_id: Option<String>,
+    /// Chosen feature values by feature ID, such as Codex's `fast_mode`.
+    pub feature_values: BTreeMap<String, Value>,
 }
 
 /// How a message sent while the agent is running treats the active turn.
@@ -579,14 +582,45 @@ pub struct DirectorySuggestion {
     pub is_directory: bool,
 }
 
-/// Agent settings used to list commands before the agent exists.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Agent settings used to list commands and features before the agent exists.
+#[derive(Clone, Debug, PartialEq)]
 pub struct DraftConfig {
     pub provider: String,
     pub cwd: PathBuf,
     pub mode_id: Option<String>,
     pub model: Option<String>,
     pub thinking_option_id: Option<String>,
+    /// Chosen feature values by feature ID, such as Codex's `fast_mode`.
+    pub feature_values: BTreeMap<String, Value>,
+}
+
+/// A provider-defined agent option the composer shows beside the model, such as Codex's Fast
+/// and Plan toggles. Providers name and describe their own features.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentFeature {
+    pub id: String,
+    pub label: String,
+    pub description: Option<String>,
+    pub tooltip: Option<String>,
+    /// A Lucide icon name from the provider, such as `zap`.
+    pub icon: Option<String>,
+    pub kind: AgentFeatureKind,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AgentFeatureKind {
+    Toggle(bool),
+    Select {
+        value: Option<String>,
+        options: Vec<AgentFeatureOption>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentFeatureOption {
+    pub id: String,
+    pub label: String,
+    pub description: Option<String>,
 }
 
 /// A daemon-side git checkout, as shown in the changes panel.

@@ -3,7 +3,7 @@ mod protocol;
 mod transport;
 
 pub use model::*;
-pub use protocol::is_absolute_workspace_path;
+pub use protocol::{is_absolute_workspace_path, parse_features};
 pub use transport::parse_ssh_uri;
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -197,6 +197,9 @@ impl PaseoSession {
         }
         if let Some(thinking_option_id) = request.thinking_option_id {
             config["thinkingOptionId"] = json!(thinking_option_id);
+        }
+        if !request.feature_values.is_empty() {
+            config["featureValues"] = json!(request.feature_values);
         }
         let mut message = json!({
             "type":"agent.create.request",
@@ -444,6 +447,37 @@ impl PaseoSession {
         require_accepted(&payload, "the thinking change")
     }
 
+    /// Sets one of the agent's provider features, such as Codex's `fast_mode`.
+    pub async fn set_feature(&self, agent_id: &str, feature_id: &str, value: Value) -> Result<()> {
+        let payload = self
+            .request(
+                json!({"type":"set_agent_feature_request", "requestId":next_request_id(), "agentId":agent_id, "featureId":feature_id, "value":value}),
+                "set_agent_feature_response",
+                false,
+            )
+            .await?;
+        require_accepted(&payload, "the feature change")
+    }
+
+    /// The features an agent with the draft's settings would have, for the composer before it
+    /// exists.
+    pub async fn provider_features(&self, draft: DraftConfig) -> Result<Vec<AgentFeature>> {
+        let payload = self
+            .request(
+                json!({"type":"list_provider_features_request", "requestId":next_request_id(), "draftConfig":draft_config_json(draft)?}),
+                "list_provider_features_response",
+                false,
+            )
+            .await?;
+        if let Some(error) = payload.get("error").and_then(Value::as_str) {
+            bail!("Paseo could not list the provider's features: {error}");
+        }
+        Ok(payload
+            .get("features")
+            .map(protocol::parse_features)
+            .unwrap_or_default())
+    }
+
     pub async fn clear_attention(&self, agent_ids: Vec<String>) -> Result<()> {
         self.request(
             json!({"type":"clear_agent_attention", "requestId":next_request_id(), "agentId":agent_ids}),
@@ -470,18 +504,7 @@ impl PaseoSession {
         let mut message =
             json!({"type":"list_commands_request", "requestId":request_id, "agentId":agent_id});
         if let Some(draft) = draft {
-            let cwd = draft.cwd.to_str().context("draft directory is not UTF-8")?;
-            let mut config = json!({"provider":draft.provider, "cwd":cwd});
-            if let Some(mode_id) = draft.mode_id {
-                config["modeId"] = json!(mode_id);
-            }
-            if let Some(model) = draft.model {
-                config["model"] = json!(model);
-            }
-            if let Some(thinking_option_id) = draft.thinking_option_id {
-                config["thinkingOptionId"] = json!(thinking_option_id);
-            }
-            message["draftConfig"] = config;
+            message["draftConfig"] = draft_config_json(draft)?;
         }
         let payload = self
             .request(message, "list_commands_response", false)
@@ -1690,6 +1713,25 @@ fn next_request_id() -> String {
     format!("zaseo-{}", NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed))
 }
 
+/// The `draftConfig` Paseo takes for listing a draft's commands and features.
+fn draft_config_json(draft: DraftConfig) -> Result<Value> {
+    let cwd = draft.cwd.to_str().context("draft directory is not UTF-8")?;
+    let mut config = json!({"provider":draft.provider, "cwd":cwd});
+    if let Some(mode_id) = draft.mode_id {
+        config["modeId"] = json!(mode_id);
+    }
+    if let Some(model) = draft.model {
+        config["model"] = json!(model);
+    }
+    if let Some(thinking_option_id) = draft.thinking_option_id {
+        config["thinkingOptionId"] = json!(thinking_option_id);
+    }
+    if !draft.feature_values.is_empty() {
+        config["featureValues"] = json!(draft.feature_values);
+    }
+    Ok(config)
+}
+
 /// Agents per history page, as Paseo's History screen asks for.
 const AGENT_HISTORY_PAGE_LIMIT: usize = 200;
 
@@ -2601,6 +2643,7 @@ async fn reconnect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use async_tungstenite::{WebSocketStream, tokio::accept_async};
     use futures::StreamExt;
     use tokio::net::{TcpListener, TcpStream};
@@ -3331,6 +3374,7 @@ while True:
             assert_eq!(creation["config"]["model"], "gpt-5.5");
             assert_eq!(creation["config"]["modeId"], "plan");
             assert_eq!(creation["config"]["thinkingOptionId"], "high");
+            assert_eq!(creation["config"]["featureValues"], json!({"fast_mode": true}));
             assert!(creation["config"].get("title").is_none());
             assert!(creation.get("initialPrompt").is_none());
             drop(first);
@@ -3369,6 +3413,7 @@ while True:
                 worktree: None,
                 idempotency_key: "stable-key".into(),
                 workspace_id: None,
+                feature_values: BTreeMap::from([("fast_mode".into(), json!(true))]),
             })
             .await
             .expect("creation replay");
@@ -4255,6 +4300,7 @@ while True:
                 worktree: None,
                 idempotency_key: "key".into(),
                 workspace_id: None,
+                feature_values: BTreeMap::new(),
             })
             .await
             .expect("create");
@@ -4413,6 +4459,97 @@ while True:
         assert_eq!(messages[2]["response"], json!({"behavior":"deny"}));
     }
 
+    #[test]
+    fn agent_features_parse_toggles_and_selects() {
+        let features = protocol::parse_features(&json!([
+            {"type":"toggle","id":"fast_mode","label":"Fast","description":"Priority inference","tooltip":"Toggle fast mode","icon":"zap","value":true},
+            {"type":"select","id":"verbosity","label":"Verbosity","value":null,"options":[{"id":"low","label":"Low"},{"id":"high","label":"High","description":"More words"}]},
+            {"type":"unknown","id":"future"},
+            {"type":"toggle","label":"No id"}
+        ]));
+        assert_eq!(
+            features,
+            vec![
+                AgentFeature {
+                    id: "fast_mode".into(),
+                    label: "Fast".into(),
+                    description: Some("Priority inference".into()),
+                    tooltip: Some("Toggle fast mode".into()),
+                    icon: Some("zap".into()),
+                    kind: AgentFeatureKind::Toggle(true),
+                },
+                AgentFeature {
+                    id: "verbosity".into(),
+                    label: "Verbosity".into(),
+                    description: None,
+                    tooltip: None,
+                    icon: None,
+                    kind: AgentFeatureKind::Select {
+                        value: None,
+                        options: vec![
+                            AgentFeatureOption {
+                                id: "low".into(),
+                                label: "Low".into(),
+                                description: None,
+                            },
+                            AgentFeatureOption {
+                                id: "high".into(),
+                                label: "High".into(),
+                                description: Some("More words".into()),
+                            },
+                        ],
+                    },
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn features_are_set_and_listed_for_drafts() {
+        let (session, daemon) = mock_daemon(vec![
+            (
+                "set_agent_feature_response",
+                json!({"agentId":"agent-1","accepted":true,"error":null}),
+            ),
+            (
+                "list_provider_features_response",
+                json!({"provider":"codex","features":[{"type":"toggle","id":"plan_mode","label":"Plan","value":false}],"error":null,"fetchedAt":"now"}),
+            ),
+            (
+                "list_provider_features_response",
+                json!({"provider":"codex","features":null,"error":"provider unavailable","fetchedAt":"now"}),
+            ),
+        ]);
+        session
+            .set_feature("agent-1", "fast_mode", json!(true))
+            .await
+            .expect("feature set");
+        let draft = DraftConfig {
+            provider: "codex".into(),
+            cwd: "/tmp/project".into(),
+            mode_id: None,
+            model: Some("gpt-6-luna".into()),
+            thinking_option_id: None,
+            feature_values: BTreeMap::from([("fast_mode".into(), json!(true))]),
+        };
+        let features = session
+            .provider_features(draft.clone())
+            .await
+            .expect("draft features");
+        assert_eq!(features[0].id, "plan_mode");
+        assert!(session.provider_features(draft).await.is_err());
+        let messages = daemon.await.expect("daemon task");
+        assert_eq!(messages[0]["type"], "set_agent_feature_request");
+        assert_eq!(messages[0]["agentId"], "agent-1");
+        assert_eq!(messages[0]["featureId"], "fast_mode");
+        assert_eq!(messages[0]["value"], true);
+        assert_eq!(messages[1]["type"], "list_provider_features_request");
+        assert_eq!(
+            messages[1]["draftConfig"],
+            json!({"provider":"codex","cwd":"/tmp/project","model":"gpt-6-luna","featureValues":{"fast_mode":true}})
+        );
+    }
+
     #[tokio::test]
     async fn commands_are_listed_for_agents_and_drafts() {
         let (session, daemon) = mock_daemon(vec![
@@ -4447,6 +4584,7 @@ while True:
                     mode_id: Some("plan".into()),
                     model: None,
                     thinking_option_id: Some("high".into()),
+                    feature_values: BTreeMap::new(),
                 }),
             )
             .await
@@ -4911,6 +5049,7 @@ while True:
                 worktree: None,
                 idempotency_key: "key".into(),
                 workspace_id: Some("wks_0123456789abcdef".into()),
+                feature_values: BTreeMap::new(),
             })
             .await
             .expect("create");
@@ -4941,6 +5080,7 @@ while True:
                 }),
                 idempotency_key: "key".into(),
                 workspace_id: None,
+                feature_values: BTreeMap::new(),
             })
             .await
             .expect("create");

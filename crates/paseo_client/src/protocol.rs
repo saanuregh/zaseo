@@ -1,5 +1,5 @@
 use crate::{
-    AgentCommand, AgentSummary, BranchSuggestion, CheckoutDiff, CheckoutStatus, DaemonStatus,
+    AgentCommand, AgentFeature, AgentFeatureKind, AgentFeatureOption, AgentSummary, BranchSuggestion, CheckoutDiff, CheckoutStatus, DaemonStatus,
     DaemonUpdate, DiffFile, DiffHunk, DiffLine, DiffLineKind, DiffStat, DirectorySuggestion,
     FileContent, PaseoWorktree, PermissionRequest, ProjectDescriptor, Provider,
     ProviderAvailability, ProviderSubagent, ProviderUsage, RecoveryState, RelayStatus,
@@ -88,6 +88,47 @@ pub fn is_absolute_workspace_path(path: &str) -> bool {
                 .take(2)
                 .count()
                 == 2)
+}
+
+/// An agent's or draft's provider features. Entries of an unknown type, or missing an ID or
+/// label, are skipped, since a newer daemon may send kinds this client doesn't draw.
+pub fn parse_features(features: &Value) -> Vec<AgentFeature> {
+    let text = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
+    features
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|feature| {
+            let kind = match feature.get("type").and_then(Value::as_str)? {
+                "toggle" => AgentFeatureKind::Toggle(feature.get("value")?.as_bool()?),
+                "select" => AgentFeatureKind::Select {
+                    value: text(feature, "value"),
+                    options: feature
+                        .get("options")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|option| {
+                            Some(AgentFeatureOption {
+                                id: text(option, "id")?,
+                                label: text(option, "label")?,
+                                description: text(option, "description"),
+                            })
+                        })
+                        .collect(),
+                },
+                _ => return None,
+            };
+            Some(AgentFeature {
+                id: text(feature, "id")?,
+                label: text(feature, "label")?,
+                description: text(feature, "description"),
+                tooltip: text(feature, "tooltip"),
+                icon: text(feature, "icon"),
+                kind,
+            })
+        })
+        .collect()
 }
 
 pub fn parse_agents(payload: &Value) -> Result<Vec<AgentSummary>> {

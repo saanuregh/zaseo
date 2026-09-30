@@ -83,7 +83,10 @@ while the pointer is over the sidebar and re-sort when it leaves. The sidebar ca
 status (each under its most urgent agent, as Paseo lists them), or by label. Each agent opens in its own tab with its conversation,
 permission prompts, and a composer with provider, model, thinking, and mode
 pickers; each opens a list with descriptions, and long lists (some hosts offer
-hundreds of models) can be searched by name or description. Tool
+hundreds of models) can be searched by name or description. After them come the
+provider's own features, as in Paseo: Codex's **Fast** (a bolt, yellow while on,
+offered on the models that support it) and **Plan** toggles, and any option list a
+provider defines; a draft's choices apply when its agent is created. Tool
 calls show as one quiet line each ("Ran 2 commands and used 1 other tool"), and a
 click opens the details in place. Once a turn finishes, its steps before the
 agent's final answer (narration, tools, and thinking) fold under a "Worked for …"

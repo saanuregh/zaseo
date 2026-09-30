@@ -16,7 +16,7 @@ use picker::Picker;
 use project::{Completion, CompletionDisplayOptions, CompletionResponse, CompletionSource};
 use serde_json::Value;
 use settings::Settings as _;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -199,6 +199,8 @@ pub struct Composer {
     pub(crate) draft_directory: Option<PathBuf>,
     /// The Paseo workspace a draft's agent joins; `None` starts a new workspace.
     pub(crate) draft_workspace_id: Option<String>,
+    /// Feature values chosen for a draft, by feature ID, such as Codex's `fast_mode`.
+    draft_feature_values: BTreeMap<String, Value>,
     queue: Vec<QueuedMessage>,
     next_queue_id: usize,
     images: Vec<PastedImage>,
@@ -446,6 +448,7 @@ impl Composer {
             draft: AgentChoices::default(),
             draft_directory,
             draft_workspace_id: None,
+            draft_feature_values: BTreeMap::new(),
             queue: Vec::new(),
             next_queue_id: 0,
             images: Vec::new(),
@@ -564,17 +567,7 @@ impl Composer {
         let key = self.command_cache_key(cx);
         let agent_id = self.agent_id.clone();
         let draft = if agent_id.is_none() {
-            let choices = self.choices(cx);
-            match (choices.provider, self.draft_directory.clone()) {
-                (Some(provider), Some(cwd)) => Some(DraftConfig {
-                    provider,
-                    cwd,
-                    mode_id: choices.mode,
-                    model: choices.model,
-                    thinking_option_id: choices.thinking,
-                }),
-                _ => None,
-            }
+            self.draft_config(cx)
         } else {
             None
         };
@@ -584,6 +577,80 @@ impl Composer {
         self.store.update(cx, |store, cx| {
             store.load_commands(key, agent_id, draft, cx);
         });
+        self.load_features(cx);
+    }
+
+    /// A draft's settings for listing its commands and features; `None` for an agent, or until
+    /// the draft has a provider and a folder.
+    fn draft_config(&self, cx: &App) -> Option<DraftConfig> {
+        if self.agent_id.is_some() {
+            return None;
+        }
+        let choices = self.choices(cx);
+        Some(DraftConfig {
+            provider: choices.provider?,
+            cwd: self.draft_directory.clone()?,
+            mode_id: choices.mode,
+            model: choices.model,
+            thinking_option_id: choices.thinking,
+            feature_values: self.draft_feature_values.clone(),
+        })
+    }
+
+    /// Which features Paseo offers depends on the provider, folder and model (Codex's Fast only
+    /// on some models), so a draft's are cached by those, not by the values chosen.
+    fn features_cache_key(draft: &DraftConfig) -> String {
+        format!(
+            "{}|{}|{}|{}|{}",
+            draft.provider,
+            draft.cwd.display(),
+            draft.model.as_deref().unwrap_or_default(),
+            draft.mode_id.as_deref().unwrap_or_default(),
+            draft.thinking_option_id.as_deref().unwrap_or_default()
+        )
+    }
+
+    fn load_features(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = self.draft_config(cx) else {
+            return;
+        };
+        let key = Self::features_cache_key(&draft);
+        self.store
+            .update(cx, |store, cx| store.load_provider_features(key, draft, cx));
+    }
+
+    /// The agent's features, or for a draft the provider's with the values chosen so far.
+    fn features(&self, cx: &App) -> Vec<paseo_client::AgentFeature> {
+        if let Some(agent) = self.agent(cx) {
+            return agent
+                .extra
+                .get("features")
+                .map(paseo_client::parse_features)
+                .unwrap_or_default();
+        }
+        let Some(draft) = self.draft_config(cx) else {
+            return Vec::new();
+        };
+        let offered = self
+            .store
+            .read(cx)
+            .provider_features
+            .get(&Self::features_cache_key(&draft))
+            .cloned()
+            .unwrap_or_default();
+        with_chosen_values(offered, &self.draft_feature_values)
+    }
+
+    fn set_feature(&mut self, feature_id: String, value: Value, cx: &mut Context<Self>) {
+        match self.agent_id.clone() {
+            Some(agent_id) => self.store.update(cx, |store, cx| {
+                store.set_feature(&agent_id, feature_id, value, cx)
+            }),
+            None => {
+                self.draft_feature_values.insert(feature_id, value);
+            }
+        }
+        cx.notify();
     }
 
     fn store_changed(&mut self, cx: &mut Context<Self>) {
@@ -613,6 +680,15 @@ impl Composer {
                 .contains_key(&self.command_cache_key(cx))
         {
             self.load_commands(cx);
+        }
+        if let Some(draft) = self.draft_config(cx)
+            && !self
+                .store
+                .read(cx)
+                .provider_features
+                .contains_key(&Self::features_cache_key(&draft))
+        {
+            self.load_features(cx);
         }
     }
 
@@ -738,6 +814,7 @@ impl Composer {
             }
         }
         self.remember(|preference, _| preference.model = Some(model_id), cx);
+        self.load_features(cx);
         cx.notify();
     }
 
@@ -757,6 +834,7 @@ impl Composer {
                 cx,
             );
         }
+        self.load_features(cx);
         cx.notify();
     }
 
@@ -768,6 +846,7 @@ impl Composer {
             None => self.draft.mode = Some(mode_id.clone()),
         }
         self.remember(|preference, _| preference.mode = Some(mode_id), cx);
+        self.load_features(cx);
         cx.notify();
     }
 
@@ -776,6 +855,7 @@ impl Composer {
             provider: Some(provider_id),
             ..AgentChoices::default()
         };
+        self.draft_feature_values.clear();
         self.load_commands(cx);
         cx.notify();
     }
@@ -1362,6 +1442,7 @@ impl Composer {
         let new_worktree = self.uses_new_worktree(cx);
         let pasted = std::mem::take(&mut self.images);
         let files = self.take_uploaded_files();
+        let feature_values = offered_values(&self.features(cx), &self.draft_feature_values);
         let mut creation_attachments = self.context_attachments.clone();
         creation_attachments.extend(files.iter().map(UploadedFile::attachment));
         let task = self.store.update(cx, |store, cx| {
@@ -1382,6 +1463,7 @@ impl Composer {
                         base: self.worktree_base().map(|base| base.ref_name.clone()),
                     }),
                     workspace_id: self.draft_workspace_id.clone(),
+                    feature_values,
                 },
                 cx,
             )
@@ -2075,6 +2157,13 @@ impl Composer {
                 })
         });
 
+        let feature_controls = self
+            .features(cx)
+            .into_iter()
+            .enumerate()
+            .map(|(index, feature)| self.render_feature(index, feature, cx))
+            .collect::<Vec<_>>();
+
         h_flex()
             .gap_0p5()
             .min_w_0()
@@ -2083,6 +2172,100 @@ impl Composer {
             .children(model_picker)
             .children(thinking_picker)
             .children(mode_picker)
+            .children(feature_controls)
+    }
+
+    /// A provider feature as Paseo draws it: a toggle is an icon button coloured while on, a
+    /// select a labelled picker.
+    fn render_feature(
+        &self,
+        index: usize,
+        feature: paseo_client::AgentFeature,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let title: SharedString = feature
+            .tooltip
+            .clone()
+            .unwrap_or_else(|| feature.label.clone())
+            .into();
+        let description = feature.description.clone().map(SharedString::from);
+        let tooltip = move |_window: &mut Window, cx: &mut App| {
+            Tooltip::with_meta(
+                title.clone(),
+                None,
+                description.clone().unwrap_or_default(),
+                cx,
+            )
+        };
+        match feature.kind {
+            paseo_client::AgentFeatureKind::Toggle(enabled) => {
+                let feature_id = feature.id.clone();
+                IconButton::new(
+                    ("paseo-feature", index),
+                    feature_icon(feature.icon.as_deref(), enabled),
+                )
+                .icon_size(IconSize::Small)
+                .icon_color(if enabled {
+                    feature_color(&feature.id)
+                } else {
+                    Color::Muted
+                })
+                .toggle_state(enabled)
+                .tooltip(tooltip)
+                .on_click(cx.listener(move |composer, _, _, cx| {
+                    composer.set_feature(feature_id.clone(), Value::Bool(!enabled), cx)
+                }))
+                .into_any_element()
+            }
+            paseo_client::AgentFeatureKind::Select { value, options } => {
+                let label = options
+                    .iter()
+                    .find(|option| Some(&option.id) == value.as_ref())
+                    .map(|option| option.label.clone())
+                    .unwrap_or_else(|| feature.label.clone());
+                let this = cx.weak_entity();
+                let (feature_id, title) = (feature.id.clone(), feature.label.clone());
+                PopoverMenu::new(("paseo-feature-picker", index))
+                    .trigger_with_tooltip(
+                        Self::picker_chip(
+                            "paseo-feature-chip",
+                            label,
+                            Some(feature_icon(feature.icon.as_deref(), true)),
+                        ),
+                        tooltip,
+                    )
+                    .anchor(gpui::Anchor::BottomLeft)
+                    .menu(move |window, cx| {
+                        let (this, feature_id) = (this.clone(), feature_id.clone());
+                        let choices = options
+                            .iter()
+                            .map(|option| Choice {
+                                id: option.id.clone(),
+                                label: option.label.clone(),
+                                description: option.description.clone(),
+                                is_default: false,
+                                color_tier: None,
+                            })
+                            .collect();
+                        Some(choice_picker(
+                            title.clone(),
+                            choices,
+                            value.clone(),
+                            Rc::new(move |id, _, cx| {
+                                let feature_id = feature_id.clone();
+                                if let Err(error) = this.update(cx, |composer, cx| {
+                                    composer.set_feature(feature_id, Value::String(id), cx)
+                                }) {
+                                    log::debug!("Paseo composer closed: {error}");
+                                }
+                            }),
+                            window,
+                            cx,
+                        ))
+                    })
+                    .into_any_element()
+            }
+        }
     }
 
     fn render_context_meter(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
@@ -2279,6 +2462,66 @@ fn remember_sent_images(store: &mut PaseoStore, message_id: &str, images: &[Past
             images.iter().map(|pasted| pasted.image.clone()).collect(),
         );
     }
+}
+
+/// Paseo's icon for a feature, from its Lucide name. Fast's bolt fills while it is on.
+fn feature_icon(icon: Option<&str>, enabled: bool) -> IconName {
+    match icon {
+        Some("zap") if enabled => IconName::BoltFilled,
+        Some("zap") => IconName::BoltOutlined,
+        Some("list-todo") => IconName::ListTodo,
+        Some("check" | "check-check") => IconName::Check,
+        _ => IconName::Settings,
+    }
+}
+
+/// The colour Paseo gives a feature while it is on: Fast yellow, auto-accept green, Plan blue.
+/// Other features, muted in Paseo, use the accent so their state still shows.
+fn feature_color(feature_id: &str) -> Color {
+    match feature_id {
+        "fast_mode" => Color::Warning,
+        "auto_accept" => Color::Success,
+        _ => Color::Accent,
+    }
+}
+
+/// A draft's offered features showing the values chosen for them.
+fn with_chosen_values(
+    features: Vec<paseo_client::AgentFeature>,
+    chosen: &BTreeMap<String, Value>,
+) -> Vec<paseo_client::AgentFeature> {
+    features
+        .into_iter()
+        .map(|mut feature| {
+            if let Some(value) = chosen.get(&feature.id) {
+                match &mut feature.kind {
+                    paseo_client::AgentFeatureKind::Toggle(enabled) => {
+                        if let Some(value) = value.as_bool() {
+                            *enabled = value;
+                        }
+                    }
+                    paseo_client::AgentFeatureKind::Select {
+                        value: selected, ..
+                    } => {
+                        *selected = value.as_str().map(str::to_owned);
+                    }
+                }
+            }
+            feature
+        })
+        .collect()
+}
+
+/// The chosen values of features the draft still offers, for creating its agent.
+fn offered_values(
+    features: &[paseo_client::AgentFeature],
+    chosen: &BTreeMap<String, Value>,
+) -> BTreeMap<String, Value> {
+    chosen
+        .iter()
+        .filter(|(id, _)| features.iter().any(|feature| &feature.id == *id))
+        .map(|(id, value)| (id.clone(), value.clone()))
+        .collect()
 }
 
 /// The largest file Paseo's own composer attaches.
@@ -2770,6 +3013,32 @@ pub(crate) fn worktree_branch_name(prompt: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn draft_features_show_and_send_the_chosen_values() {
+        let toggle = |id: &str, value| paseo_client::AgentFeature {
+            id: id.into(),
+            label: id.into(),
+            description: None,
+            tooltip: None,
+            icon: None,
+            kind: paseo_client::AgentFeatureKind::Toggle(value),
+        };
+        let offered = vec![toggle("fast_mode", false), toggle("plan_mode", false)];
+        let chosen = BTreeMap::from([
+            ("fast_mode".to_owned(), serde_json::json!(true)),
+            // A model without Fast drops it; a feature the model no longer offers isn't sent.
+            ("retired".to_owned(), serde_json::json!(true)),
+        ]);
+        assert_eq!(
+            with_chosen_values(offered.clone(), &chosen),
+            vec![toggle("fast_mode", true), toggle("plan_mode", false)]
+        );
+        assert_eq!(
+            offered_values(&offered, &chosen),
+            BTreeMap::from([("fast_mode".to_owned(), serde_json::json!(true))])
+        );
+    }
 
     #[test]
     fn attachments_over_paseos_limit_are_refused() {

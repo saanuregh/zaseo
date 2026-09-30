@@ -80,6 +80,8 @@ pub struct PaseoStore {
     /// Workspaces whose setup state was asked for on this connection.
     setup_checked: HashSet<String>,
     pub(crate) commands: HashMap<String, Vec<AgentCommand>>,
+    /// Features a draft would have, by provider, directory, model, mode and thinking.
+    pub(crate) provider_features: HashMap<String, Vec<paseo_client::AgentFeature>>,
     pub(crate) focused_agent: Option<String>,
     /// The latest phase of a daemon update this client started.
     pub(crate) daemon_update_phase: Option<String>,
@@ -328,6 +330,7 @@ impl PaseoStore {
         self.setup_checked.clear();
         self.project_icons.clear();
         self.commands.clear();
+        self.provider_features.clear();
         self.terminals.clear();
         self.terminal_list_subscriptions.clear();
         self.server_info = ServerInfo::default();
@@ -1275,6 +1278,55 @@ impl PaseoStore {
         });
     }
 
+    pub(crate) fn set_feature(
+        &mut self,
+        agent_id: &str,
+        feature_id: String,
+        value: Value,
+        cx: &mut Context<Self>,
+    ) {
+        self.state
+            .patch_feature(agent_id, &feature_id, value.clone());
+        cx.notify();
+        let agent_id = agent_id.to_owned();
+        self.request_reporting_errors(cx, move |session| async move {
+            session.set_feature(&agent_id, &feature_id, value).await
+        });
+    }
+
+    /// Loads the features a draft with these settings would have, once per `cache_key`.
+    pub(crate) fn load_provider_features(
+        &mut self,
+        cache_key: String,
+        draft: DraftConfig,
+        cx: &mut Context<Self>,
+    ) {
+        if self.provider_features.contains_key(&cache_key) || self.session.is_none() {
+            return;
+        }
+        self.provider_features.insert(cache_key.clone(), Vec::new());
+        let generation = self.connection_generation;
+        let task = self.session_request(cx, move |session| async move {
+            session.provider_features(draft).await
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |store, cx| {
+                if !store.is_current_connection(generation) {
+                    return;
+                }
+                match result {
+                    Ok(features) => {
+                        store.provider_features.insert(cache_key, features);
+                    }
+                    Err(error) => log::debug!("Paseo provider features unavailable: {error}"),
+                }
+                cx.notify();
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
     pub(crate) fn clear_attention(&mut self, agent_id: &str, cx: &mut Context<Self>) {
         let needs_clearing = self
             .state
@@ -1607,6 +1659,25 @@ impl StoreState {
             *existing = agent;
         } else {
             self.agents.push(agent);
+        }
+    }
+
+    /// Sets one feature's value in the agent's snapshot until the daemon sends the new one.
+    fn patch_feature(&mut self, agent_id: &str, feature_id: &str, value: Value) {
+        let feature = self
+            .agents
+            .iter_mut()
+            .find(|agent| agent.id == agent_id)
+            .and_then(|agent| agent.extra.get_mut("features"))
+            .and_then(Value::as_array_mut)
+            .and_then(|features| {
+                features
+                    .iter_mut()
+                    .find(|feature| feature.get("id").and_then(Value::as_str) == Some(feature_id))
+            })
+            .and_then(Value::as_object_mut);
+        if let Some(feature) = feature {
+            feature.insert("value".to_owned(), value);
         }
     }
 
@@ -2095,6 +2166,29 @@ pub fn agent_branch(agent: &AgentSummary) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setting_a_feature_updates_the_agents_feature_value() {
+        let mut state = StoreState::default();
+        state.set_agents(vec![test_agent(
+            "a",
+            "idle",
+            json!({"features": [
+                {"type": "toggle", "id": "fast_mode", "label": "Fast", "value": false},
+                {"type": "toggle", "id": "plan_mode", "label": "Plan", "value": false}
+            ]}),
+        )]);
+        state.patch_feature("a", "fast_mode", json!(true));
+        let features = paseo_client::parse_features(&state.agents[0].extra["features"]);
+        assert_eq!(
+            features[0].kind,
+            paseo_client::AgentFeatureKind::Toggle(true)
+        );
+        assert_eq!(
+            features[1].kind,
+            paseo_client::AgentFeatureKind::Toggle(false)
+        );
+    }
     use gpui::AppContext as _;
     use paseo_client::TimelinePayload;
     use serde_json::json;
