@@ -9,9 +9,10 @@ Zaseo connects to a Paseo daemon you install and start yourself. It does not bun
 start Paseo. It targets Paseo v0.10.1 and shows an incompatibility error when a daemon
 lacks the features it needs.
 
-At startup Zaseo connects to the active profile. The default `Local` profile points to
-`ws://127.0.0.1:6767/ws`. Use the host menu at the top of the Paseo sidebar, or
-**Manage Hosts…**, to switch hosts or add one.
+At startup Zaseo connects to every profile at once and lists all their agents in one
+sidebar. The default `Local` profile points to `ws://127.0.0.1:6767/ws`. Use the host
+menu at the top of the Paseo sidebar, or **Manage Hosts…**, to add a host or pick the
+default host for new agents. The sidebar's filter menu can show only some hosts.
 
 ### Profiles
 
@@ -29,8 +30,11 @@ Profiles are stored under `paseo.profiles` in your settings:
 
 SSH editing, including project switching for remote agents, needs a Zed remote server
 on the host. Builds run with `cargo run` compile and upload one. Installed release
-builds do not download Zed's server, so SSH projects fail unless a matching server is
-already in the host's `~/.zed_server`.
+builds install Zed's official server for the release pinned in
+`UPSTREAM_REMOTE_SERVER_TAG` (`crates/remote/src/transport.rs`), whose protocol matches
+Zaseo's. The host downloads it into `~/.zed_server`. If that fails, or the host's
+`ssh_connections` entry sets `upload_binary_over_ssh`, Zaseo downloads it on this
+machine and uploads it.
 
 ### Passwords and credentials
 

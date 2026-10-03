@@ -1,5 +1,3 @@
-> [!IMPORTANT]
-> Remove this line to confirm you've reviewed this PR before submitting.
 # Zaseo
 
 Zaseo is a fork of [Zed](https://zed.dev) that shows [Paseo](https://paseo.sh) agents
@@ -55,10 +53,11 @@ Flakes only see files tracked by git, so new source files must be committed befo
 ## Connect to Paseo
 
 1. Install and start a Paseo daemon yourself. Zaseo does not bundle or start Paseo.
-2. Start Zaseo. It connects to the active profile. The default `Local` profile points
-   to `ws://127.0.0.1:6767/ws`.
-3. To use another host, open the host menu at the top of the Paseo sidebar, or
-   **Manage Hosts…**.
+2. Start Zaseo. It connects to every configured host at once and lists all their agents
+   in one sidebar. The default `Local` profile points to `ws://127.0.0.1:6767/ws`.
+3. To add a host, or pick the default host for new agents, open the host menu at the
+   top of the Paseo sidebar, or **Manage Hosts…**. The sidebar's filter menu can show
+   only some hosts.
 
 Zaseo shows an incompatibility error when a daemon lacks the features it needs. For
 remote daemons, SSH, and passwords, see
