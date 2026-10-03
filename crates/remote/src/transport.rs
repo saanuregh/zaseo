@@ -20,6 +20,30 @@ pub mod mock;
 pub mod ssh;
 pub mod wsl;
 
+/// Zed release whose official remote server Zaseo installs on SSH hosts. Its protocol files must
+/// match Zaseo's `crates/proto`; `upstream_remote_server_pin_matches_proto` fails when they drift.
+pub const UPSTREAM_REMOTE_SERVER_TAG: &str = "v1.22.0";
+
+pub fn upstream_remote_server_url(platform: RemotePlatform) -> String {
+    let extension = if platform.os.is_windows() {
+        "zip"
+    } else {
+        "gz"
+    };
+    format!(
+        "https://github.com/zed-industries/zed/releases/download/{UPSTREAM_REMOTE_SERVER_TAG}/zed-remote-server-{}-{}.{extension}",
+        platform.os.as_str(),
+        platform.arch.as_str(),
+    )
+}
+
+pub fn upstream_remote_server_binary_name(platform: RemotePlatform) -> String {
+    format!(
+        "zed-remote-server-upstream-{UPSTREAM_REMOTE_SERVER_TAG}{}",
+        if platform.os.is_windows() { ".exe" } else { "" }
+    )
+}
+
 /// Parses the output of `uname -sm` to determine the remote platform.
 /// Takes the last line to skip possible shell initialization output.
 fn parse_platform(output: &str) -> Result<RemotePlatform> {
@@ -463,6 +487,82 @@ async fn which(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SHA-256 of `crates/proto/proto` as of `UPSTREAM_REMOTE_SERVER_TAG`.
+    const UPSTREAM_REMOTE_SERVER_PROTO_SHA256: &str =
+        "f4e705c666b02602a4c4292926ccd9e9a2c34bbad562e2f95a0ddafdb92d9ec1";
+
+    #[test]
+    fn upstream_remote_server_url_for_each_platform() {
+        let cases = [
+            (RemoteOs::Linux, RemoteArch::X86_64, "linux-x86_64.gz"),
+            (RemoteOs::Linux, RemoteArch::Aarch64, "linux-aarch64.gz"),
+            (RemoteOs::MacOs, RemoteArch::X86_64, "macos-x86_64.gz"),
+            (RemoteOs::MacOs, RemoteArch::Aarch64, "macos-aarch64.gz"),
+            (RemoteOs::Windows, RemoteArch::X86_64, "windows-x86_64.zip"),
+            (
+                RemoteOs::Windows,
+                RemoteArch::Aarch64,
+                "windows-aarch64.zip",
+            ),
+        ];
+        for (os, arch, asset) in cases {
+            assert_eq!(
+                upstream_remote_server_url(RemotePlatform { os, arch }),
+                format!(
+                    "https://github.com/zed-industries/zed/releases/download/{UPSTREAM_REMOTE_SERVER_TAG}/zed-remote-server-{asset}"
+                ),
+            );
+        }
+        assert_eq!(
+            upstream_remote_server_binary_name(RemotePlatform {
+                os: RemoteOs::Linux,
+                arch: RemoteArch::X86_64,
+            }),
+            format!("zed-remote-server-upstream-{UPSTREAM_REMOTE_SERVER_TAG}"),
+        );
+        assert_eq!(
+            upstream_remote_server_binary_name(RemotePlatform {
+                os: RemoteOs::Windows,
+                arch: RemoteArch::X86_64,
+            }),
+            format!("zed-remote-server-upstream-{UPSTREAM_REMOTE_SERVER_TAG}.exe"),
+        );
+    }
+
+    #[test]
+    fn upstream_remote_server_pin_matches_proto() {
+        use sha2::{Digest as _, Sha256};
+
+        let proto_dir =
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../proto/proto"));
+        let mut proto_files = std::fs::read_dir(proto_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "proto")
+            })
+            .collect::<Vec<_>>();
+        proto_files.sort();
+
+        let mut hasher = Sha256::new();
+        for path in proto_files {
+            hasher.update(path.file_name().unwrap().as_encoded_bytes());
+            hasher.update([0]);
+            hasher.update(std::fs::read(&path).unwrap());
+            hasher.update([0]);
+        }
+        let hash = format!("{:x}", hasher.finalize());
+
+        assert_eq!(
+            hash, UPSTREAM_REMOTE_SERVER_PROTO_SHA256,
+            "crates/proto/proto changed. Zaseo installs Zed's {UPSTREAM_REMOTE_SERVER_TAG} remote \
+             server, so confirm the protocol still matches that release (or bump \
+             UPSTREAM_REMOTE_SERVER_TAG to the release it matches), then update \
+             UPSTREAM_REMOTE_SERVER_PROTO_SHA256."
+        );
+    }
 
     #[test]
     fn test_parse_platform() {

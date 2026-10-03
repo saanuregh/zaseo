@@ -1,11 +1,13 @@
 use chrono::{DateTime, Datelike as _, TimeZone, Utc};
 use paseo_client::{TimelineEntry, TimelinePayload};
 use serde_json::Value;
+use std::borrow::Borrow;
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 use std::path::Path;
+use std::rc::Rc;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolStatus {
     Running,
     Completed,
@@ -13,7 +15,7 @@ pub enum ToolStatus {
     Failed,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCall {
     pub call_id: String,
     pub name: String,
@@ -22,7 +24,7 @@ pub struct ToolCall {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TodoEntry {
     pub text: String,
     pub completed: bool,
@@ -36,7 +38,7 @@ pub enum NoticeLevel {
     Error,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamContent {
     User {
         text: String,
@@ -63,7 +65,7 @@ pub enum StreamContent {
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamItem {
     /// Sequence of the first entry that produced this item; stable while chunks are appended.
     pub key: u64,
@@ -176,78 +178,223 @@ fn content_of(value: &Value) -> Option<StreamContent> {
 /// reasoning text is concatenated and tool calls are collapsed by call ID, matching the daemon's
 /// own projection.
 pub fn project_items<'a>(entries: impl IntoIterator<Item = &'a TimelineEntry>) -> Vec<StreamItem> {
-    let mut items: Vec<StreamItem> = Vec::new();
-    let mut tool_indices: HashMap<String, usize> = HashMap::new();
-    let mut last_message_id: Option<String> = None;
-    let mut last_sequence_end: Option<u64> = None;
-    let mut extends_last = false;
+    let mut projection = TimelineProjection::default();
     for entry in entries {
+        projection.push(entry);
+    }
+    projection
+        .items
+        .into_iter()
+        .map(Rc::unwrap_or_clone)
+        .collect()
+}
+
+/// How `TimelineProjection::sync` brought its items up to date.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectionUpdate {
+    Unchanged,
+    /// Only entries after the ones already projected arrived, and were folded in.
+    Appended,
+    /// The timeline changed in a way appending can't follow, so it was projected again.
+    Rebuilt,
+}
+
+/// `project_items` for one timeline, kept between store changes so streamed chunks are folded
+/// into the existing items instead of re-projecting the whole timeline per chunk. Items are
+/// shared, so rows holding them clone cheaply and an unchanged item keeps its pointer.
+#[derive(Default)]
+pub struct TimelineProjection {
+    items: Vec<Rc<StreamItem>>,
+    tool_indices: HashMap<String, usize>,
+    last_message_id: Option<String>,
+    last_sequence_end: Option<u64>,
+    extends_last: bool,
+    /// The epoch and store revision the items were projected from; `None` before the first sync.
+    synced: Option<(Option<String>, u64)>,
+    /// The store's rewrite mark for the timeline when last synced: when it moves, entries already
+    /// folded in were replaced or removed, so appending isn't enough.
+    synced_rewrite: u64,
+    first_sequence: Option<u64>,
+    entry_count: usize,
+    /// The newest projected entry, compared on the next sync because the store can replace an
+    /// entry in place under the same sequence, such as a merged row that grew.
+    last_entry: Option<TimelineEntry>,
+}
+
+impl TimelineProjection {
+    pub fn items(&self) -> &[Rc<StreamItem>] {
+        &self.items
+    }
+
+    /// Brings the items up to date with `entries`, the timeline's entries of `epoch` in sequence
+    /// order, at the store's `revision` for the timeline. Appends when the only change is new
+    /// entries after the projected ones; anything else (another epoch, older pages loaded above,
+    /// removed or replaced entries) projects the timeline again.
+    pub fn sync<'a, Entries>(
+        &mut self,
+        epoch: Option<&str>,
+        revision: u64,
+        rewrite: u64,
+        entries: impl Fn() -> Entries,
+    ) -> ProjectionUpdate
+    where
+        Entries: Iterator<Item = &'a TimelineEntry>,
+    {
+        let synced_epoch = self.synced.as_ref().map(|(epoch, _)| epoch.as_deref());
+        if synced_epoch == Some(epoch)
+            && self.synced.as_ref().map(|(_, revision)| *revision) == Some(revision)
+        {
+            return ProjectionUpdate::Unchanged;
+        }
+        let appended = synced_epoch == Some(epoch)
+            && self.synced_rewrite == rewrite
+            && self.append_new_entries(entries());
+        self.synced = Some((epoch.map(str::to_owned), revision));
+        self.synced_rewrite = rewrite;
+        if appended {
+            return ProjectionUpdate::Appended;
+        }
+        self.reset();
+        for entry in entries() {
+            self.push(entry);
+        }
+        ProjectionUpdate::Rebuilt
+    }
+
+    /// Folds in the entries after the projected ones, or returns false without changing anything
+    /// when the entries already projected are not all still there, unchanged.
+    fn append_new_entries<'a>(&mut self, entries: impl Iterator<Item = &'a TimelineEntry>) -> bool {
+        let Some(last_entry) = &self.last_entry else {
+            return false;
+        };
+        let mut entries = entries.peekable();
+        if entries.peek().map(|entry| entry.sequence) != self.first_sequence {
+            return false;
+        }
+        let mut kept = 0;
+        let mut new_entries = Vec::new();
+        for entry in entries {
+            if entry.sequence <= last_entry.sequence {
+                kept += 1;
+                if entry.sequence == last_entry.sequence && entry != last_entry {
+                    return false;
+                }
+            } else {
+                new_entries.push(entry);
+            }
+        }
+        // Projected history entries replace the live chunks they cover, which may already be
+        // folded into the items.
+        if kept != self.entry_count
+            || new_entries.is_empty()
+            || new_entries
+                .iter()
+                .any(|entry| entry.extra.get("sourceSeqRanges").is_some())
+        {
+            return false;
+        }
+        for entry in new_entries {
+            self.push(entry);
+        }
+        true
+    }
+
+    fn reset(&mut self) {
+        let synced = self.synced.take();
+        let synced_rewrite = self.synced_rewrite;
+        *self = Self {
+            synced,
+            synced_rewrite,
+            ..Self::default()
+        };
+    }
+
+    fn push(&mut self, entry: &TimelineEntry) {
+        self.first_sequence.get_or_insert(entry.sequence);
+        self.entry_count += 1;
+        self.last_entry = Some(entry.clone());
         let value = item_value(entry);
         let Some(content) = content_of(value) else {
-            continue;
+            return;
         };
         let timestamp = parse_timestamp(&entry.timestamp);
         let message_id = string_field(value, "messageId");
-        let adjacent =
-            extends_last && last_sequence_end.is_some_and(|end| entry.sequence == end + 1);
-        last_sequence_end = Some(
+        let adjacent = self.extends_last
+            && self
+                .last_sequence_end
+                .is_some_and(|end| entry.sequence == end + 1);
+        self.last_sequence_end = Some(
             entry
                 .extra
                 .get("seqEnd")
                 .and_then(Value::as_u64)
                 .unwrap_or(entry.sequence),
         );
-        if let Some(last) = items.last_mut() {
+        if let Some(last) = self.items.last_mut() {
             let same_message = adjacent
-                && match (&last_message_id, &message_id) {
+                && match (&self.last_message_id, &message_id) {
                     (Some(previous), Some(current)) => previous == current,
                     _ => true,
                 };
-            let appended = match (&mut last.content, &content) {
-                (StreamContent::Assistant { text }, StreamContent::Assistant { text: delta })
-                | (StreamContent::Reasoning { text }, StreamContent::Reasoning { text: delta })
-                    if same_message =>
+            let appends = same_message
+                && matches!(
+                    (&last.content, &content),
+                    (
+                        StreamContent::Assistant { .. },
+                        StreamContent::Assistant { .. }
+                    ) | (
+                        StreamContent::Reasoning { .. },
+                        StreamContent::Reasoning { .. }
+                    )
+                );
+            if appends {
+                let last = Rc::make_mut(last);
+                if let (
+                    StreamContent::Assistant { text } | StreamContent::Reasoning { text },
+                    StreamContent::Assistant { text: delta }
+                    | StreamContent::Reasoning { text: delta },
+                ) = (&mut last.content, &content)
                 {
                     text.push_str(delta);
-                    true
                 }
-                _ => false,
-            };
-            if appended {
                 last.last_timestamp = timestamp.or(last.last_timestamp);
                 if message_id.is_some() {
-                    last_message_id = message_id;
+                    self.last_message_id = message_id;
                 }
-                continue;
+                return;
             }
         }
-        extends_last = matches!(
+        self.extends_last = matches!(
             content,
             StreamContent::Assistant { .. } | StreamContent::Reasoning { .. }
         );
         if let StreamContent::Tool(call) = &content
             && !call.call_id.is_empty()
-            && let Some(&index) = tool_indices.get(&call.call_id)
-            && let Some(existing) = items.get_mut(index)
+            && let Some(&index) = self.tool_indices.get(&call.call_id)
+            && let Some(existing) = self.items.get_mut(index)
         {
-            existing.content = content;
-            existing.last_timestamp = timestamp.or(existing.last_timestamp);
-            continue;
+            *existing = Rc::new(StreamItem {
+                key: existing.key,
+                timestamp: existing.timestamp,
+                last_timestamp: timestamp.or(existing.last_timestamp),
+                content,
+            });
+            return;
         }
         if let StreamContent::Tool(call) = &content
             && !call.call_id.is_empty()
         {
-            tool_indices.insert(call.call_id.clone(), items.len());
+            self.tool_indices
+                .insert(call.call_id.clone(), self.items.len());
         }
-        last_message_id = message_id;
-        items.push(StreamItem {
+        self.last_message_id = message_id;
+        self.items.push(Rc::new(StreamItem {
             key: entry.sequence,
             timestamp,
             last_timestamp: timestamp,
             content,
-        });
+        }));
     }
-    items
 }
 
 /// A user prompt and everything the agent produced in response to it.
@@ -258,14 +405,16 @@ pub struct Turn {
     pub ended_at: Option<DateTime<Utc>>,
 }
 
-pub fn group_turns(items: &[StreamItem]) -> Vec<Turn> {
+pub fn group_turns<Item: Borrow<StreamItem>>(items: &[Item]) -> Vec<Turn> {
     let mut turns: Vec<Turn> = Vec::new();
     for (index, item) in items.iter().enumerate() {
+        let item: &StreamItem = item.borrow();
         let starts_turn = matches!(item.content, StreamContent::User { .. })
             && !matches!(
                 index
                     .checked_sub(1)
-                    .and_then(|previous| items.get(previous)),
+                    .and_then(|previous| items.get(previous))
+                    .map(|previous| -> &StreamItem { previous.borrow() }),
                 Some(StreamItem {
                     content: StreamContent::User { .. },
                     ..
@@ -293,12 +442,15 @@ pub fn latest_finished_turn(turn_count: usize, running: bool) -> Option<usize> {
 }
 
 /// Copyable text of a turn's agent output: the assistant messages joined by blank lines.
-pub fn turn_text(items: &[StreamItem]) -> String {
+pub fn turn_text<Item: Borrow<StreamItem>>(items: &[Item]) -> String {
     items
         .iter()
-        .filter_map(|item| match &item.content {
-            StreamContent::Assistant { text } => Some(text.trim()),
-            _ => None,
+        .filter_map(|item| {
+            let item: &StreamItem = item.borrow();
+            match &item.content {
+                StreamContent::Assistant { text } => Some(text.trim()),
+                _ => None,
+            }
         })
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
@@ -377,7 +529,7 @@ pub enum ToolKind {
     Other,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolDisplay {
     pub kind: ToolKind,
     pub label: String,
@@ -471,6 +623,23 @@ fn humanize(name: &str) -> String {
     }
 }
 
+/// What kind of tool a call is, without building its label and summary.
+pub fn tool_kind(call: &ToolCall) -> ToolKind {
+    match call.detail.get("type").and_then(Value::as_str) {
+        Some("shell" | "worktree_setup") => ToolKind::Shell,
+        Some("read") => ToolKind::Read,
+        Some("edit") => ToolKind::Edit,
+        Some("write") => ToolKind::Write,
+        Some("search") => ToolKind::Search,
+        Some("fetch") => ToolKind::Fetch,
+        Some("sub_agent") => ToolKind::SubAgent,
+        Some("plan") => ToolKind::Plan,
+        Some("plain_text") => ToolKind::Other,
+        _ if call.name == "thinking" => ToolKind::Thinking,
+        _ => ToolKind::Other,
+    }
+}
+
 pub fn tool_display(call: &ToolCall, cwd: Option<&Path>) -> ToolDisplay {
     let detail = &call.detail;
     let field = |key: &str| {
@@ -481,34 +650,25 @@ pub fn tool_display(call: &ToolCall, cwd: Option<&Path>) -> ToolDisplay {
             .filter(|text| !text.trim().is_empty())
     };
     let path = || field("filePath").map(|path| relative_path(&path, cwd));
-    let (kind, label, summary) = match detail.get("type").and_then(Value::as_str) {
-        Some("shell") => (ToolKind::Shell, "Shell".into(), field("command")),
-        Some("read") => (ToolKind::Read, "Read".into(), path()),
-        Some("edit") => (ToolKind::Edit, "Edit".into(), path()),
-        Some("write") => (ToolKind::Write, "Write".into(), path()),
-        Some("search") => (ToolKind::Search, "Search".into(), field("query")),
-        Some("fetch") => (ToolKind::Fetch, "Fetch".into(), field("url")),
-        Some("worktree_setup") => (
-            ToolKind::Shell,
-            "Worktree setup".into(),
-            field("branchName"),
-        ),
+    let (label, summary) = match detail.get("type").and_then(Value::as_str) {
+        Some("shell") => ("Shell".into(), field("command")),
+        Some("read") => ("Read".into(), path()),
+        Some("edit") => ("Edit".into(), path()),
+        Some("write") => ("Write".into(), path()),
+        Some("search") => ("Search".into(), field("query")),
+        Some("fetch") => ("Fetch".into(), field("url")),
+        Some("worktree_setup") => ("Worktree setup".into(), field("branchName")),
         Some("sub_agent") => (
-            ToolKind::SubAgent,
             field("subAgentType").unwrap_or_else(|| "Task".into()),
             field("description"),
         ),
-        Some("plan") => (ToolKind::Plan, "Plan".into(), None),
-        Some("plain_text") => (
-            ToolKind::Other,
-            field("label").unwrap_or_else(|| humanize(&call.name)),
-            None,
-        ),
-        _ if call.name == "thinking" => (ToolKind::Thinking, "Thinking".into(), None),
-        _ => (ToolKind::Other, humanize(&call.name), None),
+        Some("plan") => ("Plan".into(), None),
+        Some("plain_text") => (field("label").unwrap_or_else(|| humanize(&call.name)), None),
+        _ if call.name == "thinking" => ("Thinking".into(), None),
+        _ => (humanize(&call.name), None),
     };
     ToolDisplay {
-        kind,
+        kind: tool_kind(call),
         label,
         summary: summary.map(|summary| summary.lines().next().unwrap_or_default().to_owned()),
     }
@@ -524,21 +684,22 @@ pub enum Segment {
 /// Whether a tool call joins a group. Plans and thinking read as prose, so Paseo keeps them out.
 fn is_groupable_tool(item: &StreamItem) -> bool {
     match &item.content {
-        StreamContent::Tool(call) => !matches!(
-            tool_display(call, None).kind,
-            ToolKind::Plan | ToolKind::Thinking
-        ),
+        StreamContent::Tool(call) => {
+            !matches!(tool_kind(call), ToolKind::Plan | ToolKind::Thinking)
+        }
         _ => false,
     }
 }
 
 /// Splits `range` of `items` into segments, grouping every unbroken run of tool calls, as
 /// Paseo's overview does. Any other item ends a run.
-pub fn tool_runs(items: &[StreamItem], range: Range<usize>) -> Vec<Segment> {
+pub fn tool_runs<Item: Borrow<StreamItem>>(items: &[Item], range: Range<usize>) -> Vec<Segment> {
     let mut segments = Vec::new();
     let mut run_start = None;
     for index in range.clone() {
-        let groupable = items.get(index).is_some_and(is_groupable_tool);
+        let groupable = items
+            .get(index)
+            .is_some_and(|item| is_groupable_tool(item.borrow()));
         match (groupable, run_start) {
             (true, None) => run_start = Some(index),
             (true, Some(_)) => {}
@@ -564,7 +725,7 @@ pub fn tool_group_label<'a>(calls: impl IntoIterator<Item = &'a ToolCall>) -> St
     let (mut commands, mut searches, mut other) = (0, 0, 0);
     for call in calls {
         let path = call.detail.get("filePath").and_then(Value::as_str);
-        match tool_display(call, None).kind {
+        match tool_kind(call) {
             ToolKind::Edit | ToolKind::Write => {
                 edited.insert(path.unwrap_or(&call.call_id).to_owned());
             }
@@ -669,7 +830,7 @@ pub fn edit_diff_lines(detail: &Value) -> Vec<(DiffLineKind, String)> {
 }
 
 /// A file the agent edited during a turn, with the edits' combined diff lines.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileChange {
     pub path: String,
     pub additions: usize,
@@ -679,9 +840,10 @@ pub struct FileChange {
 
 /// Files changed by a turn's completed edit and write tool calls, in first-edit order. Paseo keeps
 /// no per-turn git checkpoints, so the tool calls are the record of what the turn changed.
-pub fn turn_changes(items: &[StreamItem]) -> Vec<FileChange> {
+pub fn turn_changes<Item: Borrow<StreamItem>>(items: &[Item]) -> Vec<FileChange> {
     let mut changes: Vec<FileChange> = Vec::new();
     for item in items {
+        let item: &StreamItem = item.borrow();
         let StreamContent::Tool(call) = &item.content else {
             continue;
         };
@@ -1131,6 +1293,131 @@ mod tests {
             }
         );
         assert_eq!(items[2].key, 4);
+    }
+
+    fn projected(projection: &TimelineProjection) -> Vec<StreamItem> {
+        projection
+            .items()
+            .iter()
+            .map(|item| StreamItem::clone(item))
+            .collect()
+    }
+
+    #[test]
+    fn incremental_projection_matches_projecting_everything() {
+        let chunks = vec![
+            entry(1, json!({"type":"user_message","text":"Fix it"})),
+            entry(2, json!({"type":"reasoning","text":"Let me "})),
+            entry(3, json!({"type":"reasoning","text":"think"})),
+            entry(
+                4,
+                json!({"type":"tool_call","callId":"c1","name":"shell","status":"running","detail":{"type":"shell","command":"ls"},"error":null}),
+            ),
+            entry(5, json!({"type":"assistant_message","text":"Done "})),
+            entry(
+                6,
+                json!({"type":"tool_call","callId":"c1","name":"shell","status":"completed","detail":{"type":"shell","command":"ls","output":"a"},"error":null}),
+            ),
+            entry(7, json!({"type":"assistant_message","text":"now"})),
+            entry(8, json!({"type":"assistant_message","text":"."})),
+        ];
+        let mut projection = TimelineProjection::default();
+        let mut entries = Vec::new();
+        let mut revision = 0;
+        for chunk in chunks {
+            entries.push(chunk);
+            revision += 1;
+            let update = projection.sync(Some("epoch"), revision, 0, || entries.iter());
+            assert_eq!(projected(&projection), project_items(&entries));
+            let expected = if entries.len() == 1 {
+                ProjectionUpdate::Rebuilt
+            } else {
+                ProjectionUpdate::Appended
+            };
+            assert_eq!(update, expected, "after {} entries", entries.len());
+        }
+        assert_eq!(
+            projection.sync(Some("epoch"), revision, 0, || entries.iter()),
+            ProjectionUpdate::Unchanged
+        );
+
+        let shared = projection.items().first().cloned();
+        revision += 1;
+        entries.push(entry(9, json!({"type":"user_message","text":"Again"})));
+        projection.sync(Some("epoch"), revision, 0, || entries.iter());
+        assert!(
+            shared
+                .zip(projection.items().first())
+                .is_some_and(|(before, after)| Rc::ptr_eq(&before, after)),
+            "appending keeps the items it didn't touch"
+        );
+
+        // A refetched tail replaces the newest entry in place, under the same sequence.
+        revision += 1;
+        if let Some(last) = entries.last_mut() {
+            *last = entry(
+                9,
+                json!({"type":"user_message","text":"Again, differently"}),
+            );
+        }
+        assert_eq!(
+            projection.sync(Some("epoch"), revision, 0, || entries.iter()),
+            ProjectionUpdate::Rebuilt
+        );
+        assert_eq!(projected(&projection), project_items(&entries));
+
+        // An older page loads above the projected entries.
+        revision += 1;
+        entries.insert(
+            0,
+            entry(0, json!({"type":"assistant_message","text":"Earlier"})),
+        );
+        entries.push(entry(
+            10,
+            json!({"type":"assistant_message","text":"Later"}),
+        ));
+        assert_eq!(
+            projection.sync(Some("epoch"), revision, 0, || entries.iter()),
+            ProjectionUpdate::Rebuilt
+        );
+        assert_eq!(projected(&projection), project_items(&entries));
+
+        // A history page covering live chunks replaces them.
+        revision += 1;
+        let mut page_entry = entry(11, json!({"type":"assistant_message","text":"Paged"}));
+        page_entry.extra = json!({"sourceSeqRanges": [[11, 11]]});
+        entries.push(page_entry);
+        assert_eq!(
+            projection.sync(Some("epoch"), revision, 0, || entries.iter()),
+            ProjectionUpdate::Rebuilt
+        );
+        assert_eq!(projected(&projection), project_items(&entries));
+
+        // An older entry replaced in place in the same update as a new tail entry: only the
+        // store's rewrite mark tells the two apart from a plain append.
+        revision += 1;
+        if let Some(first) = entries.first_mut() {
+            *first = entry(
+                0,
+                json!({"type":"assistant_message","text":"Earlier, edited"}),
+            );
+        }
+        entries.push(entry(
+            12,
+            json!({"type":"assistant_message","text":" More"}),
+        ));
+        assert_eq!(
+            projection.sync(Some("epoch"), revision, 1, || entries.iter()),
+            ProjectionUpdate::Rebuilt
+        );
+        assert_eq!(projected(&projection), project_items(&entries));
+
+        revision += 1;
+        assert_eq!(
+            projection.sync(Some("next"), revision, 1, || entries.iter()),
+            ProjectionUpdate::Rebuilt,
+            "a new epoch starts over"
+        );
     }
 
     #[test]

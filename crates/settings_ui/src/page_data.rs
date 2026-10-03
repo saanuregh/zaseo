@@ -7908,7 +7908,7 @@ fn paseo_page() -> SettingsPage {
             }),
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Font Size",
-                description: "Font size of the chat. Zooming the editor zooms it too. Falls back to the UI font size.",
+                description: "Font size of the chat. Zooming the editor zooms it too. Falls back to Zed's label size, seven eighths of the UI font size.",
                 field: Box::new(SettingField {
                     organization_override: None,
                     json_path: Some("paseo.chat.font_size"),

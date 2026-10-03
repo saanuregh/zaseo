@@ -20,6 +20,7 @@ pub use transport::ssh::{SshConnectionOptions, SshPortForwardOption};
 pub use transport::wsl::WslConnectionOptions;
 #[cfg(target_os = "windows")]
 pub use transport::wsl::wsl_path_to_windows_path;
+pub use transport::{UPSTREAM_REMOTE_SERVER_TAG, upstream_remote_server_url};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use transport::mock::{

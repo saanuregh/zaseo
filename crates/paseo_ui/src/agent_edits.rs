@@ -23,7 +23,6 @@ use serde_json::Value;
 use ui::{Button, IconButton, KeyBinding, Tooltip, prelude::*};
 use workspace::{ItemHandle, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView, Workspace};
 
-use crate::store;
 use crate::store::{PaseoStore, StoreEvent, agent_project_directory};
 use crate::timeline::{FileEdit, StreamContent, ToolStatus, project_items, reverse_edits_tracking};
 
@@ -78,60 +77,124 @@ fn edit_key(agent_id: &str, epoch: &str, item_key: u64, index: usize) -> String 
 /// The unreviewed edits of one file from every agent, oldest first.
 type FileEdits = Vec<(String, FileEdit)>;
 
+/// A file's text, the text before its edits, and where each edit sits in the text.
+struct Located {
+    text: String,
+    base: String,
+    located: Vec<(String, Range<usize>)>,
+}
+
+/// One edit a completed edit tool call made, keyed for review.
+#[derive(Clone)]
+struct ToolEdit {
+    path: PathBuf,
+    timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    key: String,
+    edit: FileEdit,
+}
+
+/// An agent's tool edits with the timeline state they were read from, so a refresh re-projects
+/// only the timelines that changed since.
+struct AgentToolEdits {
+    epoch: String,
+    revision: u64,
+    directory: Option<PathBuf>,
+    edits: Vec<ToolEdit>,
+}
+
+/// Completed edit tool calls in an agent's timeline, by absolute path.
+fn agent_tool_edits(
+    store: &PaseoStore,
+    agent_id: &str,
+    epoch: &str,
+    directory: Option<&Path>,
+) -> Vec<ToolEdit> {
+    let mut tool_edits = Vec::new();
+    for item in project_items(store.entries_for(agent_id)) {
+        let StreamContent::Tool(call) = &item.content else {
+            continue;
+        };
+        if call.status != ToolStatus::Completed {
+            continue;
+        }
+        let Some(path) = call
+            .detail
+            .get("filePath")
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+        else {
+            continue;
+        };
+        let path = Path::new(path);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            match directory {
+                Some(directory) => directory.join(path),
+                None => continue,
+            }
+        };
+        let Some(edits) = crate::timeline::tool_call_edits(&call.detail) else {
+            continue;
+        };
+        for (index, edit) in edits.into_iter().enumerate() {
+            // What a whole-file write replaced is unknown: showing it would mark the whole
+            // file as new, and rejecting it would empty the file.
+            if edit.whole_file {
+                continue;
+            }
+            tool_edits.push(ToolEdit {
+                path: path.clone(),
+                timestamp: item.timestamp,
+                key: edit_key(agent_id, epoch, item.key, index),
+                edit,
+            });
+        }
+    }
+    tool_edits
+}
+
 /// Completed edit and write tool calls from `agents`, by absolute path, leaving out edits the user
-/// already kept or rejected.
+/// already kept or rejected. `cache` keeps each agent's edits until its timeline changes.
 fn unreviewed_edits(
     store: &PaseoStore,
     agents: &[(String, Option<PathBuf>)],
+    cache: &mut HashMap<String, AgentToolEdits>,
 ) -> BTreeMap<PathBuf, FileEdits> {
     let mut files: BTreeMap<
         PathBuf,
         Vec<(Option<chrono::DateTime<chrono::Utc>>, String, FileEdit)>,
     > = BTreeMap::new();
+    cache.retain(|agent_id, _| agents.iter().any(|(listed, _)| listed == agent_id));
     for (agent_id, directory) in agents {
         let epoch = store.state.current_epoch(agent_id).unwrap_or_default();
-        for item in project_items(store.entries_for(agent_id)) {
-            let StreamContent::Tool(call) = &item.content else {
-                continue;
-            };
-            if call.status != ToolStatus::Completed {
+        let revision = store.state.timeline_revision(agent_id);
+        let current = cache.get(agent_id).is_some_and(|cached| {
+            cached.epoch == epoch && cached.revision == revision && cached.directory == *directory
+        });
+        if !current {
+            cache.insert(
+                agent_id.clone(),
+                AgentToolEdits {
+                    epoch: epoch.to_owned(),
+                    revision,
+                    directory: directory.clone(),
+                    edits: agent_tool_edits(store, agent_id, epoch, directory.as_deref()),
+                },
+            );
+        }
+        let Some(cached) = cache.get(agent_id) else {
+            continue;
+        };
+        for tool_edit in &cached.edits {
+            if store.reviewed_edits.contains(&tool_edit.key) {
                 continue;
             }
-            let Some(path) = call
-                .detail
-                .get("filePath")
-                .and_then(Value::as_str)
-                .filter(|path| !path.is_empty())
-            else {
-                continue;
-            };
-            let path = Path::new(path);
-            let path = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                match directory {
-                    Some(directory) => directory.join(path),
-                    None => continue,
-                }
-            };
-            let Some(edits) = crate::timeline::tool_call_edits(&call.detail) else {
-                continue;
-            };
-            for (index, edit) in edits.into_iter().enumerate() {
-                // What a whole-file write replaced is unknown: showing it would mark the whole
-                // file as new, and rejecting it would empty the file.
-                if edit.whole_file {
-                    continue;
-                }
-                let key = edit_key(agent_id, epoch, item.key, index);
-                if store.reviewed_edits.contains(&key) {
-                    continue;
-                }
-                files
-                    .entry(path.clone())
-                    .or_default()
-                    .push((item.timestamp, key, edit));
-            }
+            files.entry(tool_edit.path.clone()).or_default().push((
+                tool_edit.timestamp,
+                tool_edit.key.clone(),
+                tool_edit.edit.clone(),
+            ));
         }
     }
     files
@@ -204,9 +267,17 @@ struct TrackedFile {
     has_hunks: bool,
     /// The base and buffer version of the last diff update, to skip repeating it.
     applied: Option<(Arc<str>, clock::Global)>,
+    /// The edits and buffer version the last update located, to skip copying and reversing
+    /// the text again when neither changed.
+    located_from: Option<(FileEdits, clock::Global)>,
     /// The latest diff update; each one waits for the one before, because a diff can't take a
     /// new base while computing another.
     diff_update: Task<()>,
+    /// The run locating the edits in the background. Runs take turns, because each one finds
+    /// lost edits by comparing with where the one before located them.
+    locating: Option<Task<()>>,
+    /// The edits of a refresh that came during a run, located when it finishes.
+    queued: Option<FileEdits>,
     _buffer_subscription: Subscription,
 }
 
@@ -226,6 +297,7 @@ pub(crate) struct AgentEdits {
     opening: HashSet<PathBuf>,
     watched: HashSet<String>,
     editors: HashMap<EntityId, AttachedEditor>,
+    tool_edits: HashMap<String, AgentToolEdits>,
     /// Set while a refresh waits to run: streaming agents and typing send events faster than the
     /// delay, so new ones join the waiting refresh instead of pushing it back.
     refresh_task: Option<Task<()>>,
@@ -239,7 +311,7 @@ impl AgentEdits {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let store = store(cx);
+        let store = crate::hosts::local_store(cx);
         let subscriptions = vec![
             cx.observe(&store, |this, _, cx| this.schedule_refresh(cx)),
             cx.subscribe(&store, |this, _, event: &StoreEvent, cx| {
@@ -275,6 +347,7 @@ impl AgentEdits {
             opening: HashSet::new(),
             watched: HashSet::new(),
             editors: HashMap::new(),
+            tool_edits: HashMap::new(),
             refresh_task: None,
             _subscriptions: subscriptions,
         };
@@ -311,7 +384,7 @@ impl AgentEdits {
             .collect::<Vec<_>>();
         store
             .state
-            .agents
+            .agents()
             .iter()
             .filter(|agent| {
                 agent_project_directory(agent)
@@ -344,7 +417,7 @@ impl AgentEdits {
             });
             self.watched = agent_ids;
         }
-        let edits = unreviewed_edits(self.store.read(cx), &agents);
+        let edits = unreviewed_edits(self.store.read(cx), &agents, &mut self.tool_edits);
         let stale = self
             .files
             .keys()
@@ -416,7 +489,10 @@ impl AgentEdits {
                         located: Vec::new(),
                         has_hunks: false,
                         applied: None,
+                        located_from: None,
                         diff_update: Task::ready(()),
+                        locating: None,
+                        queued: None,
                         _buffer_subscription: subscription,
                     },
                 );
@@ -427,22 +503,82 @@ impl AgentEdits {
         .detach_and_log_err(cx);
     }
 
-    /// Rebuilds the text before the file's unreviewed edits and diffs the buffer against it.
+    /// Rebuilds the text before the file's unreviewed edits and diffs the buffer against it. The
+    /// text is copied and reversed in the background.
     fn update_file(&mut self, path: &Path, edits: &FileEdits, cx: &mut Context<Self>) {
         let Some(file) = self.files.get_mut(path) else {
             return;
         };
-        let snapshot = file.buffer.read(cx).text_snapshot();
-        let text = snapshot.text();
-        let (base, located) = reverse_edits_tracking(&text, edits);
-        let lost = lost_edits(&file.located, &located, edits, &snapshot);
-        if !lost.is_empty() {
-            // An edit that vanished or moved was undone or rewritten; left in, it could later
-            // match identical text elsewhere and be rejected there.
-            self.store
-                .update(cx, |store, cx| store.mark_edits_reviewed(lost, cx));
+        if file.locating.is_some() {
+            file.queued = Some(edits.clone());
             return;
         }
+        let version = file.buffer.read(cx).version();
+        if file
+            .located_from
+            .as_ref()
+            .is_some_and(|(located_edits, located_version)| {
+                located_edits == edits && *located_version == version
+            })
+        {
+            return;
+        }
+        let snapshot = file.buffer.read(cx).text_snapshot();
+        let location = cx.background_spawn({
+            let snapshot = snapshot.clone();
+            let edits = edits.clone();
+            async move {
+                let text = snapshot.text();
+                let (base, located) = reverse_edits_tracking(&text, &edits);
+                Located {
+                    text,
+                    base,
+                    located,
+                }
+            }
+        });
+        let path = path.to_path_buf();
+        let edits = edits.clone();
+        file.locating = Some(cx.spawn(async move |this, cx| {
+            let location = location.await;
+            if let Err(error) = this.update(cx, |this, cx| {
+                this.apply_location(&path, edits, snapshot, location, cx)
+            }) {
+                log::debug!("Paseo agent edits released: {error}");
+            }
+        }));
+    }
+
+    fn apply_location(
+        &mut self,
+        path: &Path,
+        edits: FileEdits,
+        snapshot: text::BufferSnapshot,
+        location: Located,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(file) = self.files.get_mut(path) else {
+            return;
+        };
+        file.locating = None;
+        let Located {
+            text,
+            base,
+            located,
+        } = location;
+        let lost = lost_edits(&file.located, &located, &edits, &snapshot);
+        if !lost.is_empty() {
+            // An edit that vanished or moved was undone or rewritten; left in, it could later
+            // match identical text elsewhere and be rejected there. The queued edits may still
+            // list it, so a refresh takes their place; the run's edits may be out of date and
+            // already reviewed, in which case reviewing them again won't refresh.
+            file.queued = None;
+            self.store
+                .update(cx, |store, cx| store.mark_edits_reviewed(lost, cx));
+            self.schedule_refresh(cx);
+            return;
+        }
+        file.located_from = Some((edits, snapshot.version().clone()));
         file.located = located
             .into_iter()
             .map(|(key, range)| {
@@ -474,8 +610,12 @@ impl AgentEdits {
                 update.await;
             });
         }
+        let queued = file.queued.take();
         if changed {
             self.sync_editors(cx);
+        }
+        if let Some(queued) = queued {
+            self.update_file(path, &queued, cx);
         }
     }
 
@@ -726,6 +866,33 @@ fn review_at_cursor(
     }
 }
 
+/// Refreshes the agent edits `editor` shows now, without the refresh delay.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_refresh_agent_edits(editor: &Entity<Editor>, cx: &mut App) {
+    let tracker = editor
+        .read(cx)
+        .addon::<AgentEditsAddon>()
+        .and_then(|addon| addon.tracker.upgrade())
+        .expect("the editor shows agent edits");
+    tracker.update(cx, |tracker, cx| tracker.refresh(cx));
+}
+
+/// Whether the edits of some file are being located now.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_locating_agent_edits(editor: &Entity<Editor>, cx: &App) -> bool {
+    editor
+        .read(cx)
+        .addon::<AgentEditsAddon>()
+        .and_then(|addon| addon.tracker.upgrade())
+        .is_some_and(|tracker| {
+            tracker
+                .read(cx)
+                .files
+                .values()
+                .any(|file| file.locating.is_some())
+        })
+}
+
 /// Marks an editor showing agent edits, for the Keep and Reject key bindings and the toolbar.
 struct AgentEditsAddon {
     tracker: WeakEntity<AgentEdits>,
@@ -967,7 +1134,7 @@ mod tests {
             ("first".to_owned(), Some(PathBuf::from("/repo"))),
             ("second".to_owned(), Some(PathBuf::from("/repo"))),
         ];
-        let files = unreviewed_edits(&store, &agents);
+        let files = unreviewed_edits(&store, &agents, &mut HashMap::new());
         let edits = &files[Path::new("/repo/src/main.rs")];
         assert_eq!(
             edits
@@ -979,7 +1146,7 @@ mod tests {
         );
 
         store.reviewed_edits.insert(edits[0].0.clone());
-        let files = unreviewed_edits(&store, &agents);
+        let files = unreviewed_edits(&store, &agents, &mut HashMap::new());
         assert_eq!(
             files[Path::new("/repo/src/main.rs")]
                 .iter()
@@ -988,6 +1155,53 @@ mod tests {
             ["B"],
             "a kept edit stays out"
         );
+    }
+
+    #[test]
+    fn cached_edits_follow_timeline_changes_and_reviews() {
+        let mut store = PaseoStore::default();
+        store
+            .state
+            .insert_entry(edit_entry("agent", 1, "2026-09-28T10:00:00Z", "a", "A"));
+        let agents = [("agent".to_owned(), Some(PathBuf::from("/repo")))];
+        let mut cache = HashMap::new();
+        let new_texts = |files: &BTreeMap<PathBuf, FileEdits>| {
+            files
+                .get(Path::new("/repo/src/main.rs"))
+                .into_iter()
+                .flatten()
+                .map(|(_, edit)| edit.new_text.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            new_texts(&unreviewed_edits(&store, &agents, &mut cache)),
+            ["A"]
+        );
+
+        store
+            .state
+            .insert_entry(edit_entry("agent", 2, "2026-09-28T10:01:00Z", "b", "B"));
+        let files = unreviewed_edits(&store, &agents, &mut cache);
+        assert_eq!(
+            new_texts(&files),
+            ["A", "B"],
+            "a changed timeline is read again"
+        );
+
+        if let Some((key, _)) = files
+            .get(Path::new("/repo/src/main.rs"))
+            .and_then(|edits| edits.first())
+        {
+            store.reviewed_edits.insert(key.clone());
+        }
+        assert_eq!(
+            new_texts(&unreviewed_edits(&store, &agents, &mut cache)),
+            ["B"],
+            "reviews apply to cached edits"
+        );
+
+        assert!(unreviewed_edits(&store, &[], &mut cache).is_empty());
+        assert!(cache.is_empty(), "agents no longer listed are forgotten");
     }
 
     #[test]
@@ -1006,6 +1220,7 @@ mod tests {
         let files = unreviewed_edits(
             &store,
             &[("agent".to_owned(), Some(PathBuf::from("/repo")))],
+            &mut HashMap::new(),
         );
         assert!(
             files.is_empty(),

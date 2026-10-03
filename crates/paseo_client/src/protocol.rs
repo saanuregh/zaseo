@@ -1,11 +1,11 @@
 use crate::{
-    AgentCommand, AgentFeature, AgentFeatureKind, AgentFeatureOption, AgentSummary, BranchSuggestion, CheckoutDiff, CheckoutStatus, DaemonStatus,
-    DaemonUpdate, DiffFile, DiffHunk, DiffLine, DiffLineKind, DiffStat, DirectorySuggestion,
-    FileContent, PaseoWorktree, PermissionRequest, ProjectDescriptor, Provider,
-    ProviderAvailability, ProviderSubagent, ProviderUsage, RecoveryState, RelayStatus,
-    SetupSnapshot, TerminalInfo, TimelineCursor, TimelineEntry, TimelinePage, TimelinePayload,
-    UploadedFile, UsageBalance, UsageDetail, UsageWindow, WorkspaceDescriptor, WorkspaceLabel,
-    WorkspaceScript, subagent_timeline_id,
+    AgentCommand, AgentFeature, AgentFeatureKind, AgentFeatureOption, AgentSummary,
+    BranchSuggestion, CheckoutDiff, CheckoutStatus, DaemonStatus, DaemonUpdate, DiffFile, DiffHunk,
+    DiffLine, DiffLineKind, DiffStat, DirectorySuggestion, FileContent, PaseoWorktree,
+    PermissionRequest, ProjectDescriptor, Provider, ProviderAvailability, ProviderSubagent,
+    ProviderUsage, RecoveryState, RelayStatus, SetupSnapshot, TerminalInfo, TimelineCursor,
+    TimelineEntry, TimelinePage, TimelinePayload, UploadedFile, UsageBalance, UsageDetail,
+    UsageWindow, WorkspaceDescriptor, WorkspaceLabel, WorkspaceScript, subagent_timeline_id,
 };
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;
@@ -240,7 +240,7 @@ pub fn parse_timeline(payload: &Value) -> Result<Vec<TimelineEntry>> {
                 sequence,
                 timestamp: required_string(entry, "timestamp")?.to_owned(),
                 payload: body,
-                extra: entry.clone(),
+                extra: entry_extra(entry, "item"),
             })
         })
         .collect()
@@ -330,7 +330,7 @@ pub fn parse_subagent_timeline_page(payload: &Value) -> Result<TimelinePage> {
                 .get("item")
                 .context("missing subagent timeline item")?
                 .clone();
-            let mut extra = row.clone();
+            let mut extra = entry_extra(row, "item");
             // A merged row spans `seqStart` to `seq`; the store reads the span from `seqEnd`.
             if extra.get("seqEnd").is_none()
                 && let Some(end) = row.get("seq").cloned()
@@ -372,6 +372,20 @@ pub fn parse_subagent_timeline_page(payload: &Value) -> Result<TimelinePage> {
     })
 }
 
+/// A timeline row without the field holding its item, which the entry keeps as its payload.
+pub(crate) fn entry_extra(row: &Value, item_key: &str) -> Value {
+    match row.as_object() {
+        Some(fields) => Value::Object(
+            fields
+                .iter()
+                .filter(|(key, _)| key.as_str() != item_key)
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
+        None => row.clone(),
+    }
+}
+
 pub(crate) fn timeline_payload(item: Value) -> TimelinePayload {
     match item.get("type").and_then(Value::as_str).unwrap_or("") {
         "user_message" | "assistant_message" | "reasoning" => TimelinePayload::Message(item),
@@ -385,13 +399,36 @@ pub fn parse_permission(payload: &Value) -> Result<PermissionRequest> {
     let request = payload
         .get("request")
         .context("missing permission request")?;
+    permission_request(required_string(payload, "agentId")?, request, None)
+}
+
+/// The permission requests an agent's snapshot lists as pending. A snapshot may leave out a
+/// request's title, which a live request always has.
+pub fn pending_permissions(agent: &AgentSummary) -> impl Iterator<Item = PermissionRequest> + '_ {
+    agent
+        .extra
+        .get("pendingPermissions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|request| {
+            permission_request(&agent.id, request, Some("Permission Required")).ok()
+        })
+}
+
+fn permission_request(
+    agent_id: &str,
+    request: &Value,
+    default_title: Option<&str>,
+) -> Result<PermissionRequest> {
     Ok(PermissionRequest {
-        agent_id: required_string(payload, "agentId")?.to_owned(),
+        agent_id: agent_id.to_owned(),
         request_id: required_string(request, "id")?.to_owned(),
         title: request
             .get("title")
             .and_then(Value::as_str)
             .or_else(|| request.get("name").and_then(Value::as_str))
+            .or(default_title)
             .context("missing permission title")?
             .to_owned(),
         description: request

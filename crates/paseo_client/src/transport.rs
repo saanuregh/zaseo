@@ -2,8 +2,9 @@ use crate::ConnectionTarget;
 use anyhow::{Context as _, Result, bail};
 use async_tungstenite::WebSocketStream;
 use async_tungstenite::tokio::{ConnectStream, TokioAdapter, client_async, connect_async};
+pub(crate) use async_tungstenite::tungstenite::Error as WebSocketError;
 use async_tungstenite::tungstenite::{
-    Error as WebSocketError, Message,
+    Message,
     handshake::client::{Request, Response},
 };
 use futures::StreamExt;
@@ -206,6 +207,25 @@ fn ssh_command(
     command
 }
 
+/// Names a WebSocket failure without its details. The connection errors above drop the details
+/// because a handshake error can echo the request, whose subprotocol header holds the password.
+pub(crate) fn websocket_error_kind(error: &WebSocketError) -> String {
+    match error {
+        WebSocketError::ConnectionClosed => "connection closed".into(),
+        WebSocketError::AlreadyClosed => "already closed".into(),
+        WebSocketError::Io(error) => format!("I/O error: {}", error.kind()),
+        WebSocketError::Tls(_) => "TLS error".into(),
+        WebSocketError::Capacity(_) => "message too large".into(),
+        WebSocketError::Protocol(_) => "protocol error".into(),
+        WebSocketError::WriteBufferFull(_) => "write buffer full".into(),
+        WebSocketError::Utf8(_) => "invalid UTF-8".into(),
+        WebSocketError::AttackAttempt => "attack attempt".into(),
+        WebSocketError::Url(_) => "invalid URL".into(),
+        WebSocketError::Http(response) => format!("HTTP status {}", response.status()),
+        WebSocketError::HttpFormat(_) => "invalid HTTP".into(),
+    }
+}
+
 pub(crate) async fn connect_socket(
     target: &ConnectionTarget,
     request: Request,
@@ -217,7 +237,13 @@ pub(crate) async fn connect_socket(
                 tokio::time::timeout(Duration::from_secs(15), connect_async(request))
                     .await
                     .context("Paseo WebSocket connection timed out")?
-                    .map_err(|_| anyhow::anyhow!("Paseo WebSocket connection failed"))?;
+                    .map_err(|error| {
+                        log::warn!(
+                            "Paseo WebSocket connection failed: {}",
+                            websocket_error_kind(&error)
+                        );
+                        anyhow::anyhow!("Paseo WebSocket connection failed")
+                    })?;
             Ok((Socket::Direct(stream), response))
         }
         ConnectionTarget::Ssh {
@@ -246,7 +272,13 @@ pub(crate) async fn connect_socket(
                 tokio::time::timeout(Duration::from_secs(15), client_async(request, stream))
                     .await
                     .context("Paseo SSH WebSocket handshake timed out")?
-                    .map_err(|_| anyhow::anyhow!("Paseo SSH WebSocket handshake failed"))?;
+                    .map_err(|error| {
+                        log::warn!(
+                            "Paseo SSH WebSocket handshake failed: {}",
+                            websocket_error_kind(&error)
+                        );
+                        anyhow::anyhow!("Paseo SSH WebSocket handshake failed")
+                    })?;
             Ok((
                 Socket::Ssh {
                     stream,

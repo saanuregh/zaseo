@@ -6,13 +6,16 @@ use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     Subscription, WeakEntity, Window, prelude::*,
 };
+use paseo_client::AgentSummary;
 use settings::Settings as _;
+use std::collections::HashSet;
 use ui::{IconButton, Indicator, PopoverMenu, Tooltip, prelude::*};
 use workspace::Workspace;
 
+use crate::sidebar::WorkspaceAgentCounts;
 use crate::store::{
-    AgentBucket, PaseoStore, agent_attention_since, agent_last_error, agent_project_name,
-    agent_requires_attention, agent_updated_at,
+    AgentBucket, PaseoStore, agent_attention_since, agent_bucket, agent_last_error,
+    agent_project_name, agent_requires_attention, agent_updated_at,
 };
 use crate::timeline::format_relative;
 
@@ -53,25 +56,48 @@ pub(crate) struct AttentionEntry {
     pub error: Option<String>,
 }
 
+/// Why an agent in `bucket` is in the inbox, if it is: a failure already seen stays out.
+fn attention_reason(agent: &AgentSummary, bucket: AgentBucket) -> Option<AttentionReason> {
+    match bucket {
+        AgentBucket::NeedsInput => Some(AttentionReason::NeedsInput),
+        AgentBucket::Failed if agent_requires_attention(agent) => Some(AttentionReason::Failed),
+        AgentBucket::Attention => Some(AttentionReason::Finished),
+        _ => None,
+    }
+}
+
+/// The agents with a permission request the store holds, which its snapshot may not list yet.
+/// Collected once so bucketing every agent doesn't scan every request per agent.
+pub(crate) fn pending_permission_agents(store: &PaseoStore) -> HashSet<&str> {
+    store
+        .state
+        .permissions
+        .values()
+        .map(|request| request.agent_id.as_str())
+        .collect()
+}
+
+/// Each of the store's agents with its bucket, as [`PaseoStore::bucket`] gives it.
+fn agent_buckets(store: &PaseoStore) -> impl Iterator<Item = (&AgentSummary, AgentBucket)> {
+    let pending = pending_permission_agents(store);
+    store.state.agents().iter().map(move |agent| {
+        let bucket = agent_bucket(agent, pending.contains(agent.id.as_str()));
+        (agent, bucket)
+    })
+}
+
 /// The agents that need the user: those waiting for input, then those that failed or finished
 /// and aren't read yet, most recent first within each by when the daemon says they started
 /// needing the user. A failure already seen stays out of the list.
 pub(crate) fn attention_entries(store: &PaseoStore) -> Vec<AttentionEntry> {
-    let mut entries = store
-        .state
-        .agents
-        .iter()
-        .filter_map(|agent| {
-            let reason = match store.bucket(agent) {
-                AgentBucket::NeedsInput => AttentionReason::NeedsInput,
-                AgentBucket::Failed if agent_requires_attention(agent) => AttentionReason::Failed,
-                AgentBucket::Attention => AttentionReason::Finished,
-                _ => return None,
-            };
+    let titles = WorkspaceAgentCounts::new(store.state.agents());
+    let mut entries = agent_buckets(store)
+        .filter_map(|(agent, bucket)| {
+            let reason = attention_reason(agent, bucket)?;
             Some(AttentionEntry {
                 agent_id: agent.id.clone(),
                 reason,
-                title: store.display_title(agent),
+                title: titles.display_title(&store.state.workspaces, agent),
                 project: agent_project_name(agent),
                 since: agent_attention_since(agent).or_else(|| agent_updated_at(agent)),
                 error: (reason == AttentionReason::Failed)
@@ -80,32 +106,94 @@ pub(crate) fn attention_entries(store: &PaseoStore) -> Vec<AttentionEntry> {
             })
         })
         .collect::<Vec<_>>();
-    entries.sort_by(|left, right| {
-        left.reason
-            .cmp(&right.reason)
-            .then_with(|| right.since.cmp(&left.since))
-    });
+    sort_entries(&mut entries);
     entries
+}
+
+fn sort_entries(entries: &mut [AttentionEntry]) {
+    entries.sort_by(compare_entries);
+}
+
+fn compare_entries(left: &AttentionEntry, right: &AttentionEntry) -> std::cmp::Ordering {
+    left.reason
+        .cmp(&right.reason)
+        .then_with(|| right.since.cmp(&left.since))
+}
+
+/// [`attention_entries`] across every host, each with its host, in the same order.
+pub(crate) fn all_attention_entries(cx: &App) -> Vec<(Entity<PaseoStore>, AttentionEntry)> {
+    let mut entries = crate::hosts::stores(cx)
+        .into_iter()
+        .flat_map(|store| {
+            attention_entries(store.read(cx))
+                .into_iter()
+                .map(move |entry| (store.clone(), entry))
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|(_, left), (_, right)| compare_entries(left, right));
+    entries
+}
+
+/// What the bell shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct AttentionSummary {
+    pub count: usize,
+    pub most_urgent: Option<AttentionReason>,
+}
+
+impl AttentionSummary {
+    fn add(&mut self, reason: AttentionReason) {
+        self.count += 1;
+        self.most_urgent = Some(self.most_urgent.map_or(reason, |most| most.min(reason)));
+    }
+}
+
+/// What the title bar and the bell show about every listed host. The host registry computes it
+/// once per host change and every view reads it from there, because those views re-render every
+/// frame while a spinner or a status pulse runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct HostActivity {
+    /// Agents whose bucket is [`AgentBucket::Running`]: working and not waiting on the user. An
+    /// agent whose turn runs while it waits for a permission counts as needing input instead.
+    pub running: usize,
+    pub attention: AttentionSummary,
+}
+
+impl HostActivity {
+    /// Counts from each agent's bucket alone, without building the inbox's titles.
+    pub(crate) fn of_stores<'a>(stores: impl IntoIterator<Item = &'a PaseoStore>) -> Self {
+        let mut activity = Self::default();
+        for store in stores {
+            for (agent, bucket) in agent_buckets(store) {
+                if bucket == AgentBucket::Running {
+                    activity.running += 1;
+                }
+                if let Some(reason) = attention_reason(agent, bucket) {
+                    activity.attention.add(reason);
+                }
+            }
+        }
+        activity
+    }
 }
 
 /// The bell that opens the list of agents that need the user, with their count in the most
 /// urgent one's colour.
 pub(crate) fn attention_bell(
     id: &'static str,
-    store: Entity<PaseoStore>,
     workspace: WeakEntity<Workspace>,
+    summary: AttentionSummary,
     cx: &App,
 ) -> AnyElement {
-    let entries = attention_entries(store.read(cx));
     let open_inbox = move |_window: &mut Window, cx: &mut App| {
-        let (store, workspace) = (store.clone(), workspace.clone());
-        Some(cx.new(|cx| AttentionInbox::new(store, workspace, cx)))
+        let workspace = workspace.clone();
+        Some(cx.new(|cx| AttentionInbox::new(workspace, cx)))
     };
     let menu = PopoverMenu::new(id)
         .anchor(gpui::Anchor::TopRight)
         .menu(open_inbox);
     let show_count = crate::PaseoSettings::get_global(cx).alerts.bell_count;
-    let Some(most_urgent) = entries.first() else {
+    let Some(most_urgent) = summary.most_urgent else {
         return menu
             .trigger_with_tooltip(
                 IconButton::new("paseo-attention-bell", IconName::Bell)
@@ -115,7 +203,7 @@ pub(crate) fn attention_bell(
             )
             .into_any_element();
     };
-    let color = most_urgent.reason.color();
+    let color = most_urgent.color();
     if !show_count {
         return menu
             .trigger_with_tooltip(
@@ -126,12 +214,12 @@ pub(crate) fn attention_bell(
             )
             .into_any_element();
     }
-    let tooltip = match entries.len() {
+    let tooltip = match summary.count {
         1 => "1 agent needs you".to_owned(),
         count => format!("{count} agents need you"),
     };
     menu.trigger_with_tooltip(
-        ui::Button::new("paseo-attention-bell", entries.len().to_string())
+        ui::Button::new("paseo-attention-bell", summary.count.to_string())
             .label_size(LabelSize::Small)
             .color(color)
             .start_icon(
@@ -146,23 +234,23 @@ pub(crate) fn attention_bell(
 
 /// The popover listing [`attention_entries`]; a row opens its agent.
 pub(crate) struct AttentionInbox {
-    store: Entity<PaseoStore>,
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
+    /// Gathered when a host changes rather than on each render.
+    entries: Vec<(Entity<PaseoStore>, AttentionEntry)>,
     _subscription: Subscription,
 }
 
 impl AttentionInbox {
-    pub(crate) fn new(
-        store: Entity<PaseoStore>,
-        workspace: WeakEntity<Workspace>,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let subscription = cx.observe(&store, |_, _, cx| cx.notify());
+    pub(crate) fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
+        let subscription = cx.observe(&crate::hosts::registry(cx), |inbox, _, cx| {
+            inbox.entries = all_attention_entries(cx);
+            cx.notify();
+        });
         Self {
-            store,
             workspace,
             focus_handle: cx.focus_handle(),
+            entries: all_attention_entries(cx),
             _subscription: subscription,
         }
     }
@@ -176,23 +264,21 @@ impl AttentionInbox {
         cx.emit(DismissEvent);
     }
 
-    fn mark_read(&mut self, agent_ids: Vec<String>, cx: &mut Context<Self>) {
-        self.store.update(cx, |store, cx| {
-            for agent_id in &agent_ids {
-                store.clear_attention(agent_id, cx);
-            }
-        });
+    fn mark_read(&mut self, agents: Vec<(Entity<PaseoStore>, String)>, cx: &mut Context<Self>) {
+        for (store, agent_id) in &agents {
+            store.update(cx, |store, cx| store.clear_attention(agent_id, cx));
+        }
     }
 
     fn render_entry(
         &self,
         index: usize,
+        store: Entity<PaseoStore>,
         entry: AttentionEntry,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let colors = cx.theme().colors();
         let open_agent = entry.agent_id.clone();
-        let read_agent = entry.agent_id.clone();
+        let read_agent = (store, entry.agent_id.clone());
         let when = entry.since.map(|since| format_relative(since, Utc::now()));
         let details = [
             Some(entry.reason.label().to_owned()),
@@ -203,47 +289,44 @@ impl AttentionInbox {
         .flatten()
         .collect::<Vec<_>>()
         .join(" • ");
-        h_flex()
-            .id(("paseo-attention-entry", index))
-            .w_full()
-            .px_2()
-            .py_1p5()
-            .gap_2()
-            .items_start()
-            .rounded_md()
-            .cursor_pointer()
-            .hover(|style| style.bg(colors.ghost_element_hover))
+        ui::ListItem::new(("paseo-attention-entry", index))
+            .spacing(ui::ListItemSpacing::Sparse)
+            .rounded()
             .on_click(cx.listener(move |inbox, _, window, cx| inbox.open(&open_agent, window, cx)))
             .child(
-                div()
-                    .pt_1p5()
-                    .child(Indicator::dot().color(entry.reason.color())),
-            )
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_start()
                     .child(
                         div()
-                            .line_clamp(2)
-                            .text_ellipsis()
-                            .child(Label::new(entry.title)),
+                            .pt_1p5()
+                            .child(Indicator::dot().color(entry.reason.color())),
                     )
                     .child(
-                        Label::new(details)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .when_some(entry.error, |this, error| {
-                        this.child(
-                            div().line_clamp(2).text_ellipsis().child(
-                                Label::new(error).size(LabelSize::Small).color(Color::Error),
-                            ),
-                        )
-                    }),
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .line_clamp(2)
+                                    .text_ellipsis()
+                                    .child(Label::new(entry.title)),
+                            )
+                            .child(
+                                Label::new(details)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .when_some(entry.error, |this, error| {
+                                this.child(div().line_clamp(2).text_ellipsis().child(
+                                    Label::new(error).size(LabelSize::Small).color(Color::Error),
+                                ))
+                            }),
+                    ),
             )
             .when(entry.reason != AttentionReason::NeedsInput, |this| {
-                this.child(
+                this.end_slot(
                     IconButton::new(("paseo-attention-read", index), IconName::Check)
                         .icon_size(IconSize::Small)
                         .icon_color(Color::Muted)
@@ -268,14 +351,14 @@ impl Focusable for AttentionInbox {
 
 impl Render for AttentionInbox {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let entries = attention_entries(self.store.read(cx));
+        let entries = self.entries.clone();
         let unread = entries
             .iter()
-            .filter(|entry| entry.reason != AttentionReason::NeedsInput)
-            .map(|entry| entry.agent_id.clone())
+            .filter(|(_, entry)| entry.reason != AttentionReason::NeedsInput)
+            .map(|(store, entry)| (store.clone(), entry.agent_id.clone()))
             .collect::<Vec<_>>();
         v_flex()
-            .key_context("PaseoAttentionInbox")
+            .key_context("PaseoAttentionInbox PaseoView")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
             .w(rems(24.))
@@ -307,17 +390,19 @@ impl Render for AttentionInbox {
                     .id("paseo-attention-entries")
                     .overflow_y_scroll()
                     .when(entries.is_empty(), |this| {
-                        this.child(
-                            div().px_2().py_2().child(
-                                Label::new("Nothing needs you right now").color(Color::Muted),
-                            ),
-                        )
+                        this.child(div().px_2().child(crate::render_message(
+                            "Nothing needs you right now",
+                            None,
+                            None,
+                        )))
                     })
                     .children(
                         entries
                             .into_iter()
                             .enumerate()
-                            .map(|(index, entry)| self.render_entry(index, entry, cx)),
+                            .map(|(index, (store, entry))| {
+                                self.render_entry(index, store, entry, cx)
+                            }),
                     ),
             )
     }
@@ -358,10 +443,22 @@ mod tests {
         assert_eq!(agent_attention_since(&plain), None);
     }
 
+    #[gpui::test]
+    fn the_inbox_says_when_nothing_needs_you(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::test_init);
+        let (_, cx) =
+            cx.add_window_view(|_, cx| AttentionInbox::new(gpui::WeakEntity::new_invalid(), cx));
+        cx.run_until_parked();
+        let message = cx.debug_bounds("paseo-message").expect("the empty message");
+        let width = cx.update(|window, _| window.viewport_size().width);
+        assert!(message.size.height > gpui::px(0.));
+        assert!(message.right() <= width, "{message:?} fits {width:?}");
+    }
+
     #[test]
     fn attention_lists_input_failed_then_finished() {
         let mut store = PaseoStore::default();
-        store.state.agents = vec![
+        store.state.test_set_agents(vec![
             agent(
                 "finished-old",
                 "idle",
@@ -390,7 +487,7 @@ mod tests {
             ),
             agent("idle", "idle", json!({})),
             agent("running", "running", json!({})),
-        ];
+        ]);
         let entries = attention_entries(&store);
         assert_eq!(
             entries

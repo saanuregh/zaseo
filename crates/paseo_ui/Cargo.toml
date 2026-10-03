@@ -13,7 +13,7 @@ path = "src/paseo_ui.rs"
 doctest = false
 
 [features]
-test-support = []
+test-support = ["db/test-support", "dep:theme", "settings/test-support"]
 
 [dependencies]
 anyhow.workspace = true
@@ -49,6 +49,7 @@ settings.workspace = true
 terminal.workspace = true
 terminal_view.workspace = true
 text.workspace = true
+theme = { workspace = true, optional = true }
 theme_settings.workspace = true
 ui.workspace = true
 ui_input.workspace = true

@@ -7,15 +7,12 @@ use settings::{BaseKeymap, Settings, update_settings_file};
 use theme::{Appearance, SystemAppearance, ThemeRegistry};
 use theme_settings::{ThemeAppearanceMode, ThemeName, ThemeSelection, ThemeSettings};
 use ui::{
-    StatefulInteractiveElement, SwitchField, TintColor, ToggleButtonGroup, ToggleButtonGroupSize,
+    StatefulInteractiveElement, SwitchField, ToggleButtonGroup, ToggleButtonGroupSize,
     ToggleButtonSimple, ToggleButtonWithIcon, Tooltip, prelude::*,
 };
 use vim_mode_setting::VimModeSetting;
 
-use crate::{
-    ImportCursorSettings, ImportVsCodeSettings, SettingsImportState,
-    theme_preview::{ThemePreviewStyle, ThemePreviewTile},
-};
+use crate::theme_preview::{ThemePreviewStyle, ThemePreviewTile};
 
 const LIGHT_THEMES: [&str; 3] = ["One Light", "Ayu Light", "Gruvbox Light"];
 const DARK_THEMES: [&str; 3] = ["One Dark", "Ayu Dark", "Gruvbox Dark"];
@@ -306,7 +303,7 @@ fn render_vim_mode_switch(tab_index: &mut isize, cx: &mut App) -> impl IntoEleme
     SwitchField::new(
         "onboarding-vim-mode",
         Some("Vim Mode"),
-        Some("Coming from Neovim? Use our first-class implementation of Vim Mode".into()),
+        Some("Edit with Vim keybindings in every editor".into()),
         toggle_state,
         {
             let fs = <dyn Fs>::global(cx);
@@ -342,12 +339,12 @@ fn render_worktree_auto_trust_switch(tab_index: &mut isize, cx: &mut App) -> imp
         ui::ToggleState::Unselected
     };
 
-    let tooltip_description = "Zed can only allow services like language servers, project settings, and MCP servers to run after you mark a new project as trusted.";
+    let tooltip_description = "Zaseo only runs language servers, project settings, and MCP servers in a project after you mark it as trusted.";
 
     SwitchField::new(
         "onboarding-auto-trust-worktrees",
         Some("Trust All Projects By Default"),
-        Some("Automatically mark all new projects as trusted to unlock all Zed's features".into()),
+        Some("Mark every new project as trusted, including the folders agents open".into()),
         toggle_state,
         {
             let fs = <dyn Fs>::global(cx);
@@ -377,51 +374,8 @@ fn render_worktree_auto_trust_switch(tab_index: &mut isize, cx: &mut App) -> imp
     .tooltip(Tooltip::text(tooltip_description))
 }
 
-fn render_setting_import_button(
-    tab_index: isize,
-    label: SharedString,
-    action: &dyn Action,
-    imported: bool,
-) -> impl IntoElement + 'static {
-    let action = action.boxed_clone();
-
-    Button::new(label.clone(), label.clone())
-        .style(ButtonStyle::OutlinedGhost)
-        .size(ButtonSize::Medium)
-        .label_size(LabelSize::Small)
-        .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-        .toggle_state(imported)
-        .tab_index(tab_index)
-        .when(imported, |this| {
-            this.end_icon(Icon::new(IconName::Check).size(IconSize::Small))
-                .color(Color::Success)
-        })
-        .on_click(move |_, window, cx| {
-            telemetry::event!("Welcome Import Settings", import_source = label,);
-            window.dispatch_action(action.boxed_clone(), cx);
-        })
-}
-
-fn render_import_settings_section(tab_index: &mut isize, cx: &mut App) -> impl IntoElement {
-    let import_state = SettingsImportState::global(cx);
-    let imports: [(SharedString, &dyn Action, bool); 2] = [
-        (
-            "VS Code".into(),
-            &ImportVsCodeSettings { skip_prompt: false },
-            import_state.vscode,
-        ),
-        (
-            "Cursor".into(),
-            &ImportCursorSettings { skip_prompt: false },
-            import_state.cursor,
-        ),
-    ];
-
-    let [vscode, cursor] = imports.map(|(label, action, imported)| {
-        *tab_index += 1;
-        render_setting_import_button(*tab_index - 1, label, action, imported)
-    });
-
+fn render_paseo_hosts_section(tab_index: &mut isize) -> impl IntoElement {
+    *tab_index += 1;
     h_flex()
         .gap_2()
         .flex_wrap()
@@ -430,13 +384,24 @@ fn render_import_settings_section(tab_index: &mut isize, cx: &mut App) -> impl I
             v_flex()
                 .gap_0p5()
                 .max_w_5_6()
-                .child(Label::new("Import Settings"))
+                .child(Label::new("Paseo Hosts"))
                 .child(
-                    Label::new("Automatically pull your settings from other editors")
-                        .color(Color::Muted),
+                    Label::new(
+                        "Connect to the Paseo daemons that run your agents, here or over SSH",
+                    )
+                    .color(Color::Muted),
                 ),
         )
-        .child(h_flex().gap_1().child(vscode).child(cursor))
+        .child(
+            Button::new("onboarding-manage-hosts", "Manage Hosts")
+                .style(ButtonStyle::OutlinedGhost)
+                .size(ButtonSize::Medium)
+                .label_size(LabelSize::Small)
+                .tab_index(*tab_index - 1)
+                .on_click(|_, window, cx| {
+                    window.dispatch_action(paseo_ui::ManageHosts.boxed_clone(), cx)
+                }),
+        )
 }
 
 pub(crate) const FEATURED_AGENT_IDS: &[&str] =
@@ -450,7 +415,7 @@ pub(crate) fn render_basics_page(cx: &mut App) -> impl IntoElement {
         .gap_6()
         .child(render_theme_section(&mut tab_index, cx))
         .child(render_base_keymap_section(&mut tab_index, cx))
-        .child(render_import_settings_section(&mut tab_index, cx))
+        .child(render_paseo_hosts_section(&mut tab_index))
         .child(render_vim_mode_switch(&mut tab_index, cx))
         .child(render_worktree_auto_trust_switch(&mut tab_index, cx))
 }

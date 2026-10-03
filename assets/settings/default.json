@@ -2936,8 +2936,8 @@
     "chat": {
       // Font family for chat prose; unset uses the UI font. Code keeps the buffer font.
       "font_family": null,
-      // Font size of the chat, in pixels; unset uses the UI font size. Zooming the editor
-      // (ctrl +/-) zooms the chat too.
+      // Font size of the chat, in pixels; unset uses Zed's label size (seven eighths of the UI
+      // font size). Zooming the editor (ctrl +/-) zooms the chat too.
       "font_size": null,
       // Line height of chat prose, as a multiple of its font size.
       "line_height": 1.55,
@@ -2953,7 +2953,7 @@
       // choice made in the sidebar's grouping menu, which also sets this.
       "grouping": null,
       // How many lines a row's title may wrap onto.
-      "title_lines": 2,
+      "title_lines": 1,
       // Whether sidebar rows and agent tabs animate: the activity line under running or
       // waiting agents, and rows easing in or flashing when an agent appears or changes state.
       "animate_status": true

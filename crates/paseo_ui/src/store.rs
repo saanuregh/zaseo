@@ -11,6 +11,7 @@ use paseo_client::{
 };
 use serde_json::Value;
 use settings::PaseoConnectionProfile;
+use std::cell::{Ref, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
@@ -29,8 +30,8 @@ pub enum ConnectionStatus {
     Reconnecting,
 }
 
-const ARCHIVED_SUBAGENTS_KEY: &str = "paseo_archived_subagents";
-const REVIEWED_EDITS_KEY: &str = "paseo_reviewed_edits";
+pub(crate) const ARCHIVED_SUBAGENTS_KEY: &str = "paseo_archived_subagents";
+pub(crate) const REVIEWED_EDITS_KEY: &str = "paseo_reviewed_edits";
 
 #[derive(Default)]
 pub(crate) struct AgentPaging {
@@ -59,6 +60,67 @@ pub enum StoreEvent {
     },
 }
 
+/// A set of IDs saved under one key-value store key, shared by every host's store. Each host
+/// once kept its own copy under the same key, so whichever host saved last dropped the entries
+/// the others had added. A default set (as in tests) isn't saved.
+#[derive(Clone, Default)]
+pub(crate) struct SavedSet {
+    key: Option<&'static str>,
+    items: std::rc::Rc<RefCell<BTreeSet<String>>>,
+}
+
+impl SavedSet {
+    pub(crate) fn load(key: &'static str, cx: &App) -> Self {
+        let items = db::kvp::KeyValueStore::global(cx)
+            .read_kvp(key)
+            .log_err()
+            .flatten()
+            .and_then(|json| serde_json::from_str(&json).log_err())
+            .unwrap_or_default();
+        Self {
+            key: Some(key),
+            items: std::rc::Rc::new(RefCell::new(items)),
+        }
+    }
+
+    pub(crate) fn contains(&self, item: &str) -> bool {
+        self.items.borrow().contains(item)
+    }
+
+    pub(crate) fn items(&self) -> Ref<'_, BTreeSet<String>> {
+        self.items.borrow()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert(&self, item: String) -> bool {
+        self.items.borrow_mut().insert(item)
+    }
+
+    /// Applies `change`, which returns whether it changed the set, and saves the set if so.
+    fn update(&self, cx: &App, change: impl FnOnce(&mut BTreeSet<String>) -> bool) -> bool {
+        let json = {
+            let mut items = self.items.borrow_mut();
+            if !change(&mut items) {
+                return false;
+            }
+            serde_json::to_string(&*items)
+        };
+        let Some(key) = self.key else {
+            return true;
+        };
+        match json {
+            Ok(json) => {
+                let key_value_store = db::kvp::KeyValueStore::global(cx);
+                db::write_and_log(cx, move || async move {
+                    key_value_store.write_kvp(key.to_string(), json).await
+                });
+            }
+            Err(error) => log::error!("Failed to serialize Paseo's saved {key}: {error}"),
+        }
+        true
+    }
+}
+
 #[derive(Default)]
 pub struct PaseoStore {
     pub(crate) state: StoreState,
@@ -69,11 +131,11 @@ pub struct PaseoStore {
     pub(crate) connection_generation: u64,
     pub(crate) paging: HashMap<String, AgentPaging>,
     /// Subagent timeline IDs the user archived from the subagent track, saved across restarts.
-    pub(crate) archived_subagents: BTreeSet<String>,
+    pub(crate) archived_subagents: SavedSet,
     /// Parents whose subagent list is being fetched, so a newly opened chat can wait for it.
     pub(crate) subagents_loading: HashSet<String>,
     /// Agent edits kept or rejected in an editor, so they stay reviewed across restarts.
-    pub(crate) reviewed_edits: BTreeSet<String>,
+    pub(crate) reviewed_edits: SavedSet,
     pub(crate) archived: Option<Vec<AgentSummary>>,
     /// Whether each archived agent's workspace can be restored, by workspace ID.
     pub(crate) recovery: HashMap<String, RecoveryState>,
@@ -88,6 +150,8 @@ pub struct PaseoStore {
     /// Project icons by project ID, with the icon revision they were loaded for.
     pub(crate) project_icons: HashMap<String, (Option<String>, Option<Arc<gpui::Image>>)>,
     pub(crate) server_info: ServerInfo,
+    /// Whether the last connection failed because the daemon wants a (different) password.
+    pub(crate) needs_password: bool,
     /// Daemon terminals per directory, for directories some view watches.
     pub(crate) terminals: HashMap<String, Vec<TerminalInfo>>,
     terminal_watchers: BTreeMap<String, usize>,
@@ -122,10 +186,19 @@ impl PaseoStore {
     }
 
     fn buckets(&self) -> HashMap<String, AgentBucket> {
+        let waiting = self
+            .state
+            .permissions
+            .values()
+            .map(|request| request.agent_id.as_str())
+            .collect::<HashSet<_>>();
         self.state
-            .agents
+            .agents()
             .iter()
-            .map(|agent| (agent.id.clone(), self.bucket(agent)))
+            .map(|agent| {
+                let bucket = agent_bucket(agent, waiting.contains(agent.id.as_str()));
+                (agent.id.clone(), bucket)
+            })
             .collect()
     }
 
@@ -179,62 +252,34 @@ impl PaseoStore {
         timeline_ids: impl IntoIterator<Item = String>,
         cx: &mut Context<Self>,
     ) {
-        self.archived_subagents.extend(timeline_ids);
-        self.save_archived_subagents(cx);
-        cx.notify();
-    }
-
-    fn save_archived_subagents(&self, cx: &App) {
-        let json = match serde_json::to_string(&self.archived_subagents) {
-            Ok(json) => json,
-            Err(error) => {
-                log::error!("Failed to serialize archived Paseo subagents: {error}");
-                return;
-            }
-        };
-        let kvp = db::kvp::KeyValueStore::global(cx);
-        db::write_and_log(cx, move || async move {
-            kvp.write_kvp(ARCHIVED_SUBAGENTS_KEY.to_string(), json)
-                .await
+        let timeline_ids = timeline_ids.into_iter().collect::<Vec<_>>();
+        self.archived_subagents.update(cx, |archived| {
+            let before = archived.len();
+            archived.extend(timeline_ids);
+            archived.len() != before
         });
+        cx.notify();
     }
 
     pub(crate) fn mark_edits_reviewed(&mut self, keys: Vec<String>, cx: &mut Context<Self>) {
-        let before = self.reviewed_edits.len();
-        self.reviewed_edits.extend(keys);
-        if self.reviewed_edits.len() == before {
-            return;
-        }
-        let json = match serde_json::to_string(&self.reviewed_edits) {
-            Ok(json) => json,
-            Err(error) => {
-                log::error!("Failed to serialize reviewed Paseo edits: {error}");
-                return;
-            }
-        };
-        let kvp = db::kvp::KeyValueStore::global(cx);
-        db::write_and_log(cx, move || async move {
-            kvp.write_kvp(REVIEWED_EDITS_KEY.to_string(), json).await
+        let changed = self.reviewed_edits.update(cx, |reviewed| {
+            let before = reviewed.len();
+            reviewed.extend(keys);
+            reviewed.len() != before
         });
-        cx.notify();
+        if changed {
+            cx.notify();
+        }
     }
 
-    pub(crate) fn load_reviewed_edits(&mut self, cx: &App) {
-        self.reviewed_edits = db::kvp::KeyValueStore::global(cx)
-            .read_kvp(REVIEWED_EDITS_KEY)
-            .log_err()
-            .flatten()
-            .and_then(|json| serde_json::from_str(&json).log_err())
-            .unwrap_or_default();
-    }
-
-    pub(crate) fn load_archived_subagents(&mut self, cx: &App) {
-        self.archived_subagents = db::kvp::KeyValueStore::global(cx)
-            .read_kvp(ARCHIVED_SUBAGENTS_KEY)
-            .log_err()
-            .flatten()
-            .and_then(|json| serde_json::from_str(&json).log_err())
-            .unwrap_or_default();
+    /// Forgets the reviewed edits of a deleted agent, which no chat can show again.
+    fn forget_reviewed_edits(&mut self, agent_id: &str, cx: &App) {
+        let prefix = format!("{agent_id}|");
+        self.reviewed_edits.update(cx, |reviewed| {
+            let before = reviewed.len();
+            reviewed.retain(|key| !key.starts_with(&prefix));
+            reviewed.len() != before
+        });
     }
 
     /// The subagent a `subagent_timeline_id` names, once its parent's list has loaded.
@@ -261,27 +306,23 @@ impl PaseoStore {
     }
 
     pub(crate) fn display_title(&self, agent: &AgentSummary) -> String {
-        agent_display_title(&self.state.agents, &self.state.workspaces, agent)
+        agent_display_title(&self.state.agents(), &self.state.workspaces, agent)
     }
 
     pub(crate) fn lone_agent_workspace(
         &self,
         agent: &AgentSummary,
     ) -> Option<&WorkspaceDescriptor> {
-        lone_agent_workspace(&self.state.agents, &self.state.workspaces, agent)
+        lone_agent_workspace(&self.state.agents(), &self.state.workspaces, agent)
     }
 
     pub(crate) fn agent(&self, agent_id: &str) -> Option<&AgentSummary> {
-        self.state
-            .agents
-            .iter()
-            .find(|agent| agent.id == agent_id)
-            .or_else(|| {
-                self.archived
-                    .iter()
-                    .flatten()
-                    .find(|agent| agent.id == agent_id)
-            })
+        self.state.agent(agent_id).or_else(|| {
+            self.archived
+                .iter()
+                .flatten()
+                .find(|agent| agent.id == agent_id)
+        })
     }
 
     pub(crate) fn provider(&self, provider_id: &str) -> Option<&Provider> {
@@ -293,7 +334,7 @@ impl PaseoStore {
     pub(crate) fn entries_for<'a>(
         &'a self,
         agent_id: &'a str,
-    ) -> impl Iterator<Item = &'a TimelineEntry> + 'a {
+    ) -> impl DoubleEndedIterator<Item = &'a TimelineEntry> + 'a {
         let epoch = self
             .state
             .current_epoch(agent_id)
@@ -353,17 +394,11 @@ impl PaseoStore {
         cx.notify();
     }
 
-    pub(crate) fn apply_refresh(
-        &mut self,
-        generation: u64,
-        providers: Vec<Provider>,
-        agents: Vec<AgentSummary>,
-    ) -> bool {
+    pub(crate) fn apply_refresh(&mut self, generation: u64, providers: Vec<Provider>) -> bool {
         if !self.is_current_connection(generation) {
             return false;
         }
         self.providers = providers;
-        self.state.set_agents(agents);
         true
     }
 
@@ -394,9 +429,7 @@ impl PaseoStore {
         {
             return false;
         }
-        for entry in page.entries {
-            self.state.insert_projected_entry(entry);
-        }
+        self.state.insert_projected_entries(page.entries);
         paging.older_cursor = page.start_cursor;
         paging.has_older = page.has_older;
         true
@@ -443,14 +476,17 @@ impl PaseoStore {
                     Ok((session, events)) => {
                         store.session = Some(Arc::new(session));
                         store.status = ConnectionStatus::Connected;
+                        store.needs_password = false;
                         store.state.error = None;
                         store.event_task = Some(cx.spawn(async move |this, cx| {
                             while let Ok(event) = events.recv().await {
+                                let mut batch = vec![event];
+                                while let Ok(event) = events.try_recv() {
+                                    batch.push(event);
+                                }
                                 if this
                                     .update(cx, |store, cx| {
-                                        if store.is_current_connection(generation) {
-                                            store.handle_event(event, cx);
-                                        }
+                                        store.handle_events(generation, batch, cx)
                                     })
                                     .is_err()
                                 {
@@ -458,10 +494,12 @@ impl PaseoStore {
                                 }
                             }
                         }));
-                        store.sync_subscriptions(cx);
                     }
                     Err(error) => {
                         store.status = ConnectionStatus::Disconnected;
+                        store.needs_password = error
+                            .chain()
+                            .any(|cause| cause.is::<paseo_client::AuthRejection>());
                         store.state.error = Some(error.to_string());
                     }
                 }
@@ -474,6 +512,41 @@ impl PaseoStore {
     }
 
     pub(crate) fn handle_event(&mut self, event: PaseoEvent, cx: &mut Context<Self>) {
+        if self.apply_paseo_event(event, cx) {
+            cx.notify();
+        }
+    }
+
+    /// Applies events of one connection that queued up together, notifying once at the end.
+    pub(crate) fn handle_events(
+        &mut self,
+        generation: u64,
+        events: Vec<PaseoEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut events = events.into_iter().peekable();
+        let mut changed = false;
+        while let Some(event) = events.next() {
+            // An event can end the connection, and the rest belong to it.
+            if !self.is_current_connection(generation) {
+                break;
+            }
+            // A directory snapshot replaces the whole list, so one followed by another changes
+            // nothing the second does not.
+            if matches!(event, PaseoEvent::AgentsChanged(_))
+                && matches!(events.peek(), Some(PaseoEvent::AgentsChanged(_)))
+            {
+                continue;
+            }
+            changed |= self.apply_paseo_event(event, cx);
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// Applies one event and returns whether views reading the store must re-render.
+    fn apply_paseo_event(&mut self, event: PaseoEvent, cx: &mut Context<Self>) -> bool {
         if matches!(
             event,
             PaseoEvent::TerminalOutput { .. }
@@ -483,14 +556,14 @@ impl PaseoStore {
                 | PaseoEvent::DictationFailed { .. }
         ) {
             cx.emit(StoreEvent::Stream(event));
-            return;
+            return false;
         }
         // The daemon broadcasts every subagent's timeline; keep only the ones a tab shows.
         if let PaseoEvent::TimelineEntry(entry) = &event
             && parse_subagent_timeline_id(&entry.agent_id).is_some()
             && !self.watchers.contains_key(&entry.agent_id)
         {
-            return;
+            return false;
         }
         if let PaseoEvent::SubagentRemoved {
             parent_agent_id,
@@ -498,17 +571,16 @@ impl PaseoStore {
         } = &event
         {
             let timeline_id = paseo_client::subagent_timeline_id(parent_agent_id, subagent_id);
-            if self.archived_subagents.contains(&timeline_id) {
-                self.archived_subagents.remove(&timeline_id);
-                self.save_archived_subagents(cx);
-            }
+            self.archived_subagents
+                .update(cx, |archived| archived.remove(&timeline_id));
         }
         if let PaseoEvent::TimelineEntry(entry) = &event {
             let timeline_id = entry.agent_id.clone();
             self.state.apply_event(event);
             cx.emit(StoreEvent::TimelineChanged(timeline_id));
-            return;
+            return false;
         }
+        let mut left_archive = false;
         match &event {
             PaseoEvent::Connected => {
                 self.status = ConnectionStatus::Connected;
@@ -520,11 +592,18 @@ impl PaseoStore {
                 for parent_agent_id in self.watched_agents() {
                     self.refresh_subagents(parent_agent_id, cx);
                 }
-                // The client's reconnect catch-up covers agent timelines only.
+                // The client's reconnect catch-up covers agent timelines only. Timelines that
+                // never loaded are loaded by `sync_subscriptions` above.
                 let subagent_timelines = self
                     .watchers
                     .keys()
-                    .filter(|timeline_id| parse_subagent_timeline_id(timeline_id).is_some())
+                    .filter(|timeline_id| {
+                        parse_subagent_timeline_id(timeline_id).is_some()
+                            && self
+                                .paging
+                                .get(timeline_id.as_str())
+                                .is_some_and(|paging| paging.loaded)
+                    })
                     .cloned()
                     .collect::<Vec<_>>();
                 for timeline_id in subagent_timelines {
@@ -563,7 +642,18 @@ impl PaseoStore {
             PaseoEvent::ServerInfo(info) => self.server_info = info.clone(),
             PaseoEvent::AgentsChanged(agents) => {
                 if let Some(archived) = self.archived.as_mut() {
-                    archived.retain(|archived| !agents.iter().any(|agent| agent.id == archived.id));
+                    let active = agents
+                        .iter()
+                        .map(|agent| agent.id.as_str())
+                        .collect::<HashSet<_>>();
+                    archived.retain(|archived| !active.contains(archived.id.as_str()));
+                }
+            }
+            PaseoEvent::AgentUpserted(agent) => {
+                if let Some(archived) = self.archived.as_mut() {
+                    let count = archived.len();
+                    archived.retain(|archived| archived.id != agent.id);
+                    left_archive = archived.len() != count;
                 }
             }
             PaseoEvent::WorkspaceRemoved { workspace_id, .. } => {
@@ -571,7 +661,7 @@ impl PaseoStore {
                     .state
                     .workspaces
                     .get(workspace_id)
-                    .filter(|workspace| workspace.kind == "worktree" || workspace.is_paseo_worktree)
+                    .filter(|workspace| workspace.is_worktree())
                     .map(|workspace| workspace.directory.clone());
                 cx.emit(StoreEvent::WorkspaceRemoved {
                     workspace_id: workspace_id.clone(),
@@ -588,16 +678,27 @@ impl PaseoStore {
             event,
             PaseoEvent::WorkspaceUpserted(_) | PaseoEvent::WorkspacesSnapshot { .. }
         );
-        let before = self.buckets();
-        self.state.apply_event(event);
-        self.announce_transitions(&before, cx);
+        // Only agents and permission requests decide buckets.
+        let changes_buckets = matches!(
+            event,
+            PaseoEvent::AgentsChanged(_)
+                | PaseoEvent::AgentUpserted(_)
+                | PaseoEvent::AgentRemoved { .. }
+                | PaseoEvent::PermissionRequested(_)
+                | PaseoEvent::PermissionResolved { .. }
+        );
+        let before = changes_buckets.then(|| self.buckets());
+        let changed = self.state.apply_event(event);
+        if changed && let Some(before) = before {
+            self.announce_transitions(&before, cx);
+        }
         if changes_projects {
             self.load_project_icons(cx);
         }
         if changes_workspaces {
             self.load_setup_statuses(cx);
         }
-        cx.notify();
+        changed || left_archive
     }
 
     pub(crate) fn refresh_projects(&mut self, cx: &mut Context<Self>) {
@@ -629,7 +730,7 @@ impl PaseoStore {
             .state
             .workspaces
             .values()
-            .filter(|workspace| workspace.kind == "worktree" || workspace.is_paseo_worktree)
+            .filter(|workspace| workspace.is_worktree())
             .map(|workspace| workspace.id.clone())
             .filter(|workspace_id| self.setup_checked.insert(workspace_id.clone()))
             .collect::<Vec<_>>();
@@ -768,11 +869,14 @@ impl PaseoStore {
         .detach_and_log_err(cx);
     }
 
+    /// Fetches the providers. Agents need no fetch: every connection's directory subscription
+    /// delivers them, newer than a separate fetch could be.
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
         let generation = self.connection_generation;
-        let task = self.session_request(cx, move |session| async move {
-            Ok((session.providers(None).await?, session.agents().await?))
-        });
+        let task = self.session_request(
+            cx,
+            move |session| async move { session.providers(None).await },
+        );
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |store, cx| {
@@ -780,8 +884,8 @@ impl PaseoStore {
                     return;
                 }
                 match result {
-                    Ok((providers, agents)) => {
-                        store.apply_refresh(generation, providers, agents);
+                    Ok(providers) => {
+                        store.apply_refresh(generation, providers);
                     }
                     Err(error) => store.state.error = Some(error.to_string()),
                 }
@@ -834,6 +938,13 @@ impl PaseoStore {
     pub(crate) fn set_focused_agent(&mut self, agent_id: String, cx: &mut Context<Self>) {
         if self.focused_agent.as_deref() != Some(agent_id.as_str()) {
             self.focused_agent = Some(agent_id);
+            cx.emit(StoreEvent::FocusChanged);
+        }
+    }
+
+    /// Clears focus when the user focuses an agent on another host.
+    pub(crate) fn clear_focused_agent(&mut self, cx: &mut Context<Self>) {
+        if self.focused_agent.take().is_some() {
             cx.emit(StoreEvent::FocusChanged);
         }
     }
@@ -914,7 +1025,7 @@ impl PaseoStore {
             self.watchers.remove(agent_id);
             // Unsubscribed agents miss live chunks, so a later watch must refetch the tail.
             self.paging.remove(agent_id);
-            self.state.timeline.retain(|(id, _, _), _| id != agent_id);
+            self.state.remove_timeline(agent_id);
             self.sync_subscriptions(cx);
         }
     }
@@ -1065,12 +1176,14 @@ impl PaseoStore {
             this.update(cx, |store, cx| {
                 match result {
                     Ok(page) => {
-                        store.apply_older_page(
+                        if store.apply_older_page(
                             generation,
                             &requested_agent_id,
                             &requested_cursor,
                             page,
-                        );
+                        ) {
+                            cx.emit(StoreEvent::TimelineChanged(requested_agent_id.clone()));
+                        }
                     }
                     Err(error) => {
                         if let Some(paging) = store.paging.get_mut(&requested_agent_id) {
@@ -1169,7 +1282,7 @@ impl PaseoStore {
 
     pub(crate) fn archive(&mut self, agent_id: &str, cx: &mut Context<Self>) {
         if let Some(agent) = self.agent(agent_id).cloned() {
-            self.state.agents.retain(|existing| existing.id != agent_id);
+            self.state.retain_agents(|existing| existing.id != agent_id);
             // Kept even before History loads any, so the agent's tab knows it is archived.
             self.archived.get_or_insert_with(Vec::new).insert(0, agent);
             cx.notify();
@@ -1208,16 +1321,30 @@ impl PaseoStore {
     }
 
     pub(crate) fn delete(&mut self, agent_id: &str, cx: &mut Context<Self>) {
-        self.state.agents.retain(|agent| agent.id != agent_id);
+        self.state.retain_agents(|agent| agent.id != agent_id);
         if let Some(archived) = self.archived.as_mut() {
             archived.retain(|agent| agent.id != agent_id);
         }
         cx.notify();
+        let generation = self.connection_generation;
         let agent_id = agent_id.to_owned();
-        self.request_reporting_errors(
-            cx,
-            move |session| async move { session.delete(&agent_id).await },
-        );
+        let requested_agent_id = agent_id.clone();
+        let task = self.session_request(cx, move |session| async move {
+            session.delete(&requested_agent_id).await
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |store, cx| match result {
+                Ok(()) => store.forget_reviewed_edits(&agent_id, cx),
+                Err(error) => {
+                    if store.is_current_connection(generation) {
+                        store.state.error = Some(error.to_string());
+                        cx.notify();
+                    }
+                }
+            })
+        })
+        .detach_and_log_err(cx);
     }
 
     pub(crate) fn rename(&mut self, agent_id: &str, name: String, cx: &mut Context<Self>) {
@@ -1225,12 +1352,7 @@ impl PaseoStore {
         if name.is_empty() {
             return;
         }
-        if let Some(agent) = self
-            .state
-            .agents
-            .iter_mut()
-            .find(|agent| agent.id == agent_id)
-        {
+        if let Some(agent) = self.state.agent_mut(agent_id) {
             agent.title = Some(name.clone());
             cx.notify();
         }
@@ -1330,9 +1452,8 @@ impl PaseoStore {
     pub(crate) fn clear_attention(&mut self, agent_id: &str, cx: &mut Context<Self>) {
         let needs_clearing = self
             .state
-            .agents
-            .iter()
-            .any(|agent| agent.id == agent_id && agent_requires_attention(agent));
+            .agent(agent_id)
+            .is_some_and(agent_requires_attention);
         if !needs_clearing || !self.connected() {
             return;
         }
@@ -1502,10 +1623,23 @@ impl PaseoStore {
 
 #[derive(Default)]
 pub(crate) struct StoreState {
-    pub agents: Vec<AgentSummary>,
+    /// Written only through the methods below, which keep `agent_positions` in step.
+    agents: Vec<AgentSummary>,
+    /// Each agent's index in `agents`, so a lookup by ID needs no scan.
+    agent_positions: HashMap<String, usize>,
     pub timeline: BTreeMap<(String, String, u64), TimelineEntry>,
     epochs: BTreeMap<String, String>,
     retired_epochs: BTreeMap<String, BTreeSet<String>>,
+    /// The highest source sequence a projected entry covers in each timeline's current epoch. It
+    /// may overstate after removals, so a streamed chunk past it can skip the overlap scan.
+    projected_end: HashMap<String, u64>,
+    /// Each timeline's revision, taken from `next_revision` whenever its entries change. Values
+    /// never repeat, so a view that remembers one can tell whether anything changed since.
+    timeline_revisions: HashMap<String, u64>,
+    /// Like `timeline_revisions`, but taken only when entries are replaced or removed, not
+    /// appended, so a view folding in new entries knows when the ones it already has changed.
+    timeline_rewrites: HashMap<String, u64>,
+    next_revision: u64,
     pub permissions: BTreeMap<String, PermissionRequest>,
     /// Provider subagents by parent agent ID, oldest first.
     pub subagents: BTreeMap<String, Vec<ProviderSubagent>>,
@@ -1518,9 +1652,68 @@ pub(crate) struct StoreState {
 }
 
 impl StoreState {
+    pub fn agents(&self) -> &[AgentSummary] {
+        &self.agents
+    }
+
+    pub fn agent(&self, agent_id: &str) -> Option<&AgentSummary> {
+        self.agent_positions
+            .get(agent_id)
+            .and_then(|position| self.agents.get(*position))
+    }
+
+    fn agent_mut(&mut self, agent_id: &str) -> Option<&mut AgentSummary> {
+        self.agent_positions
+            .get(agent_id)
+            .and_then(|position| self.agents.get_mut(*position))
+    }
+
+    pub(crate) fn retain_agents(&mut self, keep: impl FnMut(&AgentSummary) -> bool) {
+        self.agents.retain(keep);
+        self.index_agents();
+    }
+
+    fn index_agents(&mut self) {
+        self.agent_positions = self
+            .agents
+            .iter()
+            .enumerate()
+            .map(|(position, agent)| (agent.id.clone(), position))
+            .collect();
+    }
+
+    /// Replaces the agent with the same ID in place, or appends it.
+    pub(crate) fn upsert_agent(&mut self, agent: AgentSummary) {
+        match self.agent_mut(&agent.id) {
+            Some(existing) => *existing = agent,
+            None => {
+                self.agent_positions
+                    .insert(agent.id.clone(), self.agents.len());
+                self.agents.push(agent);
+            }
+        }
+    }
+
+    /// Lists `agents` as they are, without the permission requests `set_agents` takes from them.
+    #[cfg(test)]
+    pub(crate) fn test_set_agents(&mut self, agents: Vec<AgentSummary>) {
+        self.agents = agents;
+        self.index_agents();
+    }
+
     fn clear_for_connection(&mut self) {
         self.agents.clear();
+        self.agent_positions.clear();
         self.timeline.clear();
+        self.projected_end.clear();
+        self.next_revision += 1;
+        for revision in self
+            .timeline_revisions
+            .values_mut()
+            .chain(self.timeline_rewrites.values_mut())
+        {
+            *revision = self.next_revision;
+        }
         self.epochs.clear();
         self.retired_epochs.clear();
         self.permissions.clear();
@@ -1645,29 +1838,83 @@ impl StoreState {
                 .entry(agent_id.to_owned())
                 .or_default()
                 .insert(previous);
-            self.timeline.retain(|(id, _, _), _| id != agent_id);
+            self.remove_timeline(agent_id);
         }
         true
     }
 
-    fn upsert_agent(&mut self, agent: AgentSummary) {
-        if let Some(existing) = self
-            .agents
-            .iter_mut()
-            .find(|existing| existing.id == agent.id)
-        {
-            *existing = agent;
-        } else {
-            self.agents.push(agent);
+    /// Changes whenever any entry of this agent's or subagent's timeline changes, including an
+    /// in-place replacement that keeps the entry count.
+    pub fn timeline_revision(&self, timeline_id: &str) -> u64 {
+        self.timeline_revisions
+            .get(timeline_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Changes whenever an entry of this timeline is replaced or removed; see
+    /// `timeline_rewrites`.
+    pub fn timeline_rewrite(&self, timeline_id: &str) -> u64 {
+        self.timeline_rewrites
+            .get(timeline_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn bump_revision(&mut self, timeline_id: &str) {
+        self.next_revision += 1;
+        match self.timeline_revisions.get_mut(timeline_id) {
+            Some(revision) => *revision = self.next_revision,
+            None => {
+                self.timeline_revisions
+                    .insert(timeline_id.to_owned(), self.next_revision);
+            }
+        }
+    }
+
+    fn bump_rewrite(&mut self, timeline_id: &str) {
+        self.bump_revision(timeline_id);
+        self.timeline_rewrites
+            .insert(timeline_id.to_owned(), self.next_revision);
+    }
+
+    /// Drops every entry of one agent's or subagent's timeline, in all epochs.
+    pub fn remove_timeline(&mut self, timeline_id: &str) {
+        // Keys sort by timeline ID first, and `{id}\0` is the smallest ID after `id`.
+        let start = (timeline_id.to_owned(), String::new(), 0);
+        let end = (format!("{timeline_id}\0"), String::new(), 0);
+        let keys = self
+            .timeline
+            .range(start..end)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in &keys {
+            self.timeline.remove(key);
+        }
+        self.projected_end.remove(timeline_id);
+        self.bump_rewrite(timeline_id);
+    }
+
+    fn note_projected_end(&mut self, entry: &TimelineEntry) {
+        if !is_projected(entry) {
+            return;
+        }
+        let end = source_ranges(entry)
+            .map(|(_, end)| end)
+            .max()
+            .unwrap_or(entry.sequence);
+        match self.projected_end.get_mut(&entry.agent_id) {
+            Some(projected_end) => *projected_end = (*projected_end).max(end),
+            None => {
+                self.projected_end.insert(entry.agent_id.clone(), end);
+            }
         }
     }
 
     /// Sets one feature's value in the agent's snapshot until the daemon sends the new one.
     fn patch_feature(&mut self, agent_id: &str, feature_id: &str, value: Value) {
         let feature = self
-            .agents
-            .iter_mut()
-            .find(|agent| agent.id == agent_id)
+            .agent_mut(agent_id)
             .and_then(|agent| agent.extra.get_mut("features"))
             .and_then(Value::as_array_mut)
             .and_then(|features| {
@@ -1682,101 +1929,190 @@ impl StoreState {
     }
 
     fn patch_agent(&mut self, agent_id: &str, key: &str, value: Value) {
-        if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == agent_id)
+        if let Some(agent) = self.agent_mut(agent_id)
             && let Some(object) = agent.extra.as_object_mut()
         {
             object.insert(key.to_owned(), value);
         }
     }
 
+    /// Replaces every agent, and the permission requests they list, with a directory snapshot.
+    /// A snapshot listing an agent twice keeps the first, so each ID has one place to find.
     pub fn set_agents(&mut self, agents: Vec<AgentSummary>) {
+        let mut listed = HashSet::new();
+        let agents = agents
+            .into_iter()
+            .filter(|agent| listed.insert(agent.id.clone()))
+            .collect::<Vec<_>>();
         self.permissions.clear();
         for agent in &agents {
-            if let Some(requests) = agent
-                .extra
-                .get("pendingPermissions")
-                .and_then(|value| value.as_array())
-            {
-                for request in requests {
-                    if let Some(request_id) = request.get("id").and_then(|value| value.as_str()) {
-                        let title = request
-                            .get("title")
-                            .or_else(|| request.get("name"))
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("Permission Required");
-                        self.permissions.insert(
-                            request_id.into(),
-                            PermissionRequest {
-                                agent_id: agent.id.clone(),
-                                request_id: request_id.into(),
-                                title: title.into(),
-                                description: request
-                                    .get("description")
-                                    .and_then(|value| value.as_str())
-                                    .map(str::to_owned),
-                                extra: request.clone(),
-                            },
-                        );
-                    }
-                }
-            }
+            self.permissions.extend(
+                paseo_client::pending_permissions(agent)
+                    .map(|request| (request.request_id.clone(), request)),
+            );
         }
         self.agents = agents;
+        self.index_agents();
+    }
+
+    /// Replaces one agent in place, or appends a new one, and returns whether anything changed.
+    /// Its permission requests become the ones it lists, as a snapshot would make them.
+    fn apply_agent_update(&mut self, agent: AgentSummary) -> bool {
+        if self.agent(&agent.id) == Some(&agent) {
+            return false;
+        }
+        self.permissions
+            .retain(|_, request| request.agent_id != agent.id);
+        self.permissions.extend(
+            paseo_client::pending_permissions(&agent)
+                .map(|request| (request.request_id.clone(), request)),
+        );
+        self.upsert_agent(agent);
+        true
+    }
+
+    fn remove_agent(&mut self, agent_id: &str) -> bool {
+        let Some(index) = self.agent_positions.remove(agent_id) else {
+            return false;
+        };
+        self.agents.remove(index);
+        for position in self.agent_positions.values_mut() {
+            if *position > index {
+                *position -= 1;
+            }
+        }
+        self.permissions
+            .retain(|_, request| request.agent_id != agent_id);
+        true
     }
 
     pub fn set_history(&mut self, agent_id: &str, entries: Vec<TimelineEntry>) {
-        for entry in entries {
-            if entry.agent_id == agent_id {
-                self.insert_projected_entry(entry);
-            }
-        }
+        self.insert_projected_entries(
+            entries
+                .into_iter()
+                .filter(|entry| entry.agent_id == agent_id)
+                .collect(),
+        );
     }
 
     pub fn insert_entry(&mut self, entry: TimelineEntry) {
         if !self.begin_epoch(&entry.agent_id, &entry.epoch) {
             return;
         }
-        let start = (entry.agent_id.clone(), entry.epoch.clone(), 0);
-        let end = (entry.agent_id.clone(), entry.epoch.clone(), entry.sequence);
-        if self.timeline.range(start..=end).any(|(_, existing)| {
-            existing.extra.get("sourceSeqRanges").is_some()
-                && source_ranges(existing)
-                    .iter()
-                    .any(|(start, end)| *start <= entry.sequence && entry.sequence <= *end)
-        }) {
-            return;
+        let sequence = entry.sequence;
+        let may_be_covered = self
+            .projected_end
+            .get(&entry.agent_id)
+            .is_some_and(|projected_end| sequence <= *projected_end);
+        if may_be_covered {
+            let start = (entry.agent_id.clone(), entry.epoch.clone(), 0);
+            let end = (entry.agent_id.clone(), entry.epoch.clone(), sequence);
+            if self.timeline.range(start..=end).any(|(_, existing)| {
+                is_projected(existing)
+                    && source_ranges(existing)
+                        .any(|(start, end)| start <= sequence && sequence <= end)
+            }) {
+                return;
+            }
         }
-        self.timeline.insert(
-            (entry.agent_id.clone(), entry.epoch.clone(), entry.sequence),
-            entry,
-        );
+        self.note_projected_end(&entry);
+        let timeline_id = entry.agent_id.clone();
+        let replaced = self
+            .timeline
+            .insert(
+                (entry.agent_id.clone(), entry.epoch.clone(), sequence),
+                entry,
+            )
+            .is_some();
+        if replaced {
+            self.bump_rewrite(&timeline_id);
+        } else {
+            self.bump_revision(&timeline_id);
+        }
     }
 
-    pub fn insert_projected_entry(&mut self, entry: TimelineEntry) {
-        if !self.begin_epoch(&entry.agent_id, &entry.epoch) {
-            return;
+    /// Inserts a page of projected entries, which replace the entries they overlap, in one pass
+    /// over the part of the timeline they can overlap.
+    pub fn insert_projected_entries(&mut self, entries: Vec<TimelineEntry>) {
+        let mut entries = entries.into_iter().peekable();
+        while let Some(first) = entries.next() {
+            let mut run = vec![first];
+            while let Some(next) = entries.next_if(|next| {
+                run.first().is_some_and(|first| {
+                    next.agent_id == first.agent_id && next.epoch == first.epoch
+                })
+            }) {
+                run.push(next);
+            }
+            self.insert_projected_run(run);
         }
-        let ranges = source_ranges(&entry);
-        self.timeline.retain(|_, existing| {
-            existing.agent_id != entry.agent_id
-                || existing.epoch != entry.epoch
-                || !source_ranges(existing)
-                    .iter()
-                    .any(|(existing_start, existing_end)| {
-                        ranges
-                            .iter()
-                            .any(|(start, end)| start <= existing_end && existing_start <= end)
-                    })
-        });
-        self.timeline.insert(
-            (entry.agent_id.clone(), entry.epoch.clone(), entry.sequence),
-            entry,
-        );
     }
 
-    pub fn apply_event(&mut self, event: PaseoEvent) {
+    /// Inserts projected entries of one timeline epoch as if one at a time: each replaces the
+    /// earlier entries it overlaps.
+    fn insert_projected_run(&mut self, run: Vec<TimelineEntry>) {
+        let Some((agent_id, epoch)) = run
+            .first()
+            .map(|first| (first.agent_id.clone(), first.epoch.clone()))
+        else {
+            return;
+        };
+        if !self.begin_epoch(&agent_id, &epoch) {
+            return;
+        }
+        let mut later_ranges = Vec::new();
+        let mut later_sequences = HashSet::new();
+        let mut kept = Vec::with_capacity(run.len());
+        for entry in run.into_iter().rev() {
+            let replaced_later = !later_sequences.insert(entry.sequence)
+                || source_ranges(&entry).any(|range| {
+                    later_ranges
+                        .iter()
+                        .any(|later| ranges_overlap(range, *later))
+                });
+            later_ranges.extend(source_ranges(&entry));
+            if !replaced_later {
+                kept.push(entry);
+            }
+        }
+        let page_ranges = merged_ranges(later_ranges);
+        // An entry's source ranges start at or after its own sequence, so entries starting past
+        // the page's last range cannot overlap it.
+        let last_end = page_ranges.last().map_or(0, |(_, end)| *end);
+        let start = (agent_id.clone(), epoch.clone(), 0);
+        let end = (agent_id.clone(), epoch.clone(), last_end);
+        let overlapped = self
+            .timeline
+            .range(start..=end)
+            .filter(|(_, existing)| {
+                source_ranges(existing).any(|range| overlaps_merged(range, &page_ranges))
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in &overlapped {
+            self.timeline.remove(key);
+        }
+        let mut rewrote = !overlapped.is_empty();
+        for entry in kept.into_iter().rev() {
+            self.note_projected_end(&entry);
+            rewrote |= self
+                .timeline
+                .insert((agent_id.clone(), epoch.clone(), entry.sequence), entry)
+                .is_some();
+        }
+        if rewrote {
+            self.bump_rewrite(&agent_id);
+        } else {
+            self.bump_revision(&agent_id);
+        }
+    }
+
+    /// Applies an event and returns whether it changed anything views show.
+    pub fn apply_event(&mut self, event: PaseoEvent) -> bool {
         match event {
             PaseoEvent::AgentsChanged(agents) => self.set_agents(agents),
+            PaseoEvent::AgentUpserted(agent) => return self.apply_agent_update(agent),
+            PaseoEvent::AgentRemoved { agent_id } => return self.remove_agent(&agent_id),
             PaseoEvent::TimelineEntry(entry) => self.insert_entry(entry),
             PaseoEvent::TimelineReplaced { agent_id, epoch } => {
                 self.begin_epoch(&agent_id, &epoch);
@@ -1856,14 +2192,19 @@ impl StoreState {
             | PaseoEvent::DictationFailed { .. }
             | PaseoEvent::DaemonUpdateProgress { .. } => {}
         }
+        true
     }
 }
 
-fn source_ranges(entry: &TimelineEntry) -> Vec<(u64, u64)> {
-    let ranges = entry
+fn is_projected(entry: &TimelineEntry) -> bool {
+    entry.extra.get("sourceSeqRanges").is_some()
+}
+
+fn listed_source_ranges(entry: &TimelineEntry) -> impl Iterator<Item = (u64, u64)> + '_ {
+    entry
         .extra
         .get("sourceSeqRanges")
-        .and_then(|ranges| ranges.as_array())
+        .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|range| {
@@ -1872,19 +2213,45 @@ fn source_ranges(entry: &TimelineEntry) -> Vec<(u64, u64)> {
                 range.get("endSeq")?.as_u64()?,
             ))
         })
-        .collect::<Vec<_>>();
-    if ranges.is_empty() {
-        vec![(
+}
+
+/// The stream sequences an entry stands for: its listed source ranges, or else its own span.
+fn source_ranges(entry: &TimelineEntry) -> impl Iterator<Item = (u64, u64)> + '_ {
+    let own_span = listed_source_ranges(entry).next().is_none().then(|| {
+        (
             entry.sequence,
             entry
                 .extra
                 .get("seqEnd")
-                .and_then(|sequence| sequence.as_u64())
+                .and_then(Value::as_u64)
                 .unwrap_or(entry.sequence),
-        )]
-    } else {
-        ranges
+        )
+    });
+    listed_source_ranges(entry).chain(own_span)
+}
+
+fn ranges_overlap((start, end): (u64, u64), (other_start, other_end): (u64, u64)) -> bool {
+    start <= other_end && other_start <= end
+}
+
+/// Sorts ranges and merges the overlapping ones, so `overlaps_merged` can binary search them.
+fn merged_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
     }
+    merged
+}
+
+fn overlaps_merged(range: (u64, u64), merged: &[(u64, u64)]) -> bool {
+    let first_reaching = merged.partition_point(|(_, end)| *end < range.0);
+    merged
+        .get(first_reaching)
+        .is_some_and(|candidate| ranges_overlap(range, *candidate))
 }
 
 /// Paseo's sidebar status buckets (`protocol/src/agent-state-bucket.ts`), in display order.
@@ -1952,27 +2319,38 @@ pub fn agent_title(agent: &AgentSummary) -> String {
 
 /// The workspace an agent shares its sidebar row with: the one it is alone in. The project
 /// grouping titles that row with the workspace's name, so renaming the agent renames it.
-pub fn lone_agent_workspace<'a>(
-    agents: &[AgentSummary],
-    workspaces: &'a BTreeMap<String, WorkspaceDescriptor>,
+/// Generic over owned and borrowed lists, so the sidebar can pass several hosts' state without
+/// copying it.
+pub fn lone_agent_workspace<'a, Id, Descriptor>(
+    agents: &[impl std::borrow::Borrow<AgentSummary>],
+    workspaces: &'a BTreeMap<Id, Descriptor>,
     agent: &AgentSummary,
-) -> Option<&'a WorkspaceDescriptor> {
+) -> Option<&'a WorkspaceDescriptor>
+where
+    Id: std::borrow::Borrow<str> + Ord,
+    Descriptor: std::borrow::Borrow<WorkspaceDescriptor>,
+{
     let workspace_id = agent_workspace_id(agent)?;
-    let alone = agents.iter().any(|other| other.id == agent.id)
+    let mut agents = agents.iter().map(std::borrow::Borrow::borrow);
+    let alone = agents.clone().any(|other| other.id == agent.id)
         && agents
-            .iter()
             .all(|other| other.id == agent.id || agent_workspace_id(other) != Some(workspace_id));
     workspaces
         .get(workspace_id)
+        .map(std::borrow::Borrow::borrow)
         .filter(|workspace| alone && !workspace.name.trim().is_empty())
 }
 
 /// The title the project grouping shows for an agent.
-pub fn agent_display_title(
-    agents: &[AgentSummary],
-    workspaces: &BTreeMap<String, WorkspaceDescriptor>,
+pub fn agent_display_title<Id, Descriptor>(
+    agents: &[impl std::borrow::Borrow<AgentSummary>],
+    workspaces: &BTreeMap<Id, Descriptor>,
     agent: &AgentSummary,
-) -> String {
+) -> String
+where
+    Id: std::borrow::Borrow<str> + Ord,
+    Descriptor: std::borrow::Borrow<WorkspaceDescriptor>,
+{
     match lone_agent_workspace(agents, workspaces, agent) {
         Some(workspace) => workspace.name.clone(),
         None => agent_title(agent),
@@ -2044,6 +2422,14 @@ pub fn agent_provider(agent: &AgentSummary) -> &str {
 pub fn agent_updated_at(agent: &AgentSummary) -> Option<DateTime<Utc>> {
     parse_optional_timestamp(agent.extra.get("updatedAt"))
         .or_else(|| parse_optional_timestamp(agent.extra.get("createdAt")))
+}
+
+/// When the user last messaged the agent, else when it was created. Unlike `updatedAt`, which
+/// every usage update moves, this holds still while an agent works.
+pub fn agent_last_message_at(agent: &AgentSummary) -> Option<DateTime<Utc>> {
+    parse_optional_timestamp(agent.extra.get("lastUserMessageAt"))
+        .or_else(|| parse_optional_timestamp(agent.extra.get("createdAt")))
+        .or_else(|| agent_updated_at(agent))
 }
 
 pub fn agent_turn_started_at(agent: &AgentSummary) -> Option<DateTime<Utc>> {
@@ -2168,6 +2554,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_snapshot_listing_an_agent_twice_keeps_the_first() {
+        let mut state = StoreState::default();
+        state.set_agents(vec![
+            test_agent("a", "idle", json!({})),
+            test_agent("b", "idle", json!({})),
+            test_agent("a", "running", json!({})),
+        ]);
+        let ids = state
+            .agents()
+            .iter()
+            .map(|agent| agent.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["a", "b"]);
+        assert_eq!(
+            state.agent("a").map(|agent| agent.status.as_str()),
+            Some("idle")
+        );
+        assert!(state.remove_agent("a"));
+        assert!(state.agent("a").is_none(), "no second copy is left behind");
+        assert_eq!(state.agent("b").map(|agent| agent.id.as_str()), Some("b"));
+    }
+
+    #[test]
+    fn agent_lookups_follow_every_change() {
+        let mut state = StoreState::default();
+        state.set_agents(vec![
+            test_agent("a", "idle", json!({})),
+            test_agent("b", "idle", json!({})),
+            test_agent("c", "idle", json!({})),
+        ]);
+        assert!(state.apply_agent_update(test_agent("d", "running", json!({}))));
+        assert!(state.apply_agent_update(test_agent("b", "running", json!({}))));
+        assert!(state.remove_agent("a"));
+        state.patch_agent("c", "requiresAttention", Value::Bool(true));
+        let ids = state
+            .agents()
+            .iter()
+            .map(|agent| agent.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["b", "c", "d"]);
+        for id in ids {
+            assert_eq!(state.agent(id).map(|agent| agent.id.as_str()), Some(id));
+        }
+        assert_eq!(
+            state.agent("b").map(|agent| agent.status.as_str()),
+            Some("running")
+        );
+        assert_eq!(
+            state
+                .agent("c")
+                .map(|agent| agent.extra["requiresAttention"].clone()),
+            Some(Value::Bool(true))
+        );
+        assert!(state.agent("a").is_none());
+        state.retain_agents(|agent| agent.id != "c");
+        assert!(state.agent("c").is_none());
+        assert_eq!(state.agent("d").map(|agent| agent.id.as_str()), Some("d"));
+        state.clear_for_connection();
+        assert!(state.agent("d").is_none());
+    }
+
+    #[test]
     fn setting_a_feature_updates_the_agents_feature_value() {
         let mut state = StoreState::default();
         state.set_agents(vec![test_agent(
@@ -2179,7 +2627,7 @@ mod tests {
             ]}),
         )]);
         state.patch_feature("a", "fast_mode", json!(true));
-        let features = paseo_client::parse_features(&state.agents[0].extra["features"]);
+        let features = paseo_client::parse_features(&state.agents()[0].extra["features"]);
         assert_eq!(
             features[0].kind,
             paseo_client::AgentFeatureKind::Toggle(true)
@@ -2210,8 +2658,14 @@ mod tests {
     fn stale_refresh_cannot_replace_new_host_agents() {
         let mut store = PaseoStore::default();
         store.connection_generation = 2;
-        assert!(!store.apply_refresh(1, Vec::new(), vec![agent("old", "idle", json!({}))]));
-        assert!(store.state.agents.is_empty());
+        let provider = Provider {
+            id: "old".into(),
+            label: None,
+            status: "ready".into(),
+            extra: json!({}),
+        };
+        assert!(!store.apply_refresh(1, vec![provider]));
+        assert!(store.providers.is_empty());
     }
 
     fn subagent(id: &str, status: &str, created_at: &str) -> ProviderSubagent {
@@ -2446,6 +2900,105 @@ mod tests {
         assert_eq!(state.timeline.len(), 2);
     }
 
+    fn projected(sequence: u64, end: u64) -> TimelineEntry {
+        let mut projected = entry("agent", "epoch", sequence);
+        projected.extra = json!({
+            "seqEnd": end,
+            "sourceSeqRanges": [{"startSeq": sequence, "endSeq": end}]
+        });
+        projected
+    }
+
+    fn sequences(state: &StoreState, agent_id: &str) -> Vec<u64> {
+        state
+            .timeline
+            .keys()
+            .filter(|(id, _, _)| id == agent_id)
+            .map(|(_, _, sequence)| *sequence)
+            .collect()
+    }
+
+    #[test]
+    fn projected_page_replaces_only_overlapping_entries_of_its_timeline() {
+        let mut state = StoreState::default();
+        for sequence in 1..=6 {
+            state.insert_entry(entry("agent", "epoch", sequence));
+        }
+        state.insert_entry(entry("other", "epoch", 2));
+        state.set_history("agent", vec![projected(1, 2), projected(3, 4)]);
+        assert_eq!(sequences(&state, "agent"), vec![1, 3, 5, 6]);
+        assert_eq!(sequences(&state, "other"), vec![2]);
+
+        state.insert_entry(entry("agent", "epoch", 4));
+        assert_eq!(sequences(&state, "agent"), vec![1, 3, 5, 6]);
+        state.insert_entry(entry("agent", "epoch", 7));
+        assert_eq!(sequences(&state, "agent"), vec![1, 3, 5, 6, 7]);
+
+        state.set_history("agent", vec![projected(5, 7)]);
+        assert_eq!(sequences(&state, "agent"), vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn later_page_entry_replaces_an_earlier_one_it_overlaps() {
+        let mut state = StoreState::default();
+        state.set_history(
+            "agent",
+            vec![projected(1, 3), projected(2, 2), projected(4, 4)],
+        );
+        assert_eq!(sequences(&state, "agent"), vec![2, 4]);
+    }
+
+    #[test]
+    fn timeline_revision_changes_with_every_change_to_its_entries() {
+        let mut store = PaseoStore::default();
+        assert_eq!(store.state.timeline_revision("agent"), 0);
+        store.state.set_history("agent", vec![projected(1, 1)]);
+        let first = store.state.timeline_revision("agent");
+        assert_ne!(first, 0);
+
+        let mut replacement = projected(1, 1);
+        replacement.payload = TimelinePayload::Message(json!({"text": "edited"}));
+        store.state.set_history("agent", vec![replacement]);
+        let replaced = store.state.timeline_revision("agent");
+        assert_eq!(store.entries_for("agent").count(), 1);
+        assert_ne!(
+            replaced, first,
+            "an in-place replacement changes the revision"
+        );
+
+        store.state.insert_entry(entry("other", "epoch", 1));
+        assert_eq!(store.state.timeline_revision("agent"), replaced);
+
+        store.state.apply_event(PaseoEvent::TimelineReplaced {
+            agent_id: "agent".into(),
+            epoch: "next".into(),
+        });
+        let after_replacement = store.state.timeline_revision("agent");
+        assert_ne!(after_replacement, replaced);
+
+        store.state.clear_for_connection();
+        assert_ne!(store.state.timeline_revision("agent"), after_replacement);
+    }
+
+    #[test]
+    fn timeline_rewrite_moves_only_when_entries_are_replaced() {
+        let mut store = PaseoStore::default();
+        store.state.insert_entry(entry("agent", "epoch", 1));
+        store.state.insert_entry(entry("agent", "epoch", 2));
+        let appended = store.state.timeline_rewrite("agent");
+        assert_eq!(appended, 0, "appending is not a rewrite");
+
+        store.state.insert_entry(entry("agent", "epoch", 1));
+        let replaced = store.state.timeline_rewrite("agent");
+        assert_ne!(
+            replaced, appended,
+            "an entry replaced in place is a rewrite"
+        );
+
+        store.state.insert_entry(entry("agent", "epoch", 3));
+        assert_eq!(store.state.timeline_rewrite("agent"), replaced);
+    }
+
     #[test]
     fn empty_and_disconnected_state_keep_a_visible_error() {
         let mut state = StoreState::default();
@@ -2676,5 +3229,128 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(notifications.get(), 1);
+    }
+
+    fn agent_ids(store: &gpui::Entity<PaseoStore>, cx: &gpui::TestAppContext) -> Vec<String> {
+        cx.read(|cx| {
+            store
+                .read(cx)
+                .state
+                .agents()
+                .iter()
+                .map(|agent| agent.id.clone())
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    fn agent_updates_patch_the_list_and_skip_unchanged_ones(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(|_| PaseoStore::default());
+        let notifications = std::rc::Rc::new(std::cell::Cell::new(0));
+        let _observer = cx.update(|cx| {
+            let notifications = notifications.clone();
+            cx.observe(&store, move |_, _| {
+                notifications.set(notifications.get() + 1)
+            })
+        });
+        let send = |event: PaseoEvent, cx: &mut gpui::TestAppContext| {
+            store.update(cx, |store, cx| store.handle_event(event, cx));
+            cx.run_until_parked();
+            notifications.get()
+        };
+
+        let snapshot = vec![agent("a", "idle", json!({})), agent("b", "idle", json!({}))];
+        assert_eq!(send(PaseoEvent::AgentsChanged(snapshot), cx), 1);
+        let running = agent("b", "running", json!({}));
+        assert_eq!(send(PaseoEvent::AgentUpserted(running.clone()), cx), 2);
+        assert_eq!(agent_ids(&store, cx), vec!["a", "b"]);
+        assert_eq!(
+            send(PaseoEvent::AgentUpserted(running), cx),
+            2,
+            "an unchanged agent does not re-render views"
+        );
+        assert_eq!(
+            send(PaseoEvent::AgentUpserted(agent("c", "idle", json!({}))), cx),
+            3
+        );
+        assert_eq!(agent_ids(&store, cx), vec!["a", "b", "c"]);
+        assert_eq!(
+            send(
+                PaseoEvent::AgentRemoved {
+                    agent_id: "unknown".into()
+                },
+                cx
+            ),
+            3
+        );
+        assert_eq!(
+            send(
+                PaseoEvent::AgentRemoved {
+                    agent_id: "a".into()
+                },
+                cx
+            ),
+            4
+        );
+        assert_eq!(agent_ids(&store, cx), vec!["b", "c"]);
+    }
+
+    #[gpui::test]
+    fn queued_events_apply_in_one_update(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(|_| PaseoStore::default());
+        let notifications = std::rc::Rc::new(std::cell::Cell::new(0));
+        let _observer = cx.update(|cx| {
+            let notifications = notifications.clone();
+            cx.observe(&store, move |_, _| {
+                notifications.set(notifications.get() + 1)
+            })
+        });
+        store.update(cx, |store, cx| {
+            store.handle_events(
+                0,
+                vec![
+                    PaseoEvent::AgentsChanged(vec![agent("old", "idle", json!({}))]),
+                    PaseoEvent::AgentsChanged(vec![agent("a", "idle", json!({}))]),
+                    PaseoEvent::AgentUpserted(agent("b", "idle", json!({}))),
+                ],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert_eq!(notifications.get(), 1);
+        assert_eq!(agent_ids(&store, cx), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn agent_update_replaces_only_its_own_permission_requests() {
+        let mut state = StoreState::default();
+        state.set_agents(vec![
+            agent(
+                "a",
+                "idle",
+                json!({"pendingPermissions":[{"id":"a-request", "name":"Run"}]}),
+            ),
+            agent(
+                "b",
+                "idle",
+                json!({"pendingPermissions":[{"id":"b-request"}]}),
+            ),
+        ]);
+        assert_eq!(
+            state
+                .permissions
+                .get("b-request")
+                .map(|request| request.title.as_str()),
+            Some("Permission Required")
+        );
+        assert!(state.apply_event(PaseoEvent::AgentUpserted(agent("a", "running", json!({})))));
+        assert_eq!(
+            state.permissions.keys().collect::<Vec<_>>(),
+            vec!["b-request"]
+        );
+        assert!(state.apply_event(PaseoEvent::AgentRemoved {
+            agent_id: "b".into()
+        }));
+        assert!(state.permissions.is_empty());
     }
 }

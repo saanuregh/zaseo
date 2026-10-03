@@ -1,6 +1,6 @@
 use crate::{
-    NewFile, OpenMode, PathList, RecentWorkspace, SerializedWorkspaceLocation,
-    ToggleWorkspaceSidebar, Workspace, WorkspaceSettings,
+    OpenMode, PathList, RecentWorkspace, SerializedWorkspaceLocation, ToggleWorkspaceSidebar,
+    Workspace, WorkspaceSettings,
     item::{Item, ItemEvent},
     persistence::WorkspaceDb,
 };
@@ -160,14 +160,20 @@ impl SectionEntry {
 }
 
 // Zaseo opens projects from agents, so there's no Open Project or Clone Repository entry.
-const CONTENT: (Section<2>, Section<3>) = (
+const CONTENT: (Section<3>, Section<3>) = (
     Section {
         title: "Get Started",
         entries: [
             SectionEntry {
                 icon: IconName::Plus,
-                title: "New File",
-                action: &NewFile,
+                title: "New Workspace",
+                action: &zed_actions::paseo::NewAgentWorkspace,
+                visibility_guard: SectionVisibility::Always,
+            },
+            SectionEntry {
+                icon: IconName::Sparkle,
+                title: "New Agent",
+                action: &zed_actions::paseo::NewAgent,
                 visibility_guard: SectionVisibility::Always,
             },
             SectionEntry {
@@ -465,10 +471,10 @@ impl Render for WelcomePage {
                             .justify_center()
                             .mb_4()
                             .gap_4()
-                            .child(Vector::square(VectorName::ZedLogo, rems_from_px(45_f32)))
+                            .child(Vector::square(VectorName::ZaseoLogo, rems_from_px(45_f32)))
                             .child(
                                 v_flex().child(Headline::new(welcome_label)).child(
-                                    Label::new("The editor for what's next")
+                                    Label::new("Zed with native Paseo agents")
                                         .size(LabelSize::Small)
                                         .color(Color::Muted)
                                         .italic(),

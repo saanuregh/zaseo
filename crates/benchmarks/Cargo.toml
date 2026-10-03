@@ -33,6 +33,8 @@ language_model = { workspace = true, features = ["test-support"] }
 lsp = { workspace = true, features = ["test-support"] }
 markdown.workspace = true
 multi_buffer.workspace = true
+paseo_client.workspace = true
+paseo_ui = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }
 prompt_store.workspace = true
 rpc.workspace = true
@@ -62,4 +64,8 @@ harness = false
 
 [[bench]]
 name = "markdown_renderer"
+harness = false
+
+[[bench]]
+name = "paseo"
 harness = false

@@ -1476,7 +1476,9 @@
     "context": "Welcome",
     "use_key_equivalents": true,
     "bindings": {
-      "ctrl-n": "workspace::NewFile",
+      // Here too, Zaseo's ctrl-n starts a Paseo workspace; the Welcome page handles menu
+      // navigation, so the context-free menu binding would win over the Workspace one.
+      "ctrl-n": "paseo_ui::NewAgentWorkspace",
       "ctrl-=": ["zed::IncreaseUiFontSize", { "persist": false }],
       "ctrl-+": ["zed::IncreaseUiFontSize", { "persist": false }],
       "ctrl--": ["zed::DecreaseUiFontSize", { "persist": false }],
@@ -1675,36 +1677,58 @@
     },
   },
   {
+    // Zaseo turns Zed's edit predictions off, so their toggle gives its key to Review Last Turn,
+    // which would otherwise lose to this deeper Editor binding.
+    "context": "Editor",
+    "unbind": {
+      "ctrl-alt-shift-e": "editor::ToggleEditPrediction",
+    },
+  },
+  {
     "context": "Workspace",
     "use_key_equivalents": true,
+    // Zaseo is agent-first, so these take Zed's New File and Project Symbols keys everywhere;
+    // both stay in the command palette.
+    "unbind": {
+      "ctrl-n": "workspace::NewFile",
+      "ctrl-t": "project_symbols::Toggle",
+    },
     "bindings": {
-      "ctrl-alt-p": "paseo_ui::TogglePanel",
-      "ctrl-alt-k": "command_palette::Toggle",
       "ctrl-alt-n": "paseo_ui::NewAgentWorkspace",
       "ctrl-alt-t": "paseo_ui::NewAgent",
+      "ctrl-n": "paseo_ui::NewAgentWorkspace",
+      "ctrl-t": "paseo_ui::NewAgent",
+      "ctrl-alt-shift-e": "paseo_ui::ReviewLastTurn",
+      "ctrl-1": ["paseo_ui::OpenSidebarRowAtIndex", { "index": 1 }],
+      "ctrl-2": ["paseo_ui::OpenSidebarRowAtIndex", { "index": 2 }],
+      "ctrl-3": ["paseo_ui::OpenSidebarRowAtIndex", { "index": 3 }],
+      "ctrl-4": ["paseo_ui::OpenSidebarRowAtIndex", { "index": 4 }],
+      "ctrl-5": ["paseo_ui::OpenSidebarRowAtIndex", { "index": 5 }],
+      "ctrl-6": ["paseo_ui::OpenSidebarRowAtIndex", { "index": 6 }],
+      "ctrl-7": ["paseo_ui::OpenSidebarRowAtIndex", { "index": 7 }],
+      "ctrl-8": ["paseo_ui::OpenSidebarRowAtIndex", { "index": 8 }],
+      "ctrl-9": ["paseo_ui::OpenSidebarRowAtIndex", { "index": 9 }],
+      "ctrl-alt-p": "paseo_ui::TogglePanel",
       "ctrl-alt-]": "paseo_ui::NextAgent",
       "ctrl-alt-[": "paseo_ui::PreviousAgent",
+    },
+  },
+  {
+    // Repeated from the Workspace block so they beat Zed's context-free menu bindings in views
+    // that handle menus, such as the sidebar. Every Paseo screen adds `PaseoView` to its context.
+    "context": "PaseoView",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-n": "paseo_ui::NewAgentWorkspace",
+      "ctrl-t": "paseo_ui::NewAgent",
     },
   },
   {
     "context": "PaseoAgentView || PaseoSidebar",
     "use_key_equivalents": true,
     "bindings": {
-      "ctrl-k": "command_palette::Toggle",
-      "ctrl-n": "paseo_ui::NewAgentWorkspace",
-      "ctrl-t": "paseo_ui::NewAgent",
       "ctrl-shift-backspace": "paseo_ui::ArchiveAgent",
-      "ctrl-e": "paseo_ui::ReviewLastTurn",
       "ctrl-shift-t": "paseo_ui::NewTerminal",
-      "ctrl-1": ["paseo_ui::OpenAgentAtIndex", { "index": 1 }],
-      "ctrl-2": ["paseo_ui::OpenAgentAtIndex", { "index": 2 }],
-      "ctrl-3": ["paseo_ui::OpenAgentAtIndex", { "index": 3 }],
-      "ctrl-4": ["paseo_ui::OpenAgentAtIndex", { "index": 4 }],
-      "ctrl-5": ["paseo_ui::OpenAgentAtIndex", { "index": 5 }],
-      "ctrl-6": ["paseo_ui::OpenAgentAtIndex", { "index": 6 }],
-      "ctrl-7": ["paseo_ui::OpenAgentAtIndex", { "index": 7 }],
-      "ctrl-8": ["paseo_ui::OpenAgentAtIndex", { "index": 8 }],
-      "ctrl-9": ["paseo_ui::OpenAgentAtIndex", { "index": 9 }],
     },
   },
   {
@@ -1750,7 +1774,6 @@
     "bindings": {
       "escape": "paseo_ui::InterruptAgent",
       "ctrl-d": "paseo_ui::ToggleDictation",
-      "ctrl-e": "paseo_ui::ReviewLastTurn",
       "ctrl-shift-t": "paseo_ui::NewTerminal",
       "shift-tab": "paseo_ui::CycleMode",
       "ctrl-/": "paseo_ui::ToggleModelPicker",

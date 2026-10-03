@@ -439,7 +439,11 @@ pub mod paseo {
         [
             /// Adds the selected code, with its file and lines, to the current Paseo agent's
             /// message.
-            AddSelectionToAgent
+            AddSelectionToAgent,
+            /// Starts a new Paseo agent in the Paseo workspace this editor workspace shows.
+            NewAgent,
+            /// Opens the New Workspace window to start a Paseo workspace with a chat or a terminal.
+            NewAgentWorkspace,
         ]
     );
 

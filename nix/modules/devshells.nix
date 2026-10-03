@@ -21,6 +21,25 @@
           passthru.env = attrs.env;
         })).env; # exfil `env`; it's not in drvAttrs
 
+      # cargo-shear as CI pins it (`.github/workflows/run_tests.yml`), since `script/clippy` passes
+      # flags older releases lack. It needs a newer rustc than nixpkgs' default.
+      cargoShear =
+        (pkgs.makeRustPlatform {
+          cargo = rustToolchain;
+          rustc = rustToolchain;
+        }).buildRustPackage
+          rec {
+            pname = "cargo-shear";
+            version = "1.13.4";
+            src = pkgs.fetchCrate {
+              inherit pname version;
+              hash = "sha256-bTTNiDWkbyjxFo59Hkeah23lQEGiuH5Xrm6z7SUNtoQ=";
+            };
+            cargoHash = "sha256-Mhxrcc9ErTYIV+yuIROuMdhbxrFdZZ2yAAXK0WRWcRI=";
+            # Its integration tests fail in the Nix build with missing files; the unit tests pass.
+            cargoTestFlags = [ "--lib" ];
+          };
+
       # Musl cross-compiler for building remote_server
       muslCross = pkgs.pkgsCross.musl64;
 
@@ -60,7 +79,7 @@
             rustToolchain # cargo, rustc, and rust-toolchain.toml components included
             cargo-nextest
             cargo-hakari
-            cargo-shear
+            cargoShear
             cargo-zigbuild
             # TODO: package protobuf-language-server for editing zed.proto
             # TODO: add other tools used in our scripts

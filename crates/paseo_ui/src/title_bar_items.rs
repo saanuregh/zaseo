@@ -6,59 +6,77 @@ use ui::{CommonAnimationExt as _, Tooltip, prelude::*};
 use workspace::Workspace;
 
 use crate::agent_view::AgentTab;
+use crate::attention::HostActivity;
 use crate::sidebar::AgentAlert;
-use crate::store::{AgentBucket, PaseoStore};
+use crate::store::AgentBucket;
 
 /// The views to put after the project name and at the start of the title bar's right side.
 pub fn title_bar_items(workspace: &Entity<Workspace>, cx: &mut App) -> (AnyView, AnyView) {
-    let store = crate::store(cx);
-    let agent = cx.new(|cx| TitleBarAgent::new(store.clone(), workspace, cx));
-    let status = cx.new(|cx| TitleBarStatus::new(store, workspace.downgrade(), cx));
+    let agent = cx.new(|cx| TitleBarAgent::new(workspace, cx));
+    let status = cx.new(|cx| TitleBarStatus::new(workspace.downgrade(), cx));
     (agent.into(), status.into())
 }
 
 struct TitleBarAgent {
-    store: Entity<PaseoStore>,
     workspace: WeakEntity<Workspace>,
+    /// The active tab's agent title and bucket, kept so a host change that doesn't touch them
+    /// doesn't re-render the title bar.
+    shown: Option<(String, AgentBucket)>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl TitleBarAgent {
-    fn new(
-        store: Entity<PaseoStore>,
-        workspace: &Entity<Workspace>,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    fn new(workspace: &Entity<Workspace>, cx: &mut Context<Self>) -> Self {
         let subscriptions = vec![
-            cx.observe(&store, |_, _, cx| cx.notify()),
-            cx.subscribe(workspace, |_, _, event: &workspace::Event, cx| {
+            cx.observe(&crate::hosts::registry(cx), |agent, _, cx| {
+                agent.update_shown(cx)
+            }),
+            cx.subscribe(workspace, |agent, _, event: &workspace::Event, cx| {
                 if matches!(event, workspace::Event::ActiveItemChanged) {
-                    cx.notify();
+                    agent.update_shown(cx);
                 }
             }),
         ];
+        // The title bar is built while the workspace is being updated, so its tab is read after.
+        let this = cx.weak_entity();
+        cx.defer(move |cx| {
+            if let Err(error) = this.update(cx, |agent, cx| agent.update_shown(cx)) {
+                log::debug!("Paseo title bar released: {error}");
+            }
+        });
         Self {
-            store,
             workspace: workspace.downgrade(),
+            shown: None,
             _subscriptions: subscriptions,
         }
     }
-}
 
-impl Render for TitleBarAgent {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn active_agent(&self, cx: &App) -> Option<(String, AgentBucket)> {
         let agent_id = self.workspace.upgrade().and_then(|workspace| {
             workspace
                 .read(cx)
                 .active_item(cx)
                 .and_then(|item| item.downcast::<AgentTab>())
                 .and_then(|tab| tab.read(cx).agent_id(cx))
-        });
-        let store = self.store.read(cx);
-        let Some((title, bucket)) = agent_id.and_then(|agent_id| {
-            let agent = store.agent(&agent_id)?;
-            Some((store.display_title(agent), store.bucket(agent)))
-        }) else {
+        })?;
+        let store = crate::hosts::store_for_agent(&agent_id, cx)?;
+        let store = store.read(cx);
+        let agent = store.agent(&agent_id)?;
+        Some((store.display_title(agent), store.bucket(agent)))
+    }
+
+    fn update_shown(&mut self, cx: &mut Context<Self>) {
+        let shown = self.active_agent(cx);
+        if shown != self.shown {
+            self.shown = shown;
+            cx.notify();
+        }
+    }
+}
+
+impl Render for TitleBarAgent {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let Some((title, bucket)) = self.shown.clone() else {
             return div().into_any_element();
         };
         let color = AgentAlert::for_bucket(bucket).map_or(Color::Muted, AgentAlert::border_color);
@@ -87,38 +105,37 @@ impl Render for TitleBarAgent {
 }
 
 struct TitleBarStatus {
-    store: Entity<PaseoStore>,
     workspace: WeakEntity<Workspace>,
-    _subscription: Subscription,
+    /// Read when a host changes, not in `render`, which the spinner's animation runs every
+    /// frame.
+    activity: HostActivity,
+    _subscriptions: [Subscription; 2],
 }
 
 impl TitleBarStatus {
-    fn new(
-        store: Entity<PaseoStore>,
-        workspace: WeakEntity<Workspace>,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let subscription = cx.observe(&store, |_, _, cx| cx.notify());
+    fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
+        let subscriptions = [
+            cx.observe(&crate::hosts::registry(cx), |status, _, cx| {
+                let activity = crate::hosts::activity(cx);
+                if activity != status.activity {
+                    status.activity = activity;
+                    cx.notify();
+                }
+            }),
+            // The bell's count can be turned off in settings.
+            cx.observe_global::<settings::SettingsStore>(|_, cx| cx.notify()),
+        ];
         Self {
-            store,
             workspace,
-            _subscription: subscription,
+            activity: crate::hosts::activity(cx),
+            _subscriptions: subscriptions,
         }
     }
 }
 
-fn running_agent_count(store: &PaseoStore) -> usize {
-    store
-        .state
-        .agents
-        .iter()
-        .filter(|agent| store.bucket(agent) == AgentBucket::Running)
-        .count()
-}
-
 impl Render for TitleBarStatus {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let running = running_agent_count(self.store.read(cx));
+        let running = self.activity.running;
         h_flex()
             .gap_1()
             .when(running > 0, |this| {
@@ -143,8 +160,8 @@ impl Render for TitleBarStatus {
             })
             .child(crate::attention::attention_bell(
                 "paseo-title-bar-attention",
-                self.store.clone(),
                 self.workspace.clone(),
+                self.activity.attention,
                 cx,
             ))
     }
@@ -161,13 +178,13 @@ mod tests {
 
     #[test]
     fn title_bar_counts_running_agents() {
-        let mut store = PaseoStore::default();
-        store.state.agents = vec![
+        let mut store = crate::store::PaseoStore::default();
+        store.state.test_set_agents(vec![
             agent("working", "running"),
             agent("starting", "initializing"),
             agent("idle", "idle"),
             agent("failed", "error"),
-        ];
-        assert_eq!(running_agent_count(&store), 2);
+        ]);
+        assert_eq!(HostActivity::of_stores([&store]).running, 2);
     }
 }

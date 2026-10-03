@@ -7,10 +7,7 @@ use gpui::{
 use paseo_client::{AgentHistoryPage, AgentSummary, RecoveryState};
 use serde_json::{Value, json};
 use std::time::Duration;
-use ui::{
-    Chip, CommonAnimationExt as _, ContextMenu, HighlightedLabel, Tooltip, prelude::*,
-    right_click_menu,
-};
+use ui::{Chip, ContextMenu, HighlightedLabel, Tooltip, prelude::*, right_click_menu};
 use workspace::{Item, Workspace, item::ItemEvent};
 
 use crate::sidebar::{provider_icon, title_match_positions};
@@ -66,6 +63,14 @@ enum HistoryStatus {
 
 /// What a History row shows, read from the agent and its project placement.
 #[derive(Clone)]
+/// What every History row reads, worked out once per render.
+struct RowStyle<'a> {
+    lower_query: &'a str,
+    hover: gpui::Hsla,
+    active: gpui::Hsla,
+    now: DateTime<Utc>,
+}
+
 struct HistoryRow {
     agent_id: String,
     workspace_id: Option<String>,
@@ -100,7 +105,7 @@ impl HistoryRow {
                 .title
                 .clone()
                 .filter(|title| !title.is_empty())
-                .unwrap_or_else(|| "New session".to_owned()),
+                .unwrap_or_else(|| "New agent".to_owned()),
             provider: agent_provider(agent).to_owned(),
             archived: agent.extra["archivedAt"].is_string(),
             pending: agent.extra["pendingPermissions"]
@@ -113,21 +118,28 @@ impl HistoryRow {
     }
 }
 
-/// Paseo's History: every agent the host keeps, active and archived, newest first in date
-/// sections, searched by the host, a page at a time.
-pub struct PaseoHistoryView {
+/// One host's History pages.
+struct HostHistory {
     store: Entity<PaseoStore>,
+    agents: Vec<AgentSummary>,
+    next_cursor: Option<String>,
+    search_truncated: bool,
+    connection_generation: u64,
+    error: Option<String>,
+    /// The page request in flight; `Some` while this host is loading.
+    load: Option<Task<()>>,
+}
+
+/// Paseo's History: every agent each host keeps, active and archived, newest first in date
+/// sections, searched by the hosts, a page per host at a time.
+pub struct PaseoHistoryView {
+    hosts: Vec<HostHistory>,
     workspace: WeakEntity<Workspace>,
     search: Entity<Editor>,
     query: String,
-    agents: Vec<AgentSummary>,
-    /// The agents' rows, newest first, rebuilt only when the agents change.
+    /// The agents' rows from every host, newest first, rebuilt only when the agents change.
     rows: Vec<HistoryRow>,
-    next_cursor: Option<String>,
-    search_truncated: bool,
     status: HistoryStatus,
-    connection_generation: u64,
-    load: Option<Task<()>>,
     search_debounce: Option<Task<()>>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -135,17 +147,16 @@ pub struct PaseoHistoryView {
 
 impl PaseoHistoryView {
     fn new(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let store = crate::store(cx);
         let search = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_placeholder_text("Search history", window, cx);
             editor
         });
         let subscriptions = vec![
-            // History isn't live, so only a host switch or reconnect, which is another host's
-            // history, needs it to load again.
-            cx.observe(&store, |view: &mut Self, store, cx| {
-                if store.read(cx).connection_generation != view.connection_generation {
+            // History isn't live, so only a host added, removed or reconnected, which changes
+            // whose history is listed, needs it to load again.
+            cx.observe(&crate::hosts::registry(cx), |view: &mut Self, _, cx| {
+                if view.hosts_changed(cx) {
                     view.reload(cx);
                 }
             }),
@@ -155,25 +166,28 @@ impl PaseoHistoryView {
                 }
             }),
         ];
-        let connection_generation = store.read(cx).connection_generation;
         let mut view = Self {
-            store,
+            hosts: Vec::new(),
             workspace,
             search,
             query: String::new(),
-            agents: Vec::new(),
             rows: Vec::new(),
-            next_cursor: None,
-            search_truncated: false,
             status: HistoryStatus::Loading,
-            connection_generation,
-            load: None,
             search_debounce: None,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
         };
         view.reload(cx);
         view
+    }
+
+    fn hosts_changed(&self, cx: &App) -> bool {
+        let stores = crate::hosts::stores(cx);
+        stores.len() != self.hosts.len()
+            || stores.iter().zip(&self.hosts).any(|(store, host)| {
+                *store != host.store
+                    || store.read(cx).connection_generation != host.connection_generation
+            })
     }
 
     fn search_changed(&mut self, cx: &mut Context<Self>) {
@@ -194,10 +208,34 @@ impl PaseoHistoryView {
         }));
     }
 
-    /// Loads the first page again, keeping the rows on screen until it arrives.
+    /// Loads every host's first page again, keeping the rows on screen until they arrive.
     pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
-        self.status = HistoryStatus::Loading;
-        self.fetch(None, cx);
+        let previous = std::mem::take(&mut self.hosts);
+        self.hosts = crate::hosts::stores(cx)
+            .into_iter()
+            .map(|store| {
+                // A host still listed keeps its rows on screen while its first page reloads.
+                let agents = previous
+                    .iter()
+                    .find(|host| host.store == store)
+                    .map(|host| host.agents.clone())
+                    .unwrap_or_default();
+                HostHistory {
+                    connection_generation: store.read(cx).connection_generation,
+                    store,
+                    agents,
+                    next_cursor: None,
+                    search_truncated: false,
+                    error: None,
+                    load: None,
+                }
+            })
+            .collect();
+        for index in 0..self.hosts.len() {
+            self.fetch(index, None, cx);
+        }
+        self.update_status(false);
+        self.agents_changed(cx);
     }
 
     fn load_more(&mut self, cx: &mut Context<Self>) {
@@ -205,47 +243,82 @@ impl PaseoHistoryView {
         if matches!(self.status, HistoryStatus::Loading) {
             return;
         }
-        let Some(cursor) = self.next_cursor.clone() else {
+        let pages = self
+            .hosts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, host)| Some((index, host.next_cursor.clone()?)))
+            .collect::<Vec<_>>();
+        if pages.is_empty() {
             return;
-        };
-        self.status = HistoryStatus::LoadingMore;
-        self.fetch(Some(cursor), cx);
+        }
+        for (index, cursor) in pages {
+            self.fetch(index, Some(cursor), cx);
+        }
+        self.update_status(true);
+        cx.notify();
     }
 
-    fn fetch(&mut self, cursor: Option<String>, cx: &mut Context<Self>) {
-        let appending = cursor.is_some();
-        let search = if self.searchable(cx) {
-            self.query.clone()
-        } else {
-            String::new()
+    fn fetch(&mut self, index: usize, cursor: Option<String>, cx: &mut Context<Self>) {
+        let Some(host) = self.hosts.get(index) else {
+            return;
         };
-        let generation = self.store.read(cx).connection_generation;
-        self.connection_generation = generation;
-        let task = self.store.update(cx, |store, cx| {
+        let searching = !self.query.is_empty();
+        let host_searches = Self::host_searches(&host.store, cx);
+        // A host that can't search would list everything under a query, so it sits out.
+        if searching && !host_searches {
+            if let Some(host) = self.hosts.get_mut(index) {
+                host.agents.clear();
+                host.next_cursor = None;
+            }
+            return;
+        }
+        let appending = cursor.is_some();
+        let search = self.query.clone();
+        let store = host.store.clone();
+        let generation = store.read(cx).connection_generation;
+        let task = store.update(cx, |store, cx| {
             store.session_request(cx, move |session| async move {
                 session.agent_history(&search, cursor).await
             })
         });
-        cx.notify();
-        self.load = Some(cx.spawn(async move |view, cx| {
+        let load = cx.spawn(async move |view, cx| {
             let result = task.await;
             if let Err(error) = view.update(cx, |view, cx| {
-                if !view.store.read(cx).is_current_connection(generation) {
+                let Some(host) = view.hosts.get_mut(index) else {
+                    return;
+                };
+                if host.store != store || !store.read(cx).is_current_connection(generation) {
                     return;
                 }
+                host.load = None;
                 match result {
-                    Ok(page) => view.apply_page(page, appending, cx),
-                    Err(error) => view.status = HistoryStatus::Failed(format!("{error:#}")),
+                    Ok(page) => {
+                        Self::apply_page(host, page, appending, cx);
+                        host.error = None;
+                    }
+                    Err(error) => host.error = Some(format!("{error:#}")),
                 }
-                cx.notify();
+                view.update_status(false);
+                view.agents_changed(cx);
             }) {
                 log::debug!("Paseo History closed before its page arrived: {error}");
             }
-        }));
+        });
+        if let Some(host) = self.hosts.get_mut(index) {
+            host.connection_generation = generation;
+            host.load = Some(load);
+        }
+        cx.notify();
     }
 
-    fn apply_page(&mut self, page: AgentHistoryPage, appending: bool, cx: &mut Context<Self>) {
-        self.store.update(cx, |store, cx| {
+    fn apply_page(
+        host: &mut HostHistory,
+        page: AgentHistoryPage,
+        appending: bool,
+        cx: &mut Context<Self>,
+    ) {
+        host.store.update(cx, |store, cx| {
             store.remember_archived(
                 page.agents
                     .iter()
@@ -255,29 +328,64 @@ impl PaseoHistoryView {
             )
         });
         if appending {
-            self.agents.extend(page.agents);
+            host.agents.extend(page.agents);
         } else {
-            self.agents = page.agents;
+            host.agents = page.agents;
         }
-        self.next_cursor = page.next_cursor;
-        self.search_truncated = page.search_truncated;
-        self.status = HistoryStatus::Idle;
-        self.agents_changed(cx);
+        host.next_cursor = page.next_cursor;
+        host.search_truncated = page.search_truncated;
+    }
+
+    /// Loading while any first page is out, failed only when every host failed and nothing
+    /// is listed.
+    fn update_status(&mut self, loading_more: bool) {
+        let loading = self.hosts.iter().any(|host| host.load.is_some());
+        let was_loading_more = matches!(self.status, HistoryStatus::LoadingMore);
+        self.status = if loading && (loading_more || was_loading_more) {
+            HistoryStatus::LoadingMore
+        } else if loading {
+            HistoryStatus::Loading
+        } else if let Some(error) = self
+            .hosts
+            .iter()
+            .find_map(|host| host.error.clone())
+            .filter(|_| self.hosts.iter().all(|host| host.error.is_some()))
+        {
+            HistoryStatus::Failed(error)
+        } else {
+            HistoryStatus::Idle
+        };
     }
 
     fn agents_changed(&mut self, cx: &mut Context<Self>) {
-        self.rows = self.agents.iter().map(HistoryRow::new).collect();
+        self.rows = self
+            .hosts
+            .iter()
+            .flat_map(|host| host.agents.iter())
+            .map(HistoryRow::new)
+            .collect();
         self.rows
             .sort_by_key(|row| std::cmp::Reverse(row.updated_at));
         cx.notify();
     }
 
-    /// Paseo shows search only when the host can search its history.
+    fn host_searches(store: &Entity<PaseoStore>, cx: &App) -> bool {
+        store.read(cx).server_info.has_feature("agentHistorySearch")
+    }
+
+    /// Paseo shows search only when a host can search its history.
     fn searchable(&self, cx: &App) -> bool {
-        self.store
-            .read(cx)
-            .server_info
-            .has_feature("agentHistorySearch")
+        self.hosts
+            .iter()
+            .any(|host| Self::host_searches(&host.store, cx))
+    }
+
+    fn has_more(&self) -> bool {
+        self.hosts.iter().any(|host| host.next_cursor.is_some())
+    }
+
+    fn search_truncated(&self) -> bool {
+        self.hosts.iter().any(|host| host.search_truncated)
     }
 
     fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -294,9 +402,19 @@ impl PaseoHistoryView {
         });
     }
 
+    /// The host listing an agent's row.
+    fn host_of_agent(&mut self, agent_id: &str) -> Option<&mut HostHistory> {
+        self.hosts
+            .iter_mut()
+            .find(|host| host.agents.iter().any(|agent| agent.id == agent_id))
+    }
+
     /// Marks an agent archived or active in the rows, since History doesn't follow live changes.
     fn set_archived(&mut self, agent_id: &str, archived: bool, cx: &mut Context<Self>) {
-        if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == agent_id) {
+        if let Some(agent) = self
+            .host_of_agent(agent_id)
+            .and_then(|host| host.agents.iter_mut().find(|agent| agent.id == agent_id))
+        {
             agent.extra["archivedAt"] = if archived {
                 json!(Utc::now().to_rfc3339())
             } else {
@@ -307,30 +425,41 @@ impl PaseoHistoryView {
     }
 
     fn archive_row(&mut self, agent_id: &str, cx: &mut Context<Self>) {
-        self.store
-            .update(cx, |store, cx| store.archive(agent_id, cx));
+        if let Some(store) = self.host_of_agent(agent_id).map(|host| host.store.clone()) {
+            store.update(cx, |store, cx| store.archive(agent_id, cx));
+        }
         self.set_archived(agent_id, true, cx);
     }
 
     fn unarchive_row(&mut self, agent_id: &str, cx: &mut Context<Self>) {
-        self.store
-            .update(cx, |store, cx| store.unarchive(agent_id, cx));
+        if let Some(store) = self.host_of_agent(agent_id).map(|host| host.store.clone()) {
+            store.update(cx, |store, cx| store.unarchive(agent_id, cx));
+        }
         self.set_archived(agent_id, false, cx);
     }
 
     fn delete_row(&mut self, agent_id: &str, cx: &mut Context<Self>) {
-        self.store
-            .update(cx, |store, cx| store.delete(agent_id, cx));
-        self.agents.retain(|agent| agent.id != agent_id);
+        if let Some(host) = self.host_of_agent(agent_id) {
+            let store = host.store.clone();
+            host.agents.retain(|agent| agent.id != agent_id);
+            store.update(cx, |store, cx| store.delete(agent_id, cx));
+        }
         self.agents_changed(cx);
     }
 
     /// Restoring a workspace brings back its archived agents.
     fn restore_workspace_row(&mut self, workspace_id: &str, cx: &mut Context<Self>) {
-        self.store.update(cx, |store, cx| {
+        let Some(host) = self.hosts.iter_mut().find(|host| {
+            host.agents
+                .iter()
+                .any(|agent| agent_workspace_id(agent) == Some(workspace_id))
+        }) else {
+            return;
+        };
+        host.store.update(cx, |store, cx| {
             store.restore_workspace(workspace_id.to_owned(), cx)
         });
-        for agent in &mut self.agents {
+        for agent in &mut host.agents {
             if agent_workspace_id(agent) == Some(workspace_id) {
                 agent.extra["archivedAt"] = Value::Null;
             }
@@ -348,13 +477,13 @@ impl PaseoHistoryView {
 
     fn render_text(
         text: String,
-        query: &str,
+        lower_query: &str,
         color: Color,
         size: LabelSize,
         weight: Option<FontWeight>,
     ) -> AnyElement {
-        let positions = (!query.is_empty())
-            .then(|| title_match_positions(&text, &query.to_lowercase()))
+        let positions = (!lower_query.is_empty())
+            .then(|| title_match_positions(&text, lower_query))
             .flatten();
         match positions {
             Some(positions) => HighlightedLabel::new(text, positions)
@@ -371,10 +500,15 @@ impl PaseoHistoryView {
         }
     }
 
-    fn render_row(&self, index: usize, row: HistoryRow, cx: &mut Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors().clone();
-        let query = self.query.clone();
-        let now = Utc::now();
+    fn render_row(
+        &self,
+        index: usize,
+        row: &HistoryRow,
+        style: &RowStyle,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let query = style.lower_query;
+        let (hover, active) = (style.hover, style.active);
         let column = |text: Option<String>, width: f32| {
             div()
                 .flex_none()
@@ -382,7 +516,7 @@ impl PaseoHistoryView {
                 .min_w_0()
                 .child(Self::render_text(
                     text.unwrap_or_default(),
-                    &query,
+                    query,
                     Color::Muted,
                     LabelSize::Small,
                     None,
@@ -399,8 +533,8 @@ impl PaseoHistoryView {
                 .gap_2()
                 .rounded_md()
                 .cursor_pointer()
-                .hover(|style| style.bg(colors.ghost_element_hover))
-                .active(|style| style.bg(colors.ghost_element_active))
+                .hover(|style| style.bg(hover))
+                .active(|style| style.bg(active))
                 .on_click(cx.listener(move |view, _, window, cx| view.open(&agent_id, window, cx)))
                 .child(
                     h_flex()
@@ -410,7 +544,7 @@ impl PaseoHistoryView {
                         .child(div().flex_none().max_w(px(320.)).min_w_0().child(
                             Self::render_text(
                                 row.place.clone(),
-                                &query,
+                                query,
                                 Color::Default,
                                 LabelSize::Default,
                                 None,
@@ -428,7 +562,7 @@ impl PaseoHistoryView {
                         )
                         .child(div().min_w_0().flex_shrink_1().child(Self::render_text(
                             row.title.clone(),
-                            &query,
+                            query,
                             Color::Muted,
                             LabelSize::Default,
                             None,
@@ -454,7 +588,7 @@ impl PaseoHistoryView {
                     div().flex_none().w(px(72.)).flex().justify_end().child(
                         Label::new(
                             row.updated_at
-                                .map(|updated_at| format_relative(updated_at, now))
+                                .map(|updated_at| format_relative(updated_at, style.now))
                                 .unwrap_or_default(),
                         )
                         .size(LabelSize::Small)
@@ -469,34 +603,33 @@ impl PaseoHistoryView {
     fn row_menu(
         &self,
         index: usize,
-        row: HistoryRow,
+        row: &HistoryRow,
         item: gpui::Stateful<gpui::Div>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let view = cx.weak_entity();
-        let HistoryRow {
-            agent_id,
-            workspace_id,
-            archived,
-            ..
-        } = row;
+        let agent_id = row.agent_id.clone();
+        let workspace_id = row.workspace_id.clone();
+        let archived = row.archived;
         right_click_menu(("paseo-history-menu", index))
             .trigger(move |_, _, _| item)
             .menu(move |window, cx| {
                 // Asked when the menu opens, since recovery arrives after the rows.
                 let restorable_workspace = workspace_id.clone().filter(|workspace_id| {
                     archived
-                        && matches!(
-                            crate::store(cx).read(cx).recovery.get(workspace_id),
-                            Some(RecoveryState::Recoverable { .. })
-                        )
+                        && crate::hosts::stores(cx).iter().any(|store| {
+                            matches!(
+                                store.read(cx).recovery.get(workspace_id),
+                                Some(RecoveryState::Recoverable { .. })
+                            )
+                        })
                 });
                 let (view, agent_id) = (view.clone(), agent_id.clone());
                 ContextMenu::build(window, cx, move |menu, _, _| {
                     if !archived {
                         return menu.entry(
                             "Archive",
-                            None,
+                            Some(Box::new(crate::ArchiveAgent)),
                             row_action(&view, &agent_id, Self::archive_row),
                         );
                     }
@@ -513,11 +646,24 @@ impl PaseoHistoryView {
                         ),
                         None => menu,
                     };
-                    menu.separator().entry(
-                        "Delete Permanently",
-                        None,
-                        row_action(&view, &agent_id, Self::delete_row),
-                    )
+                    menu.separator()
+                        .entry("Delete Permanently…", None, move |window, cx| {
+                            let (view, agent_id) = (view.clone(), agent_id.clone());
+                            crate::workspace_tools::confirm_then(
+                                "Delete this agent permanently?",
+                                "Its conversation is removed from the host and can't be recovered.",
+                                "Delete Permanently",
+                                move |cx| {
+                                    if let Err(error) =
+                                        view.update(cx, |view, cx| view.delete_row(&agent_id, cx))
+                                    {
+                                        log::debug!("Paseo History closed: {error}");
+                                    }
+                                },
+                                window,
+                                cx,
+                            );
+                        })
                 })
             })
             .into_any_element()
@@ -525,9 +671,17 @@ impl PaseoHistoryView {
 
     fn render_list(&self, cx: &mut Context<Self>) -> AnyElement {
         let today = Local::now().date_naive();
+        let lower_query = self.query.to_lowercase();
+        let colors = cx.theme().colors();
+        let style = RowStyle {
+            lower_query: &lower_query,
+            hover: colors.ghost_element_hover,
+            active: colors.ghost_element_active,
+            now: Utc::now(),
+        };
         let mut list = v_flex().gap_0p5();
         let mut current = None;
-        for (index, row) in self.rows.clone().into_iter().enumerate() {
+        for (index, row) in self.rows.iter().enumerate() {
             let section = history_section(
                 row.updated_at
                     .map(|updated_at| updated_at.with_timezone(&Local).date_naive()),
@@ -543,13 +697,13 @@ impl PaseoHistoryView {
                         .child(Label::new(section.label()).color(Color::Muted)),
                 );
             }
-            list = list.child(self.render_row(index, row, cx));
+            list = list.child(self.render_row(index, row, &style, cx));
         }
         list.into_any_element()
     }
 
     fn render_footer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.search_truncated {
+        if self.search_truncated() {
             return Some(
                 Label::new("Too many matches — narrow your search")
                     .size(LabelSize::Small)
@@ -557,7 +711,7 @@ impl PaseoHistoryView {
                     .into_any_element(),
             );
         }
-        self.next_cursor.as_ref()?;
+        self.has_more().then_some(())?;
         let loading = matches!(
             self.status,
             HistoryStatus::Loading | HistoryStatus::LoadingMore
@@ -565,7 +719,7 @@ impl PaseoHistoryView {
         Some(
             Button::new(
                 "paseo-history-load-more",
-                if loading { "Loading..." } else { "Load more" },
+                if loading { "Loading…" } else { "Load more" },
             )
             .style(ButtonStyle::Subtle)
             .disabled(loading)
@@ -576,67 +730,56 @@ impl PaseoHistoryView {
 
     fn render_empty(&self, cx: &mut Context<Self>) -> AnyElement {
         let searching = !self.query.is_empty();
+        let message = crate::render_message(
+            if searching {
+                "No agents match"
+            } else {
+                "No agents yet"
+            },
+            None,
+            searching.then(|| {
+                Button::new("paseo-history-clear-search", "Clear search")
+                    .style(ButtonStyle::Subtle)
+                    .on_click(cx.listener(|view, _, window, cx| view.clear_search(window, cx)))
+                    .into_any_element()
+            }),
+        );
         v_flex()
-            .py_12()
-            .gap_3()
+            .py_8()
             .items_center()
-            .child(
-                Label::new(if searching {
-                    "No sessions match"
-                } else {
-                    "No sessions yet"
-                })
-                .color(Color::Muted),
-            )
-            .when(searching, |this| {
-                this.child(
-                    Button::new("paseo-history-clear-search", "Clear search")
-                        .style(ButtonStyle::Subtle)
-                        .on_click(cx.listener(|view, _, window, cx| view.clear_search(window, cx))),
-                )
-            })
+            .child(message)
             .into_any_element()
     }
 }
 
 impl Render for PaseoHistoryView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors().clone();
+        let colors = cx.theme().colors();
+        let (border_variant, editor_background) = (colors.border_variant, colors.editor_background);
         let body = match &self.status {
-            HistoryStatus::Loading if self.agents.is_empty() => v_flex()
-                .py_12()
-                .items_center()
-                .child(
-                    Icon::new(IconName::LoadCircle)
-                        .size(IconSize::Medium)
-                        .color(Color::Muted)
-                        .with_rotate_animation(2),
-                )
-                .into_any_element(),
-            HistoryStatus::Failed(error) if self.agents.is_empty() => v_flex()
-                .py_12()
-                .gap_3()
-                .items_center()
-                .child(Label::new("Unable to load sessions").weight(FontWeight::SEMIBOLD))
-                .child(
-                    Label::new(error.clone())
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .child(
-                    Button::new("paseo-history-retry", "Try again")
-                        .style(ButtonStyle::Subtle)
-                        .on_click(cx.listener(|view, _, _, cx| view.reload(cx))),
-                )
-                .into_any_element(),
-            _ if self.agents.is_empty() => self.render_empty(cx),
+            HistoryStatus::Loading if self.rows.is_empty() => crate::render_loading("Loading…"),
+            HistoryStatus::Failed(error) if self.rows.is_empty() => crate::render_error(
+                "Unable to load agents",
+                error.clone(),
+                Some(
+                    h_flex()
+                        .child(
+                            Button::new("paseo-history-retry", "Try again")
+                                .style(ButtonStyle::Subtle)
+                                .on_click(cx.listener(|view, _, _, cx| view.reload(cx))),
+                        )
+                        .into_any_element(),
+                ),
+                cx,
+            ),
+            _ if self.rows.is_empty() => self.render_empty(cx),
             _ => self.render_list(cx),
         };
-        let footer = (!self.agents.is_empty())
+        let footer = (!self.rows.is_empty())
             .then(|| self.render_footer(cx))
             .flatten();
         let failure = match &self.status {
-            HistoryStatus::Failed(error) if !self.agents.is_empty() => Some(
+            HistoryStatus::Failed(error) if !self.rows.is_empty() => Some(
                 h_flex()
                     .gap_2()
                     .px_3()
@@ -650,7 +793,7 @@ impl Render for PaseoHistoryView {
                     )
                     .child(
                         div().flex_1().min_w_0().child(
-                            Label::new(format!("Unable to load sessions: {error}"))
+                            Label::new(format!("Unable to load agents: {error}"))
                                 .size(LabelSize::Small),
                         ),
                     )
@@ -670,8 +813,8 @@ impl Render for PaseoHistoryView {
                 .py_1()
                 .rounded_md()
                 .border_1()
-                .border_color(colors.border_variant)
-                .bg(colors.editor_background)
+                .border_color(border_variant)
+                .bg(editor_background)
                 .child(
                     Icon::new(IconName::MagnifyingGlass)
                         .size(IconSize::Small)
@@ -691,11 +834,11 @@ impl Render for PaseoHistoryView {
         });
         div()
             .id("paseo-history")
-            .key_context("PaseoHistory")
+            .key_context("PaseoHistory PaseoView")
             .track_focus(&self.focus_handle)
             .size_full()
             .overflow_y_scroll()
-            .bg(colors.editor_background)
+            .bg(editor_background)
             .child(
                 v_flex()
                     .w_full()
@@ -770,6 +913,61 @@ pub(crate) fn open_history(
 mod tests {
     use super::*;
 
+    #[gpui::test]
+    fn an_empty_history_says_so_inside_the_view(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::test_init);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            PaseoHistoryView::new(WeakEntity::new_invalid(), window, cx)
+        });
+        cx.run_until_parked();
+        // What a daemon with no agents answers, through the path a loaded page takes.
+        view.update(cx, |view, cx| {
+            for host in &mut view.hosts {
+                host.load = None;
+                host.error = None;
+                let empty = AgentHistoryPage {
+                    agents: Vec::new(),
+                    next_cursor: None,
+                    search_truncated: false,
+                };
+                PaseoHistoryView::apply_page(host, empty, false, cx);
+            }
+            view.update_status(false);
+            view.agents_changed(cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("paseo-error").is_none(),
+            "a loaded page shows no error"
+        );
+        let message = cx.debug_bounds("paseo-message").expect("the empty state");
+        let width = cx.update(|window, _| window.viewport_size().width);
+        assert!(message.size.height > gpui::px(0.));
+        assert!(
+            message.left() >= gpui::px(0.) && message.right() <= width,
+            "{message:?} fits {width:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn a_failed_load_shows_its_error_inside_the_view(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::test_init);
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            PaseoHistoryView::new(WeakEntity::new_invalid(), window, cx)
+        });
+        cx.run_until_parked();
+        let error = cx
+            .debug_bounds("paseo-error")
+            .expect("a host that isn't connected fails to load");
+        let width = cx.update(|window, _| window.viewport_size().width);
+        assert!(error.size.height > gpui::px(0.));
+        assert!(
+            error.left() >= gpui::px(0.) && error.right() <= width,
+            "{error:?} fits {width:?}"
+        );
+    }
+
     #[test]
     fn history_sections_follow_local_days() {
         let today = NaiveDate::from_ymd_opt(2026, 10, 1).expect("date");
@@ -814,7 +1012,7 @@ mod tests {
         agent.extra["pendingPermissions"] = json!([{}, {}]);
         let row = HistoryRow::new(&agent);
         assert_eq!(row.place, "Design Cortex");
-        assert_eq!(row.title, "New session");
+        assert_eq!(row.title, "New agent");
         assert_eq!(row.project.as_deref(), Some("axon"));
         assert_eq!(row.branch.as_deref(), Some("main"));
         assert!(row.archived);

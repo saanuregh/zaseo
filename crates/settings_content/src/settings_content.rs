@@ -358,7 +358,7 @@ pub struct PaseoChatSettingsContent {
     pub font_family: Option<FontFamilyName>,
     /// Font size of the chat, in pixels. Zooming the editor (Ctrl +/-) zooms it too.
     ///
-    /// Default: the UI font size
+    /// Default: Zed's label size, seven eighths of the UI font size
     pub font_size: Option<FontSize>,
     /// Line height of chat prose, as a multiple of its font size.
     ///
@@ -389,7 +389,7 @@ pub struct PaseoSidebarSettingsContent {
     pub grouping: Option<PaseoSidebarGrouping>,
     /// How many lines a row's title may wrap onto.
     ///
-    /// Default: 2
+    /// Default: 1
     pub title_lines: Option<u32>,
     /// Whether sidebar rows and agent tabs animate: the activity line under running or waiting
     /// agents, and rows easing in or flashing when an agent appears or changes state.

@@ -147,7 +147,9 @@ impl GlobalCommandPaletteInterceptor {
         workspace: WeakEntity<Workspace>,
         cx: &mut App,
     ) -> Option<Task<CommandInterceptResult>> {
-        let handler = cx.try_global::<Self>().map(|interceptor| interceptor.0.clone());
+        let handler = cx
+            .try_global::<Self>()
+            .map(|interceptor| interceptor.0.clone());
         let sources = cx
             .try_global::<CommandPaletteSources>()
             .map(|sources| sources.0.clone())

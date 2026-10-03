@@ -77,7 +77,7 @@ fn tab_paseo_workspace(tab: &Entity<AgentTab>, cx: &App) -> Option<String> {
 pub(crate) fn agent_paseo_workspace(agent_id: &str, cx: &App) -> Option<String> {
     let agent_id = paseo_client::parse_subagent_timeline_id(agent_id)
         .map_or(agent_id, |(parent_agent_id, _)| parent_agent_id);
-    crate::store(cx)
+    crate::hosts::store_for_agent(agent_id, cx)?
         .read(cx)
         .agent(agent_id)
         .and_then(agent_workspace_id)
@@ -202,18 +202,20 @@ fn open_missing_tabs(
             .retain(|agent_id| !open.contains(agent_id));
         shown.closed_agents.clone()
     };
+    let Some(store) = crate::hosts::store_for_workspace(paseo_workspace_id, cx) else {
+        return;
+    };
     let missing = {
-        let store = crate::store(cx);
         let store = store.read(cx);
         let workspace_of = store
             .state
-            .agents
+            .agents()
             .iter()
             .filter_map(|agent| Some((agent.id.as_str(), agent_workspace_id(agent)?)))
             .collect::<HashMap<_, _>>();
         let mut agents = store
             .state
-            .agents
+            .agents()
             .iter()
             .filter(|agent| agent_workspace_id(agent) == Some(paseo_workspace_id))
             .filter(|agent| {
@@ -223,7 +225,7 @@ fn open_missing_tabs(
             })
             .filter(|agent| !open.contains(&agent.id) && !closed.contains(&agent.id))
             .collect::<Vec<_>>();
-        agents.sort_by_key(|agent| store::agent_string(agent, "createdAt").map(str::to_owned));
+        agents.sort_by_cached_key(|agent| store::agent_string(agent, "createdAt"));
         agents
             .into_iter()
             .map(|agent| agent.id.clone())
@@ -246,11 +248,15 @@ fn open_missing_tabs(
 /// its first agent tab, and the shown workspace gets tabs for agents it gains. Only Paseo
 /// workspaces working in this workspace's folders are shown.
 pub(crate) fn refresh(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    let current = shown(cx.entity_id(), cx).and_then(|shown| shown.paseo_workspace_id.clone());
+    // Most editor workspaces hold no Paseo chats, and this runs on every change on any host.
+    if current.is_none() && workspace.items_of_type::<AgentTab>(cx).next().is_none() {
+        return;
+    }
     let active = workspace
         .active_item(cx)
         .and_then(|item| item.downcast::<AgentTab>())
         .and_then(|tab| tab_paseo_workspace(&tab, cx));
-    let current = shown(cx.entity_id(), cx).and_then(|shown| shown.paseo_workspace_id.clone());
     let Some(target) = active.or_else(|| current.clone()).or_else(|| {
         workspace
             .items_of_type::<AgentTab>(cx)
@@ -292,11 +298,9 @@ pub(crate) fn paseo_workspace_removed(
         }
         showed
     };
-    let archived_agents = crate::store(cx)
-        .read(cx)
-        .archived
+    let archived_agents = crate::hosts::stores(cx)
         .iter()
-        .flatten()
+        .flat_map(|store| store.read(cx).archived.iter().flatten())
         .filter(|agent| agent_workspace_id(agent) == Some(paseo_workspace_id))
         .map(|agent| agent.id.clone())
         .collect::<HashSet<_>>();
@@ -323,7 +327,9 @@ pub(crate) fn paseo_workspace_removed(
             // belonged to the workspace this showed, unless its restored tab isn't checked yet.
             None => {
                 archived_agents.contains(&agent_id)
-                    || (showed && !pending && crate::store(cx).read(cx).agent(&agent_id).is_none())
+                    || (showed
+                        && !pending
+                        && crate::hosts::store_for_agent(&agent_id, cx).is_none())
             }
         };
         if belonged {

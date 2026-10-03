@@ -1,5 +1,6 @@
 mod app_menus;
 pub mod edit_prediction_registry;
+mod frame_report;
 #[cfg(target_os = "macos")]
 pub(crate) mod mac_only_instance;
 mod migrate;
@@ -27,6 +28,7 @@ use debugger_ui::debugger_panel::DebugPanel;
 use editor::{Editor, MultiBuffer};
 use extension_host::ExtensionStore;
 use feature_flags::{FeatureFlagAppExt as _, PanicFeatureFlag};
+pub use frame_report::init as init_frame_report;
 use fs::Fs;
 use futures::{StreamExt, channel::mpsc, select_biased};
 use git_ui::branch_diff::BranchDiffToolbar;
@@ -5992,6 +5994,175 @@ mod tests {
     }
 
     #[gpui::test]
+    fn paseo_screens_keep_ctrl_k_chords_and_palette_is_ctrl_shift_p(cx: &mut TestAppContext) {
+        init_keymap_test(cx);
+        cx.update(|cx| {
+            let keymap = gpui::Keymap::new(
+                settings::KeymapFile::load_asset_allow_partial_failure(
+                    "keymaps/default-linux.json",
+                    cx,
+                )
+                .unwrap(),
+            );
+            let resolve = |keystroke: &str, contexts: &[&str]| {
+                let contexts = contexts
+                    .iter()
+                    .map(|context| gpui::KeyContext::parse(context).unwrap())
+                    .collect::<Vec<_>>();
+                let (bindings, pending) = keymap
+                    .bindings_for_input(&[gpui::Keystroke::parse(keystroke).unwrap()], &contexts);
+                let first = bindings
+                    .first()
+                    .map(|binding| binding.action().name().to_string());
+                (first, pending)
+            };
+            for screen in [
+                "PaseoAgentView",
+                "PaseoSidebar",
+                "PaseoHistory",
+                "PaseoUsage",
+                "PaseoDaemon",
+                "PaseoWorktrees",
+                "PaseoHosts",
+                "PaseoAttentionInbox",
+            ] {
+                let contexts = ["Workspace", "Pane", screen];
+                let (_, pending) = resolve("ctrl-k", &contexts);
+                assert!(pending, "{screen}: ctrl-k starts Zed's chords");
+                assert_eq!(
+                    resolve("ctrl-shift-p", &contexts).0.as_deref(),
+                    Some("command_palette::Toggle"),
+                    "{screen}"
+                );
+                assert_ne!(
+                    resolve("ctrl-alt-k", &contexts).0.as_deref(),
+                    Some("command_palette::Toggle"),
+                    "{screen}: hints should show ctrl-shift-p"
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn paseo_ctrl_n_and_ctrl_t_work_everywhere(cx: &mut TestAppContext) {
+        init_keymap_test(cx);
+        cx.update(|cx| {
+            let keymap = gpui::Keymap::new(
+                settings::KeymapFile::load_asset_allow_partial_failure(
+                    "keymaps/default-linux.json",
+                    cx,
+                )
+                .unwrap(),
+            );
+            // Every action the keystroke reaches, in the order dispatch tries them; one a view
+            // doesn't handle falls through to the next.
+            let actions = |keystroke: &str, contexts: &[&str]| {
+                let contexts = contexts
+                    .iter()
+                    .map(|context| gpui::KeyContext::parse(context).unwrap())
+                    .collect::<Vec<_>>();
+                keymap
+                    .bindings_for_input(&[gpui::Keystroke::parse(keystroke).unwrap()], &contexts)
+                    .0
+                    .iter()
+                    .map(|binding| binding.action().name().to_string())
+                    .collect::<Vec<_>>()
+            };
+            for contexts in [
+                &["Workspace"][..],
+                &["Workspace", "Pane", "Editor mode=full"],
+                &["Workspace", "Pane", "PaseoHistory PaseoView"],
+                &["Workspace", "Pane", "Welcome"],
+            ] {
+                let ctrl_n = actions("ctrl-n", contexts);
+                assert!(
+                    ctrl_n.contains(&"paseo_ui::NewAgentWorkspace".to_string())
+                        && !ctrl_n.contains(&"workspace::NewFile".to_string()),
+                    "{contexts:?}: {ctrl_n:?}"
+                );
+                let ctrl_t = actions("ctrl-t", contexts);
+                assert!(
+                    ctrl_t.contains(&"paseo_ui::NewAgent".to_string())
+                        && !ctrl_t.contains(&"project_symbols::Toggle".to_string()),
+                    "{contexts:?}: {ctrl_t:?}"
+                );
+            }
+            for contexts in [
+                &["Workspace"][..],
+                &["Workspace", "Pane", "Editor mode=full"],
+                &["Workspace", "Pane", "PaseoAgentView PaseoView"],
+                &[
+                    "Workspace",
+                    "Pane",
+                    "PaseoAgentView PaseoView",
+                    "PaseoComposer",
+                    "Editor mode=full",
+                ],
+            ] {
+                assert_eq!(
+                    actions("ctrl-alt-shift-e", contexts)
+                        .first()
+                        .map(String::as_str),
+                    Some("paseo_ui::ReviewLastTurn"),
+                    "{contexts:?}"
+                );
+                assert!(
+                    !actions("ctrl-e", contexts).contains(&"paseo_ui::ReviewLastTurn".to_string()),
+                    "ctrl-e is Zed's file finder again: {contexts:?}"
+                );
+            }
+            for contexts in [
+                &["Workspace"][..],
+                &["Workspace", "Pane", "Editor mode=full"],
+            ] {
+                let ctrl_1 = actions("ctrl-1", contexts);
+                assert!(
+                    ctrl_1.contains(&"paseo_ui::OpenSidebarRowAtIndex".to_string()),
+                    "{contexts:?}: {ctrl_1:?}"
+                );
+            }
+            for screen in [
+                "PaseoSidebar PaseoView",
+                "PaseoAgentView PaseoView",
+                "PaseoHistory PaseoView",
+                "Welcome",
+            ] {
+                // Zed's context-free `ctrl-n` (menu::SelectNext) outranks the Workspace binding
+                // in views that handle menus, such as the sidebar.
+                assert_eq!(
+                    actions("ctrl-n", &["Workspace", "Pane", screen])
+                        .first()
+                        .map(String::as_str),
+                    Some("paseo_ui::NewAgentWorkspace"),
+                    "{screen}"
+                );
+            }
+            let hint = keymap
+                .bindings_for_action(&paseo_ui::NewAgentWorkspace)
+                .last()
+                .map(|binding| {
+                    binding
+                        .keystrokes()
+                        .iter()
+                        .map(|keystroke| keystroke.unparse())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                });
+            assert_eq!(hint.as_deref(), Some("ctrl-n"), "hints show ctrl-n");
+            assert_eq!(
+                actions(
+                    "ctrl-n",
+                    &["Workspace", "Pane", "Editor mode=full showing_completions"]
+                )
+                .first()
+                .map(String::as_str),
+                Some("editor::ContextMenuNext"),
+                "completion menus keep ctrl-n"
+            );
+        });
+    }
+
+    #[gpui::test]
     fn test_emacs_cursor_keys_keep_narrower_bindings(cx: &mut TestAppContext) {
         init_keymap_test(cx);
 
@@ -6573,6 +6744,9 @@ mod tests {
     ) -> Arc<AppState> {
         cx.update(move |cx| {
             env_logger::builder().is_test(true).try_init().ok();
+            // Without its own database a test shares the process-wide fallback, so state one test
+            // saves, such as reviewed agent edits, leaks into the next.
+            cx.set_global(db::AppDatabase::test_new());
 
             let state = Arc::get_mut(&mut app_state).unwrap();
             state.build_window_options = build_window_options;
@@ -7236,24 +7410,117 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         assert_eq!(draft_workspace_ids(&one, cx), [Some("wks_b".to_owned())]);
-
-        window
-            .update(cx, |_, window, cx| {
-                window.dispatch_action(Box::new(paseo_ui::NewAgentWorkspace), cx)
-            })
-            .unwrap();
-        cx.run_until_parked();
-        let mut drafts = draft_workspace_ids(&one, cx);
-        drafts.sort();
-        assert_eq!(drafts, [None, Some("wks_b".to_owned())]);
         assert_eq!(agent_tab_ids(&one, cx), ["b1"]);
 
         open_paseo_agent(window, &one, "a1", cx);
         assert_eq!(
             draft_workspace_ids(&one, cx),
-            [None],
+            Vec::<Option<String>>::new(),
             "wks_b's draft is hidden"
         );
+    }
+
+    fn new_workspace_open(workspace: &Entity<Workspace>, cx: &TestAppContext) -> bool {
+        cx.read(|cx| paseo_ui::test_new_workspace_open(workspace.read(cx), cx))
+    }
+
+    #[gpui::test]
+    async fn paseo_new_workspace_opens_floating_window(cx: &mut TestAppContext) {
+        let (window, one, _) = paseo_two_workspaces(cx).await;
+        cx.update(paseo_ui::test_use_local_host);
+
+        cx.dispatch_action(window.into(), paseo_ui::NewAgentWorkspace);
+        cx.run_until_parked();
+        assert!(new_workspace_open(&one, cx));
+        assert_eq!(agent_tabs(&one, cx), Vec::new(), "no draft tab opens");
+
+        // Escape in the composer arrives as an interrupt, which a draft passes on.
+        cx.dispatch_action(window.into(), paseo_ui::InterruptAgent);
+        cx.run_until_parked();
+        assert!(!new_workspace_open(&one, cx));
+
+        cx.dispatch_action(window.into(), paseo_ui::NewAgentWorkspace);
+        cx.run_until_parked();
+        cx.dispatch_action(window.into(), menu::Cancel);
+        cx.run_until_parked();
+        assert!(!new_workspace_open(&one, cx));
+        assert_eq!(agent_tabs(&one, cx), Vec::new());
+    }
+
+    #[gpui::test]
+    async fn paseo_new_agent_is_in_the_pane_new_menu(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(init);
+        cx.update(|cx| {
+            // The pane's New Agent entry is the shared action that Paseo handles.
+            let action = cx
+                .build_action(zed_actions::paseo::NewAgent.name(), None)
+                .expect("the pane's New Agent entry is a registered action");
+            assert!(action.partial_eq(&paseo_ui::NewAgent));
+        });
+    }
+
+    #[gpui::test]
+    async fn paseo_new_workspace_keeps_unsent_message(cx: &mut TestAppContext) {
+        let (window, one, _) = paseo_two_workspaces(cx).await;
+        add_workspace_agent("n1", path!("/one"), "wks_a", 1, cx);
+        let new_workspace_text =
+            |cx: &TestAppContext| cx.read(|cx| paseo_ui::test_new_workspace_text(&one, cx));
+
+        cx.dispatch_action(window.into(), paseo_ui::NewAgentWorkspace);
+        cx.run_until_parked();
+        window
+            .update(cx, |_, window, cx| {
+                paseo_ui::test_new_workspace_set_text(&one, "Fix the login", window, cx)
+            })
+            .unwrap();
+        cx.dispatch_action(window.into(), menu::Cancel);
+        cx.run_until_parked();
+        assert_eq!(new_workspace_text(cx), None);
+
+        cx.dispatch_action(window.into(), paseo_ui::NewAgentWorkspace);
+        cx.run_until_parked();
+        assert_eq!(
+            new_workspace_text(cx).as_deref(),
+            Some("Fix the login"),
+            "closing keeps the unsent message"
+        );
+
+        cx.update(|cx| paseo_ui::test_new_workspace_agent_created(&one, "n1", cx));
+        cx.run_until_parked();
+        cx.dispatch_action(window.into(), paseo_ui::NewAgentWorkspace);
+        cx.run_until_parked();
+        assert_eq!(
+            new_workspace_text(cx).as_deref(),
+            Some(""),
+            "creating the agent clears it"
+        );
+    }
+
+    #[gpui::test]
+    async fn paseo_new_workspace_send_opens_agent_workspace(cx: &mut TestAppContext) {
+        let (window, one, two) = paseo_two_workspaces(cx).await;
+        cx.update(|cx| {
+            paseo_ui::test_add_paseo_workspace("wks_n", Path::new(path!("/two")), false, cx)
+        });
+        add_workspace_agent("n1", path!("/two"), "wks_n", 1, cx);
+
+        cx.dispatch_action(window.into(), paseo_ui::NewAgentWorkspace);
+        cx.run_until_parked();
+        assert!(new_workspace_open(&one, cx));
+
+        cx.update(|cx| paseo_ui::test_new_workspace_agent_created(&one, "n1", cx));
+        cx.run_until_parked();
+        assert!(!new_workspace_open(&one, cx));
+        assert_eq!(
+            window
+                .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+                .unwrap(),
+            two,
+            "the new agent opens in its own workspace"
+        );
+        assert_eq!(agent_tab_ids(&two, cx), ["n1"]);
+        assert_eq!(agent_tabs(&one, cx), Vec::new(), "no tab is left behind");
     }
 
     /// The Paseo workspace each draft tab's agent will join.
@@ -7340,6 +7607,40 @@ mod tests {
         });
         assert_eq!(active_agent.as_deref(), Some("a2"), "the most recent agent");
         assert!(agent_tab_ids(&two, cx).is_empty());
+    }
+
+    #[gpui::test]
+    async fn paseo_empty_workspace_row_reuses_its_draft_tab(cx: &mut TestAppContext) {
+        let (window, one, two) = paseo_two_workspaces(cx).await;
+        cx.update(paseo_ui::test_use_local_host);
+        cx.update(|cx| {
+            paseo_ui::test_add_paseo_workspace("wks_empty", Path::new(path!("/one")), false, cx);
+        });
+        let open_from = |workspace: &Entity<Workspace>, cx: &mut TestAppContext| {
+            window
+                .update(cx, |_, window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        paseo_ui::open_paseo_workspace_tabs(workspace, "wks_empty", window, cx)
+                    })
+                })
+                .unwrap();
+            cx.run_until_parked();
+        };
+        activate_workspace(window, &two, cx);
+        open_from(&two, cx);
+        open_from(&one, cx);
+        open_from(&two, cx);
+        let drafts = cx.read(|cx| {
+            one.read(cx)
+                .items_of_type::<paseo_ui::AgentTab>(cx)
+                .filter(|tab| tab.read(cx).agent_id(cx).is_none())
+                .count()
+        });
+        assert_eq!(drafts, 1, "every click shows the same draft");
+        let active = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        assert_eq!(active, one);
     }
 
     #[gpui::test]
@@ -7525,6 +7826,79 @@ mod tests {
             restored_agents(cx),
             vec!["ours".to_string()],
             "once known, only the workspace's own agent keeps its tab"
+        );
+    }
+
+    #[gpui::test]
+    async fn paseo_restored_tab_moves_to_its_agents_host(cx: &mut TestAppContext) {
+        let (window, _one, two) = paseo_two_workspaces(cx).await;
+        let profile = |name: &str, target_uri: &str| settings::PaseoConnectionProfile {
+            name: name.into(),
+            target_uri: target_uri.into(),
+            editor_ssh_uri: None,
+            client_id: format!("client-{name}"),
+        };
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|settings, cx| {
+                settings.update_user_settings(cx, |settings| {
+                    settings.paseo = Some(settings::PaseoSettingsContent {
+                        profiles: Some(vec![
+                            profile("Test", "ws://172.17.0.2:6767/ws"),
+                            profile("Local", "ws://127.0.0.1:6767/ws"),
+                        ]),
+                        active_profile: Some("Test".into()),
+                        ..Default::default()
+                    });
+                });
+            });
+        });
+        cx.run_until_parked();
+        window
+            .update(cx, |_, window, cx| {
+                two.update(cx, |workspace, cx| {
+                    paseo_ui::test_restore_agent_tab(workspace, "agent", window, cx)
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let tab_hosts = |cx: &TestAppContext| {
+            cx.read(|cx| {
+                two.read(cx)
+                    .items_of_type::<paseo_ui::AgentTab>(cx)
+                    .map(|tab| {
+                        (
+                            tab.read(cx).agent_id(cx),
+                            paseo_ui::AgentTab::test_host_name(&tab, cx),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            tab_hosts(cx),
+            vec![(Some("agent".to_owned()), Some("Test".to_owned()))],
+            "a tab saved without a host starts on the default host"
+        );
+
+        cx.update(|cx| {
+            paseo_ui::test_add_agent_on(
+                "Local",
+                paseo_client::AgentSummary {
+                    id: "agent".into(),
+                    title: Some("Fix login".into()),
+                    status: "idle".into(),
+                    directory: Some(PathBuf::from(path!("/two/src"))),
+                    project: Some(json!({"projectName": "two"})),
+                    extra: json!({}),
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            tab_hosts(cx),
+            vec![(Some("agent".to_owned()), Some("Local".to_owned()))],
+            "once its host lists the agent, the tab talks to that host"
         );
     }
 
@@ -7912,6 +8286,56 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    async fn paseo_hidden_sidebar_changes_dont_flash_when_shown(cx: &mut TestAppContext) {
+        let (window, one, two) = paseo_two_workspaces(cx).await;
+        let (panel_one, panel_two) = (paseo_panel(&one, cx), paseo_panel(&two, cx));
+        add_paseo_agent("agent", path!("/one"), cx);
+        cx.run_until_parked();
+        activate_workspace(window, &two, cx);
+        activate_workspace(window, &one, cx);
+        let mut working = paseo_ui::test_agent("agent", "Fix login", "running");
+        working.directory = Some(PathBuf::from(path!("/one")));
+        cx.update(|cx| paseo_ui::test_upsert_agent(working, cx));
+        cx.run_until_parked();
+        assert!(
+            cx.read(|cx| paseo_ui::PaseoPanel::test_flashing(&panel_one, "agent", cx)),
+            "the sidebar on screen flashes the row that changed"
+        );
+        activate_workspace(window, &two, cx);
+        assert!(
+            !cx.read(|cx| paseo_ui::PaseoPanel::test_flashing(&panel_two, "agent", cx)),
+            "a sidebar shown after the change shows it without a flash"
+        );
+    }
+
+    #[gpui::test]
+    async fn paseo_hidden_sidebar_rebuilds_when_drawn_or_read(cx: &mut TestAppContext) {
+        let (window, one, two) = paseo_two_workspaces(cx).await;
+        let (panel_one, panel_two) = (paseo_panel(&one, cx), paseo_panel(&two, cx));
+        add_paseo_agent("agent", path!("/one"), cx);
+        cx.run_until_parked();
+        assert!(!cx.read(|cx| paseo_ui::PaseoPanel::test_rows_pending(&panel_one, cx)));
+        assert!(
+            cx.read(|cx| paseo_ui::PaseoPanel::test_rows_pending(&panel_two, cx)),
+            "a sidebar that isn't drawn leaves its rows for later"
+        );
+        assert_eq!(
+            cx.update(|cx| paseo_ui::PaseoPanel::test_agent_order(&panel_two, cx)),
+            ["agent"],
+            "number keys read rows brought up to date"
+        );
+
+        add_paseo_agent("second", path!("/two"), cx);
+        cx.run_until_parked();
+        assert!(cx.read(|cx| paseo_ui::PaseoPanel::test_rows_pending(&panel_two, cx)));
+        activate_workspace(window, &two, cx);
+        assert!(
+            !cx.read(|cx| paseo_ui::PaseoPanel::test_rows_pending(&panel_two, cx)),
+            "a sidebar catches up when it is drawn"
+        );
+    }
+
     /// A window whose project holds `/root/main.rs`, opened in an editor.
     async fn paseo_window_with_main_rs(
         cx: &mut TestAppContext,
@@ -8229,6 +8653,53 @@ mod tests {
             agent_edit_hunk_count(&editor, cx),
             0,
             "the undone edit doesn't attach to the same text typed elsewhere"
+        );
+    }
+
+    #[gpui::test]
+    async fn paseo_edits_changed_while_being_located_are_caught_up(cx: &mut TestAppContext) {
+        let (window, editor) = paseo_window_with_agent_edit(cx).await;
+        let agent_line = "    let count: u32 = \"one\";";
+        let start = "fn main() {\n".len();
+        let buffer = cx.update(|cx| {
+            editor
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .expect("one file")
+        });
+        window
+            .update(cx, |_, _, cx| {
+                // Edits in place, so the edit's anchors survive and only the first run sees it gone.
+                buffer.update(cx, |buffer, cx| {
+                    buffer.edit(
+                        [(start..start + agent_line.len(), "    let total = 0;")],
+                        None,
+                        cx,
+                    )
+                });
+                paseo_ui::test_refresh_agent_edits(&editor, cx);
+                assert!(
+                    paseo_ui::test_locating_agent_edits(&editor, cx),
+                    "locating the edits runs off the main thread"
+                );
+                buffer.update(cx, |buffer, cx| {
+                    buffer.edit(
+                        [(start..start + "    let total = 0;".len(), agent_line)],
+                        None,
+                        cx,
+                    )
+                });
+                paseo_ui::test_refresh_agent_edits(&editor, cx);
+            })
+            .expect("workspace window");
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(
+            agent_edit_hunk_count(&editor, cx),
+            0,
+            "an edit undone and redone during a run stays reviewed: the run that saw it gone counts"
         );
     }
 

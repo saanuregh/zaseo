@@ -996,6 +996,85 @@ fn test_combined_injection_with_leading_content_layer_ordering(cx: &mut App) {
 }
 
 #[gpui::test]
+fn test_combined_injection_and_injection_sharing_a_start(cx: &mut App) {
+    // Regression test for "layers out of order: end decreased at equal start". A combined
+    // injection's layer spans its parent layer, so when the file starts with another injection
+    // (here a comment), the layers share a start: the two combined layers end at the end of the
+    // file and sort ahead of the comment's, widest first.
+    let registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
+    let python = Arc::new(
+        Language::new(
+            LanguageConfig {
+                name: "Python".into(),
+                matcher: (LanguageMatcher {
+                    path_suffixes: vec!["py".to_string()],
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            },
+            Some(tree_sitter_python::LANGUAGE.into()),
+        )
+        .with_injection_query(
+            r#"
+            ((comment) @injection.content
+             (#set! injection.language "comment"))
+            ((string (string_content) @injection.content)
+             (#set! injection.language "HTML")
+             (#set! injection.combined))
+            ((string (string_content) @injection.content)
+             (#set! injection.language "Markdown")
+             (#set! injection.combined))
+            "#,
+        )
+        .unwrap(),
+    );
+    registry.add(python.clone());
+    registry.add(Arc::new(comment_lang()));
+    registry.add(Arc::new(html_lang()));
+    registry.add(markdown_lang());
+
+    let buffer = Buffer::new(
+        ReplicaId::LOCAL,
+        BufferId::new(1).unwrap(),
+        r#"
+# leading comment
+first = "<b>one</b>"
+second = "<i>two</i>"
+"#
+        .unindent(),
+    );
+
+    let mut syntax_map = SyntaxMap::new(&buffer);
+    syntax_map.set_language_registry(registry);
+    // In debug builds, `reparse` runs `check_invariants`.
+    syntax_map.reparse(python, &buffer);
+    let snapshot = syntax_map.snapshot();
+    let ranges = snapshot
+        .layers_for_range(0..buffer.len(), &buffer, true)
+        .map(|layer| {
+            (
+                layer.depth,
+                layer.language.name(),
+                layer.node().byte_range(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        ranges
+            .iter()
+            .any(|(depth, name, _)| *depth == 1 && name.as_ref() == "comment"),
+        "{ranges:?}"
+    );
+    assert!(
+        ranges
+            .iter()
+            .any(|(depth, name, _)| *depth == 1 && name.as_ref() == "HTML"),
+        "{ranges:?}"
+    );
+}
+
+#[gpui::test]
 fn test_comment_triggered_injection_toggle(cx: &mut App) {
     let registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
 

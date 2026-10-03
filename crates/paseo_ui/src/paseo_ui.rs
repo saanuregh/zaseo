@@ -9,6 +9,7 @@ mod daemon;
 mod dictation;
 mod editor_context;
 mod history;
+mod hosts;
 mod last_turn;
 mod sidebar;
 mod store;
@@ -26,8 +27,8 @@ pub use title_bar_items::title_bar_items;
 use anyhow::{Result, anyhow};
 use db::kvp::KeyValueStore;
 use gpui::{
-    Action, App, AppContext as _, AsyncApp, Context, Entity, Global, Pixels, Task, TaskExt, Window,
-    actions, px,
+    Action, App, AppContext as _, AsyncApp, Context, Entity, Global, Pixels, Task, TaskExt,
+    WeakEntity, Window, actions, px,
 };
 use paseo_client::{ConnectionTarget, is_absolute_workspace_path};
 use schemars::JsonSchema;
@@ -37,15 +38,24 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use theme_settings::ThemeSettings;
+use util::ResultExt as _;
 use workspace::{
     MultiWorkspace, Pane, Toast, Workspace, item::ItemEvent, notifications::NotificationId,
 };
 
 pub use agent_edits::{AgentEditsToolbar, KeepAllEdits, KeepEdit, RejectAllEdits, RejectEdit};
+#[cfg(any(test, feature = "test-support"))]
+pub use agent_edits::{test_locating_agent_edits, test_refresh_agent_edits};
 pub use agent_view::{AgentTab, AgentView, agent_tab_menu};
+use hosts::HostsEvent;
 pub use sidebar::PaseoPanel;
-use store::{PaseoStore, StoreEvent};
+use store::PaseoStore;
+#[cfg(any(test, feature = "test-support"))]
+pub use timeline::{FileEdit, reverse_edits_tracking};
 pub use usage::UsageStatusItem;
+// Defined with the shared actions so the Welcome page, which can't depend on this crate, can
+// offer them.
+pub use zed_actions::paseo::{NewAgent, NewAgentWorkspace};
 
 actions!(
     paseo_ui,
@@ -56,10 +66,6 @@ actions!(
         OpenTab,
         /// Opens the selected Paseo agent's workspace in the editor.
         OpenWorkspace,
-        /// Starts a new Paseo agent in the Paseo workspace this editor workspace shows.
-        NewAgent,
-        /// Starts a new Paseo workspace with a new agent.
-        NewAgentWorkspace,
         /// Moves focus to the message composer.
         FocusComposer,
         /// Interrupts the running agent turn.
@@ -90,7 +96,7 @@ actions!(
         OpenHistory,
         /// Opens the Paseo host settings.
         ManageHosts,
-        /// Reconnects to the active Paseo host.
+        /// Reconnects to every Paseo host.
         Reconnect,
         /// Opens the next agent in the sidebar.
         NextAgent,
@@ -138,11 +144,12 @@ pub struct OpenPaseoTerminal {
     pub terminal_id: String,
 }
 
-/// Opens the agent at a sidebar position (1-based, like Paseo's Cmd+1..9).
+/// Opens the sidebar row at a position (1-based, like Paseo's Cmd+1..9): a workspace, or an agent
+/// outside one.
 #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
-#[action(namespace = paseo_ui)]
+#[action(namespace = paseo_ui, deprecated_aliases = ["paseo_ui::OpenAgentAtIndex"])]
 #[serde(deny_unknown_fields)]
-pub struct OpenAgentAtIndex {
+pub struct OpenSidebarRowAtIndex {
     pub index: usize,
 }
 
@@ -222,7 +229,7 @@ impl Settings for PaseoSettings {
                 grouping: sidebar.and_then(|sidebar| sidebar.grouping),
                 title_lines: sidebar
                     .and_then(|sidebar| sidebar.title_lines)
-                    .unwrap_or(2)
+                    .unwrap_or(1)
                     .clamp(1, 4) as usize,
                 animate_status: sidebar
                     .and_then(|sidebar| sidebar.animate_status)
@@ -248,187 +255,204 @@ impl PaseoSettings {
     }
 }
 
-struct GlobalPaseoStore(Entity<PaseoStore>);
-impl Global for GlobalPaseoStore {}
-
 const CLIENT_ID_KEY: &str = "paseo_client_id";
 const PREFERENCES_KEY: &str = "paseo_create_agent_preferences";
 
 pub fn init(cx: &mut App) {
     PaseoSettings::register(cx);
     workspace::register_serializable_item::<AgentTab>(cx);
-    let store = cx.new(|cx| {
-        let mut store = PaseoStore::default();
-        store.load_archived_subagents(cx);
-        store.load_reviewed_edits(cx);
-        store
-    });
-    init_system_notifications(&store, cx);
-    cx.set_global(GlobalPaseoStore(store));
+    hosts::init(cx);
+    init_system_notifications(cx);
     editor_context::init(cx);
     agent_edits::init(cx);
     command_center::init_palette_source(cx);
     cx.observe_new(
         |workspace: &mut Workspace, window, cx: &mut Context<Workspace>| {
-            cx.observe(&crate::store(cx), |workspace, _, cx| {
-                close_restored_tabs_of_other_workspaces(workspace, cx)
-            })
-            .detach();
-            cx.subscribe_self(|workspace, event: &workspace::Event, cx| {
-                if matches!(event, workspace::Event::ItemAdded { .. }) {
-                    close_restored_tabs_of_other_workspaces(workspace, cx);
-                }
-            })
-            .detach();
-            let workspace_id = cx.entity_id();
-            cx.on_release(move |_, cx| workspace_tabs::forget(workspace_id, cx))
-                .detach();
-            if let Some(window) = window {
-                cx.observe_in(&crate::store(cx), window, |workspace, _, window, cx| {
-                    workspace_tabs::refresh(workspace, window, cx)
-                })
-                .detach();
-                cx.subscribe_in(
-                    &cx.entity(),
-                    window,
-                    |workspace, _, event: &workspace::Event, window, cx| {
-                        if matches!(
-                            event,
-                            workspace::Event::ItemAdded { .. }
-                                | workspace::Event::ActiveItemChanged
-                        ) {
-                            workspace_tabs::refresh(workspace, window, cx);
-                        }
-                    },
-                )
-                .detach();
-                cx.subscribe_in(
-                    &crate::store(cx),
-                    window,
-                    |workspace, _, event: &StoreEvent, window, cx| {
-                        if let StoreEvent::WorkspaceRemoved {
-                            workspace_id,
-                            worktree_directory,
-                        } = event
-                        {
-                            paseo_workspace_removed(
-                                workspace,
-                                workspace_id,
-                                worktree_directory.as_deref(),
-                                window,
-                                cx,
-                            );
-                        }
-                    },
-                )
-                .detach();
+            follow_paseo_changes(window, cx);
+            register_workspace_actions(workspace);
+            show_attention_toasts(cx);
+        },
+    )
+    .detach();
+}
+
+/// Keeps a workspace's chats in step with every host and with its own tabs.
+fn follow_paseo_changes(window: Option<&mut Window>, cx: &mut Context<Workspace>) {
+    cx.subscribe_self(|workspace, event: &workspace::Event, cx| {
+        if matches!(event, workspace::Event::ItemAdded { .. }) {
+            close_restored_tabs_of_other_workspaces(workspace, cx);
+        }
+    })
+    .detach();
+    let workspace_id = cx.entity_id();
+    cx.on_release(move |_, cx| workspace_tabs::forget(workspace_id, cx))
+        .detach();
+    let Some(window) = window else {
+        cx.observe(&hosts::registry(cx), |workspace, _, cx| {
+            close_restored_tabs_of_other_workspaces(workspace, cx)
+        })
+        .detach();
+        return;
+    };
+    // One observer for every host change, so each change walks the workspace's tabs once.
+    cx.observe_in(&hosts::registry(cx), window, |workspace, _, window, cx| {
+        close_restored_tabs_of_other_workspaces(workspace, cx);
+        reopen_tabs_on_their_hosts(workspace, window, cx);
+        workspace_tabs::refresh(workspace, window, cx)
+    })
+    .detach();
+    cx.subscribe_in(
+        &cx.entity(),
+        window,
+        |workspace, _, event: &workspace::Event, window, cx| {
+            if matches!(
+                event,
+                workspace::Event::ItemAdded { .. } | workspace::Event::ActiveItemChanged
+            ) {
+                workspace_tabs::refresh(workspace, window, cx);
             }
-            workspace.register_action(|workspace, _: &TogglePanel, window, cx| {
-                workspace.toggle_panel_focus::<PaseoPanel>(window, cx);
-            });
-            workspace.register_action(|workspace, _: &OpenTab, window, cx| {
-                open_tab(workspace, window, cx);
-            });
-            workspace.register_action(|workspace, _: &NewAgent, window, cx| {
-                new_agent(workspace, window, cx);
-            });
-            workspace.register_action(|workspace, _: &NewAgentWorkspace, window, cx| {
-                open_draft(workspace, None, window, cx);
-            });
-            workspace.register_action(|workspace, _: &ForkAgent, window, cx| {
-                if let Some(agent_id) = current_agent_id(workspace, cx) {
-                    fork_agent(workspace, &agent_id, window, cx);
-                }
-            });
-            workspace.register_action(|workspace, action: &OpenAgentById, window, cx| {
-                open_agent(workspace, &action.agent_id, true, window, cx);
-            });
-            workspace.register_action(|workspace, action: &OpenPaseoTerminal, window, cx| {
-                let info = terminal::terminals_for(&action.directory, cx)
-                    .into_iter()
-                    .find(|info| info.id == action.terminal_id);
-                match info {
-                    Some(info) => terminal::open_terminal(
-                        workspace,
-                        info,
-                        action.directory.clone(),
-                        window,
-                        cx,
-                    ),
-                    None => log::info!("Paseo terminal {} is gone", action.terminal_id),
-                }
-            });
-            workspace.register_action(|workspace, _: &NewTerminal, window, cx| {
-                match terminal::agent_directory(current_agent_id(workspace, cx), cx) {
-                    Some(directory) => terminal::new_terminal(directory, window, cx),
-                    None => workspace.show_error(
-                        anyhow!("Open a Paseo agent to start a terminal in its directory"),
-                        cx,
-                    ),
-                }
-            });
-            workspace.register_action(|workspace, _: &ReviewLastTurn, window, cx| {
-                last_turn::open_last_turn(workspace, window, cx);
-            });
-            workspace.register_action(|workspace, _: &AddProject, window, cx| {
-                workspace_tools::add_project(workspace, window, cx);
-            });
-            workspace.register_action(|workspace, _: &NewProjectDirectory, window, cx| {
-                workspace_tools::new_project_directory(workspace, window, cx);
-            });
-            workspace.register_action(|workspace, _: &OpenHistory, window, cx| {
-                history::open_history(workspace, window, cx);
-            });
-            workspace.register_action(|workspace, _: &OpenDaemonStatus, window, cx| {
-                daemon::open_daemon_status(workspace, window, cx);
-            });
-            workspace.register_action(|workspace, _: &OpenProviderUsage, window, cx| {
-                usage::open_usage(workspace, window, cx);
-            });
-            workspace.register_action(|workspace, _: &ManageHosts, window, cx| {
-                connection_picker::open_hosts(workspace, window, cx);
-            });
-            workspace.register_action(|workspace, action: &OpenAgentAtIndex, window, cx| {
-                sidebar::open_agent_at_index(workspace, action.index, window, cx);
-            });
-            workspace.register_action(|workspace, _: &NextAgent, window, cx| {
-                sidebar::open_adjacent_agent(workspace, 1, window, cx);
-            });
-            workspace.register_action(|workspace, _: &PreviousAgent, window, cx| {
-                sidebar::open_adjacent_agent(workspace, -1, window, cx);
-            });
-            workspace.register_action(|_, _: &Reconnect, _, cx| {
-                auto_connect(true, cx);
-            });
-            let paseo_store = crate::store(cx);
-            cx.subscribe(&paseo_store, |workspace, _, event: &StoreEvent, cx| {
-                let StoreEvent::NeedsAttention { agent_id, message } = event else {
-                    return;
-                };
-                if !PaseoSettings::get_global(cx).alerts.toasts {
-                    return;
-                }
-                let agent_id = agent_id.clone();
-                let handle = cx.weak_entity();
-                workspace.show_toast(
-                    Toast::new(
-                        // One id for every agent, so a new alert replaces the last instead of
-                        // stacking; the sidebar's bell lists them all.
-                        NotificationId::named("paseo-attention".into()),
-                        message.clone(),
-                    )
-                    .on_click("Open", move |window, cx| {
-                        if let Err(error) = handle.update(cx, |workspace, cx| {
-                            open_agent(workspace, &agent_id, true, window, cx)
-                        }) {
-                            log::debug!("Paseo workspace closed: {error}");
-                        }
-                    })
-                    .autohide(),
+        },
+    )
+    .detach();
+    cx.subscribe_in(
+        &hosts::registry(cx),
+        window,
+        |workspace, _, event: &HostsEvent, window, cx| {
+            if let HostsEvent::WorkspaceRemoved {
+                workspace_id,
+                worktree_directory,
+            } = event
+            {
+                paseo_workspace_removed(
+                    workspace,
+                    workspace_id,
+                    worktree_directory.as_deref(),
+                    window,
                     cx,
                 );
-            })
-            .detach();
+            }
+        },
+    )
+    .detach();
+}
+
+fn register_workspace_actions(workspace: &mut Workspace) {
+    workspace.register_action(|workspace, _: &TogglePanel, window, cx| {
+        workspace.toggle_panel_focus::<PaseoPanel>(window, cx);
+    });
+    workspace.register_action(|workspace, _: &OpenTab, window, cx| {
+        open_tab(workspace, window, cx);
+    });
+    workspace.register_action(|workspace, _: &NewAgent, window, cx| {
+        new_agent(workspace, window, cx);
+    });
+    workspace.register_action(|workspace, _: &NewAgentWorkspace, window, cx| {
+        workspace_tools::open_new_workspace(workspace, None, window, cx);
+    });
+    workspace.register_action(|workspace, _: &ForkAgent, window, cx| {
+        if let Some((store, agent_id)) = current_agent(workspace, cx) {
+            fork_agent(workspace, store, &agent_id, window, cx);
+        }
+    });
+    workspace.register_action(|workspace, action: &OpenAgentById, window, cx| {
+        open_agent(workspace, &action.agent_id, true, window, cx);
+    });
+    workspace.register_action(|workspace, action: &OpenPaseoTerminal, window, cx| {
+        let found = hosts::store_for_terminal(&action.terminal_id, cx).and_then(|store| {
+            let info = terminal::terminals_for(&store, &action.directory, cx)
+                .into_iter()
+                .find(|info| info.id == action.terminal_id)?;
+            Some((store, info))
+        });
+        match found {
+            Some((store, info)) => terminal::open_terminal(
+                workspace,
+                store,
+                info,
+                action.directory.clone(),
+                window,
+                cx,
+            ),
+            None => log::info!("Paseo terminal {} is gone", action.terminal_id),
+        }
+    });
+    workspace.register_action(|workspace, _: &NewTerminal, window, cx| {
+        match terminal::agent_directory(current_agent(workspace, cx), cx) {
+            Some((store, directory)) => terminal::new_terminal(store, directory, window, cx),
+            None => workspace.show_error(
+                anyhow!("Open a Paseo agent to start a terminal in its directory"),
+                cx,
+            ),
+        }
+    });
+    workspace.register_action(|workspace, _: &ReviewLastTurn, window, cx| {
+        last_turn::open_last_turn(workspace, window, cx);
+    });
+    workspace.register_action(|workspace, _: &AddProject, window, cx| {
+        workspace_tools::add_project(workspace, window, cx);
+    });
+    workspace.register_action(|workspace, _: &NewProjectDirectory, window, cx| {
+        workspace_tools::new_project_directory(workspace, window, cx);
+    });
+    workspace.register_action(|workspace, _: &OpenHistory, window, cx| {
+        history::open_history(workspace, window, cx);
+    });
+    workspace.register_action(|workspace, _: &OpenDaemonStatus, window, cx| {
+        daemon::open_daemon_status(workspace, window, cx);
+    });
+    workspace.register_action(|workspace, _: &OpenProviderUsage, window, cx| {
+        usage::open_usage(workspace, window, cx);
+    });
+    workspace.register_action(|workspace, _: &ManageHosts, window, cx| {
+        connection_picker::open_hosts(workspace, window, cx);
+    });
+    workspace.register_action(|workspace, action: &OpenSidebarRowAtIndex, window, cx| {
+        sidebar::open_row_at_index(workspace, action.index, window, cx);
+    });
+    workspace.register_action(|workspace, _: &NextAgent, window, cx| {
+        sidebar::open_adjacent_agent(workspace, 1, window, cx);
+    });
+    workspace.register_action(|workspace, _: &PreviousAgent, window, cx| {
+        sidebar::open_adjacent_agent(workspace, -1, window, cx);
+    });
+    workspace.register_action(|_, _: &Reconnect, _, cx| {
+        hosts::connect_all(true, cx);
+    });
+}
+
+/// Shows a toast when an agent on any host needs the user.
+fn show_attention_toasts(cx: &mut Context<Workspace>) {
+    cx.subscribe(
+        &hosts::registry(cx),
+        |workspace, _, event: &HostsEvent, cx| {
+            let HostsEvent::NeedsAttention {
+                agent_id, message, ..
+            } = event
+            else {
+                return;
+            };
+            if !PaseoSettings::get_global(cx).alerts.toasts {
+                return;
+            }
+            let agent_id = agent_id.clone();
+            let handle = cx.weak_entity();
+            workspace.show_toast(
+                Toast::new(
+                    // One id for every agent, so a new alert replaces the last instead of
+                    // stacking; the sidebar's bell lists them all.
+                    NotificationId::named("paseo-attention".into()),
+                    message.clone(),
+                )
+                .on_click("Open", move |window, cx| {
+                    if let Err(error) = handle.update(cx, |workspace, cx| {
+                        open_agent(workspace, &agent_id, true, window, cx)
+                    }) {
+                        log::debug!("Paseo workspace closed: {error}");
+                    }
+                })
+                .autohide(),
+                cx,
+            );
         },
     )
     .detach();
@@ -439,9 +463,14 @@ const SYSTEM_NOTIFICATION_TAG: &str = "paseo-agent:";
 
 /// Raises a system notification for an agent that needs the user while no Zaseo window has focus,
 /// and opens that agent when the user clicks it.
-fn init_system_notifications(store: &Entity<PaseoStore>, cx: &mut App) {
-    cx.subscribe(store, |store, event: &StoreEvent, cx| {
-        let StoreEvent::NeedsAttention { agent_id, message } = event else {
+fn init_system_notifications(cx: &mut App) {
+    cx.subscribe(&hosts::registry(cx), |_, event: &HostsEvent, cx| {
+        let HostsEvent::NeedsAttention {
+            store,
+            agent_id,
+            message,
+        } = event
+        else {
             return;
         };
         // A user looking at Zaseo already sees the toast and the bell.
@@ -498,26 +527,54 @@ fn open_agent_from_notification(agent_id: &str, cx: &mut App) {
 }
 
 /// The agent in the active tab, else the one most recently focused in a Paseo view.
-pub(crate) fn current_agent_id(workspace: &Workspace, cx: &App) -> Option<String> {
+pub(crate) fn current_agent(
+    workspace: &Workspace,
+    cx: &App,
+) -> Option<(Entity<PaseoStore>, String)> {
     workspace
         .active_item(cx)
         .and_then(|item| item.downcast::<AgentTab>())
-        .and_then(|tab| tab.read(cx).agent_id(cx))
-        .or_else(|| store(cx).read(cx).focused_agent.clone())
+        .and_then(|tab| {
+            let view = tab.read(cx).view().read(cx);
+            Some((view.store.clone(), view.agent_id.clone()?))
+        })
+        .or_else(|| {
+            let store = hosts::focused_store(cx)?;
+            let agent_id = store.read(cx).focused_agent.clone()?;
+            Some((store, agent_id))
+        })
 }
 
-/// Connects to the active host at app startup. Kept out of `init` so tests never reach a daemon.
+/// Runs `update` on `workspace` once the current update finishes, logging if the workspace closed
+/// first. Event handlers and menu entries run while the workspace, its tabs or the window root may
+/// be mid-update, and opening or moving tabs reads all of them.
+pub(crate) fn defer_workspace_update(
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+    update: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
+) {
+    window.defer(cx, move |window, cx| {
+        if let Err(error) = workspace.update(cx, |workspace, cx| update(workspace, window, cx)) {
+            log::debug!("Paseo workspace closed: {error}");
+        }
+    });
+}
+
+/// Connects to every host at app startup. Kept out of `init` so tests never reach a daemon.
 pub fn connect_on_startup(cx: &mut App) {
-    auto_connect(false, cx);
+    hosts::start_connecting(cx);
 }
 
-/// The UI font size shifted by the buffer zoom, so Ctrl +/- zooms the chat along with the editors.
+/// Zed's label size (seven eighths of the UI font size), shifted by the buffer zoom so Ctrl +/-
+/// zooms the chat along with the editors. The UI font size itself reads larger than the panels
+/// around the chat, whose labels use the smaller size.
 pub(crate) fn chat_font_size(cx: &App) -> Pixels {
     let settings = ThemeSettings::get_global(cx);
     let base = PaseoSettings::get_global(cx)
         .chat
         .font_size
-        .unwrap_or_else(|| settings.ui_font_size(cx));
+        .unwrap_or_else(|| (settings.ui_font_size(cx) * 0.875).round());
     theme_settings::clamp_font_size(
         base + settings.buffer_font_size(cx) - settings.buffer_font_size_settings(),
     )
@@ -539,8 +596,64 @@ pub(crate) fn render_loading(message: impl Into<gpui::SharedString>) -> gpui::An
         .into_any_element()
 }
 
-pub(crate) fn store(cx: &App) -> Entity<PaseoStore> {
-    cx.global::<GlobalPaseoStore>().0.clone()
+/// `text` with its first character in upper case, for ids shown as names.
+pub(crate) fn capitalize_first(text: &str) -> String {
+    let mut characters = text.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => String::new(),
+    }
+}
+
+/// An empty or unavailable state: a muted message, an optional hint, and an optional action.
+pub(crate) fn render_message(
+    title: impl Into<gpui::SharedString>,
+    hint: Option<gpui::SharedString>,
+    action: Option<gpui::AnyElement>,
+) -> gpui::AnyElement {
+    use ui::prelude::*;
+    v_flex()
+        .debug_selector(|| "paseo-message".into())
+        .gap_1()
+        .py_4()
+        .child(Label::new(title.into()).color(Color::Muted))
+        .when_some(hint, |this, hint| {
+            this.child(Label::new(hint).size(LabelSize::Small).color(Color::Muted))
+        })
+        .when_some(action, |this, action| {
+            this.child(div().pt_1().child(action))
+        })
+        .into_any_element()
+}
+
+/// A one-line red error inside a card or under a field, where a full error card would be too much.
+pub(crate) fn render_inline_error(message: impl Into<gpui::SharedString>) -> gpui::AnyElement {
+    use ui::prelude::*;
+    Label::new(message.into())
+        .size(LabelSize::Small)
+        .color(Color::Error)
+        .into_any_element()
+}
+
+pub(crate) fn render_error(
+    title: impl Into<gpui::SharedString>,
+    error: impl Into<gpui::SharedString>,
+    retry: Option<gpui::AnyElement>,
+    cx: &App,
+) -> gpui::AnyElement {
+    use ui::prelude::*;
+    v_flex()
+        .debug_selector(|| "paseo-error".into())
+        .p_4()
+        .gap_2()
+        .rounded_md()
+        .border_1()
+        .border_color(cx.theme().status().error_border)
+        .bg(cx.theme().status().error_background)
+        .child(Label::new(title.into()).weight(gpui::FontWeight::SEMIBOLD))
+        .child(Label::new(error.into()).size(LabelSize::Small))
+        .when_some(retry, |this, retry| this.child(retry))
+        .into_any_element()
 }
 
 /// A stable client ID for profiles saved without one, so reconnects keep daemon-side ownership.
@@ -549,9 +662,9 @@ pub(crate) fn client_id_for(profile: &PaseoConnectionProfile, cx: &App) -> Strin
         return profile.client_id.clone();
     }
     let kvp = KeyValueStore::global(cx);
-    match kvp.read_kvp(CLIENT_ID_KEY) {
-        Ok(Some(client_id)) if !client_id.is_empty() => client_id,
-        _ => {
+    match stored_client_id(kvp.read_kvp(CLIENT_ID_KEY)) {
+        StoredClientId::Found(client_id) => client_id,
+        StoredClientId::Missing => {
             let client_id = uuid::Uuid::new_v4().to_string();
             let stored = client_id.clone();
             db::write_and_log(cx, move || async move {
@@ -559,23 +672,38 @@ pub(crate) fn client_id_for(profile: &PaseoConnectionProfile, cx: &App) -> Strin
             });
             client_id
         }
+        // Writing a new ID would replace the stable one the store couldn't read this time.
+        StoredClientId::Unreadable(error) => {
+            log::error!(
+                "Could not read the Paseo client ID, using one for this session: {error:#}"
+            );
+            session_client_id()
+        }
     }
 }
 
-/// Connects to the active profile, like Paseo's desktop app does with its local daemon.
-pub(crate) fn auto_connect(force: bool, cx: &mut App) {
-    let Some(mut profile) = PaseoSettings::get_global(cx).active().cloned() else {
-        return;
-    };
-    profile.client_id = client_id_for(&profile, cx);
-    let store = store(cx);
-    store.update(cx, |store, cx| {
-        if !force && store.status != store::ConnectionStatus::Disconnected {
-            return;
-        }
-        let generation = store.begin_connection(profile.clone());
-        store.connect(profile, None, generation, cx);
-    });
+#[derive(Debug, PartialEq)]
+enum StoredClientId {
+    Found(String),
+    Missing,
+    Unreadable(String),
+}
+
+fn stored_client_id(read: Result<Option<String>>) -> StoredClientId {
+    match read {
+        Ok(Some(client_id)) if !client_id.is_empty() => StoredClientId::Found(client_id),
+        Ok(_) => StoredClientId::Missing,
+        Err(error) => StoredClientId::Unreadable(format!("{error:#}")),
+    }
+}
+
+/// One client ID for the whole session, so every host and reconnect shares it while the stored
+/// one can't be read.
+fn session_client_id() -> String {
+    static SESSION_CLIENT_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SESSION_CLIENT_ID
+        .get_or_init(|| uuid::Uuid::new_v4().to_string())
+        .clone()
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -602,9 +730,9 @@ impl CreatePreferences {
     pub fn load(cx: &App) -> Self {
         KeyValueStore::global(cx)
             .read_kvp(PREFERENCES_KEY)
-            .ok()
+            .log_err()
             .flatten()
-            .and_then(|json| serde_json::from_str(&json).ok())
+            .and_then(|json| serde_json::from_str(&json).log_err())
             .unwrap_or_default()
     }
 
@@ -630,7 +758,7 @@ pub struct SelectedWorkspace {
 
 /// The directory and host of the agent most recently focused in a Paseo view.
 pub fn selected_workspace(cx: &App) -> Result<Option<SelectedWorkspace>> {
-    let Some(agent_id) = store(cx).read(cx).focused_agent.clone() else {
+    let Some(agent_id) = hosts::focused_agent(cx) else {
         return Ok(None);
     };
     agent_workspace(&agent_id, cx)
@@ -638,7 +766,9 @@ pub fn selected_workspace(cx: &App) -> Result<Option<SelectedWorkspace>> {
 
 /// The directory and host of an agent, or `None` when the agent isn't known.
 pub fn agent_workspace(agent_id: &str, cx: &App) -> Result<Option<SelectedWorkspace>> {
-    let store = store(cx);
+    let Some(store) = hosts::store_for_agent(agent_id, cx) else {
+        return Ok(None);
+    };
     let store = store.read(cx);
     let Some(agent) = store.agent(agent_id) else {
         return Ok(None);
@@ -647,19 +777,18 @@ pub fn agent_workspace(agent_id: &str, cx: &App) -> Result<Option<SelectedWorksp
         .directory
         .clone()
         .ok_or_else(|| anyhow!("Selected Paseo agent has no workspace directory"))?;
-    directory_workspace(directory, cx).map(Some)
+    directory_workspace(directory, store).map(Some)
 }
 
-/// The directory and host of a Paseo folder on the active connection.
-fn directory_workspace(directory: PathBuf, cx: &App) -> Result<SelectedWorkspace> {
+/// The directory and host of a Paseo folder on `store`'s host.
+fn directory_workspace(directory: PathBuf, store: &PaseoStore) -> Result<SelectedWorkspace> {
     if !directory.to_str().is_some_and(is_absolute_workspace_path) {
         return Err(anyhow!("Paseo workspace directory is not absolute"));
     }
-    let store = store(cx).read(cx);
     let profile = store
         .active_profile
         .as_ref()
-        .ok_or_else(|| anyhow!("No Paseo connection profile is active"))?;
+        .ok_or_else(|| anyhow!("No Paseo host is set up"))?;
     Ok(SelectedWorkspace {
         directory,
         target: connection_picker::parse_target(profile)?,
@@ -724,9 +853,9 @@ fn project_switcher(cx: &App) -> Result<GlobalProjectSwitcher> {
         .ok_or_else(|| anyhow!("Zaseo can't open Paseo workspaces in this window"))
 }
 
-/// The editor project's directory, only when the daemon runs on this machine and can use it.
-fn project_directory(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
-    if !store(cx).read(cx).is_local_host() {
+/// The editor project's directory, only when `store`'s daemon runs on this machine and can use it.
+fn project_directory(workspace: &Workspace, store: &PaseoStore, cx: &App) -> Option<PathBuf> {
+    if !store.is_local_host() {
         return None;
     }
     workspace
@@ -887,8 +1016,7 @@ pub(crate) fn workspace_owns_agent(workspace: &Workspace, agent_id: &str, cx: &A
 }
 
 /// The folder a Paseo workspace works in, from its descriptor or, before that loads, its agents.
-fn paseo_workspace_directory(paseo_workspace_id: &str, cx: &App) -> Option<PathBuf> {
-    let store = store(cx).read(cx);
+fn paseo_workspace_directory(paseo_workspace_id: &str, store: &PaseoStore) -> Option<PathBuf> {
     store
         .state
         .workspaces
@@ -897,7 +1025,7 @@ fn paseo_workspace_directory(paseo_workspace_id: &str, cx: &App) -> Option<PathB
         .or_else(|| {
             store
                 .state
-                .agents
+                .agents()
                 .iter()
                 .find(|agent| store::agent_workspace_id(agent) == Some(paseo_workspace_id))
                 .and_then(|agent| agent.directory.clone())
@@ -913,9 +1041,59 @@ pub(crate) fn workspace_holds_paseo_workspace(
     let Ok(switcher) = project_switcher(cx) else {
         return false;
     };
-    paseo_workspace_directory(paseo_workspace_id, cx)
-        .and_then(|directory| directory_workspace(directory, cx).ok())
+    let Some(store) = hosts::store_for_workspace(paseo_workspace_id, cx) else {
+        return false;
+    };
+    let store = store.read(cx);
+    paseo_workspace_directory(paseo_workspace_id, store)
+        .and_then(|directory| directory_workspace(directory, store).ok())
         .is_some_and(|selected| (switcher.owns)(&selected, workspace, cx))
+}
+
+/// Reopens chats on their agent's host once that host lists the agent. A tab saved before hosts
+/// were recorded, or opened before its host's agent list arrived, starts on the default host,
+/// which has no such agent.
+fn reopen_tabs_on_their_hosts(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let misplaced = workspace
+        .items_of_type::<AgentTab>(cx)
+        .filter_map(|tab| {
+            let view = tab.read(cx).view().read(cx);
+            let agent_id = view.agent_id.clone()?;
+            if view.store.read(cx).agent(&agent_id).is_some() {
+                return None;
+            }
+            let owner = hosts::store_for_agent(&agent_id, cx)?;
+            owner
+                .read(cx)
+                .agent(&agent_id)
+                .is_some()
+                .then_some((tab, agent_id))
+        })
+        .collect::<Vec<_>>();
+    for (tab, agent_id) in misplaced {
+        let Some(pane) = workspace.pane_for(&tab) else {
+            continue;
+        };
+        let (index, previously_active) = {
+            let pane = pane.read(cx);
+            (pane.index_for_item(&tab), pane.active_item())
+        };
+        let replacement = new_agent_tab(workspace, &agent_id, window, cx);
+        pane.update(cx, |pane, cx| {
+            pane.add_item(Box::new(replacement), false, false, index, window, cx);
+            if let Some(previously_active) =
+                previously_active.filter(|item| item.item_id() != tab.entity_id())
+                && let Some(index) = pane.index_for_item(previously_active.as_ref())
+            {
+                pane.activate_item(index, false, false, window, cx);
+            }
+        });
+        workspace_tabs::detach_tab(workspace, &tab, window, cx);
+    }
 }
 
 /// Closes restored tabs whose agent belongs to another workspace, checking each tab once the
@@ -969,7 +1147,30 @@ fn move_tabs_out_of_empty_workspace(
     if !source.read(cx).root_paths(cx).is_empty() {
         return;
     }
-    let (moved, source_active_view) = source.update(cx, |source, cx| {
+    let (moved, source_active_view) = detach_every_chat(source, window, cx);
+    if moved.is_empty() {
+        return;
+    }
+    let switcher = project_switcher(cx).ok();
+    let (homes, stay) = sort_moved_chats(moved, switcher.as_ref(), target, cx);
+    if let Some(switcher) = switcher {
+        move_chats_home(&switcher, homes, target, window, cx);
+    }
+    if !stay.is_empty() {
+        keep_moved_chats(target, stay, source_active_view, window, cx);
+    }
+}
+
+/// A moved chat's view, and whether its restored tab still waits for its folder check.
+type MovedChat = (Entity<AgentView>, bool);
+
+/// Removes every chat from `source`, returning them and the view of its active chat, if any.
+fn detach_every_chat(
+    source: &Entity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) -> (Vec<MovedChat>, Option<Entity<AgentView>>) {
+    source.update(cx, |source, cx| {
         let tabs = source.items_of_type::<AgentTab>(cx).collect::<Vec<_>>();
         let source_active_view = source
             .active_item(cx)
@@ -986,16 +1187,25 @@ fn move_tabs_out_of_empty_workspace(
             })
             .collect::<Vec<_>>();
         (views, source_active_view)
-    });
-    if moved.is_empty() {
-        return;
-    }
-    let switcher = project_switcher(cx).ok();
+    })
+}
+
+/// Splits moved chats into those with a folder of their own to go to, grouped by folder, and
+/// those that stay with `target`.
+fn sort_moved_chats(
+    moved: Vec<MovedChat>,
+    switcher: Option<&GlobalProjectSwitcher>,
+    target: &Entity<Workspace>,
+    cx: &App,
+) -> (
+    Vec<(SelectedWorkspace, Vec<Entity<AgentView>>)>,
+    Vec<MovedChat>,
+) {
     let mut stay = Vec::new();
     // One switch per folder, so two agents from a folder that isn't open don't open it twice.
     let mut homes: Vec<(SelectedWorkspace, Vec<Entity<AgentView>>)> = Vec::new();
     for (view, owner_check_pending) in moved {
-        let home = switcher.as_ref().and_then(|switcher| {
+        let home = switcher.and_then(|switcher| {
             let agent_id = view.read(cx).agent_id.clone()?;
             let selected = agent_workspace(&agent_id, cx).ok().flatten()?;
             (!(switcher.owns)(&selected, target.read(cx), cx)).then_some(selected)
@@ -1012,36 +1222,53 @@ fn move_tabs_out_of_empty_workspace(
             None => homes.push((selected, vec![view])),
         }
     }
-    if let Some(switcher) = switcher {
-        for (selected, views) in homes {
-            let switch = target.update(cx, |target, cx| {
-                (switcher.switch)(selected, None, SwitchMode::Background, target, window, cx)
-            });
-            let target = target.clone();
-            window
-                .spawn(cx, async move |cx| {
-                    let (home, error) = match switch.await {
-                        Ok(home) => (home, None),
-                        Err(error) => (target, Some(error)),
-                    };
-                    update_in_own_window(&home, cx, |home, window, cx| {
-                        if let Some(error) = error {
-                            let error =
-                                error.context("Could not open the agent's workspace in the editor");
-                            show_open_error(home, &error, cx);
-                        }
-                        let pane = home.active_pane().clone();
-                        for view in views {
-                            add_moved_chat(home, &pane, view, false, window, cx);
-                        }
-                    })
+    (homes, stay)
+}
+
+/// Opens each folder's workspace without switching the window, and adds its chats there, or to
+/// `target` when it can't open.
+fn move_chats_home(
+    switcher: &GlobalProjectSwitcher,
+    homes: Vec<(SelectedWorkspace, Vec<Entity<AgentView>>)>,
+    target: &Entity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    for (selected, views) in homes {
+        let switch = target.update(cx, |target, cx| {
+            (switcher.switch)(selected, None, SwitchMode::Background, target, window, cx)
+        });
+        let target = target.clone();
+        window
+            .spawn(cx, async move |cx| {
+                let (home, error) = match switch.await {
+                    Ok(home) => (home, None),
+                    Err(error) => (target, Some(error)),
+                };
+                update_in_own_window(&home, cx, |home, window, cx| {
+                    if let Some(error) = error {
+                        let error =
+                            error.context("Could not open the agent's workspace in the editor");
+                        show_open_error(home, &error, cx);
+                    }
+                    let pane = home.active_pane().clone();
+                    for view in views {
+                        add_moved_chat(home, &pane, view, false, window, cx);
+                    }
                 })
-                .detach_and_log_err(cx);
-        }
+            })
+            .detach_and_log_err(cx);
     }
-    if stay.is_empty() {
-        return;
-    }
+}
+
+/// Adds the chats that stay to `target`'s active pane, keeping the one that was active active.
+fn keep_moved_chats(
+    target: &Entity<Workspace>,
+    stay: Vec<MovedChat>,
+    source_active_view: Option<Entity<AgentView>>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     target.update(cx, |target, cx| {
         let pane = target.active_pane().clone();
         for (view, owner_check_pending) in stay {
@@ -1172,10 +1399,20 @@ pub(crate) fn new_agent_tab(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Entity<AgentTab> {
-    let directory = project_directory(workspace, cx);
+    let store = hosts::store_for_agent(agent_id, cx).unwrap_or_else(|| hosts::default_store(cx));
+    let directory = project_directory(workspace, store.read(cx), cx);
     let workspace_handle = Some(cx.weak_entity());
     let agent_id = agent_id.to_owned();
-    cx.new(|cx| AgentTab::new(Some(agent_id), directory, workspace_handle, window, cx))
+    cx.new(|cx| {
+        AgentTab::on_host(
+            store,
+            Some(agent_id),
+            directory,
+            workspace_handle,
+            window,
+            cx,
+        )
+    })
 }
 
 pub(crate) fn open_agent_here(
@@ -1219,15 +1456,28 @@ pub(crate) fn open_subagent(
     workspace.add_item_to_active_pane(Box::new(tab), None, true, window, cx);
 }
 
+/// Starts a draft on the default host.
 pub fn open_draft(
     workspace: &mut Workspace,
     directory: Option<PathBuf>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Entity<AgentTab> {
-    let directory = directory.or_else(|| project_directory(workspace, cx));
+    let store = hosts::default_store(cx);
+    open_draft_on(workspace, store, directory, window, cx)
+}
+
+/// Starts a draft whose agent will run on `store`'s host.
+pub(crate) fn open_draft_on(
+    workspace: &mut Workspace,
+    store: Entity<PaseoStore>,
+    directory: Option<PathBuf>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Entity<AgentTab> {
+    let directory = directory.or_else(|| project_directory(workspace, store.read(cx), cx));
     let workspace_handle = Some(cx.weak_entity());
-    let tab = cx.new(|cx| AgentTab::new(None, directory, workspace_handle, window, cx));
+    let tab = cx.new(|cx| AgentTab::on_host(store, None, directory, workspace_handle, window, cx));
     workspace.add_item_to_active_pane(Box::new(tab.clone()), None, true, window, cx);
     focus_tab_composer(&tab, window, cx);
     tab
@@ -1242,7 +1492,11 @@ pub(crate) fn open_draft_joining(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Entity<AgentTab> {
-    let tab = open_draft(workspace, directory, window, cx);
+    let store = paseo_workspace_id
+        .as_deref()
+        .and_then(|paseo_workspace_id| hosts::store_for_workspace(paseo_workspace_id, cx))
+        .unwrap_or_else(|| hosts::default_store(cx));
+    let tab = open_draft_on(workspace, store, directory, window, cx);
     if let Some(paseo_workspace_id) = paseo_workspace_id {
         join_paseo_workspace(workspace, &tab, &paseo_workspace_id, window, cx);
     }
@@ -1285,12 +1539,16 @@ pub(crate) fn new_agent_in_paseo_workspace(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Task<Result<Entity<AgentTab>>> {
-    let Some(directory) = paseo_workspace_directory(paseo_workspace_id, cx) else {
+    let found = hosts::store_for_workspace(paseo_workspace_id, cx).and_then(|store| {
+        let directory = paseo_workspace_directory(paseo_workspace_id, store.read(cx))?;
+        Some((directory, store))
+    });
+    let Some((directory, store)) = found else {
         let error = anyhow!("Paseo hasn't loaded this workspace yet");
         show_open_error(workspace, &error, cx);
         return Task::ready(Err(error));
     };
-    let draft = open_draft_in(workspace, directory, window, cx);
+    let draft = open_draft_in_on(workspace, store, directory, window, cx);
     let paseo_workspace_id = paseo_workspace_id.to_owned();
     cx.spawn_in(window, async move |_, cx| {
         let tab = draft.await?;
@@ -1314,11 +1572,13 @@ pub fn open_paseo_workspace_tabs(
     cx: &mut Context<Workspace>,
 ) {
     let recent = {
-        let store = store(cx);
+        let Some(store) = hosts::store_for_workspace(paseo_workspace_id, cx) else {
+            return;
+        };
         let store = store.read(cx);
         store
             .state
-            .agents
+            .agents()
             .iter()
             .filter(|agent| store::agent_workspace_id(agent) == Some(paseo_workspace_id))
             .max_by_key(|agent| store::agent_updated_at(agent))
@@ -1326,9 +1586,72 @@ pub fn open_paseo_workspace_tabs(
     };
     match recent {
         Some(agent_id) => open_agent(workspace, &agent_id, true, window, cx),
-        None => new_agent_in_paseo_workspace(workspace, paseo_workspace_id, window, cx)
-            .detach_and_log_err(cx),
+        None => {
+            if let Some(tab) = draft_tab_in(workspace, paseo_workspace_id, cx) {
+                workspace.activate_item(&tab, true, true, window, cx);
+                focus_tab_composer(&tab, window, cx);
+                return;
+            }
+            let this_workspace = cx.weak_entity();
+            let paseo_workspace_id = paseo_workspace_id.to_owned();
+            // Deferred because looking through the window's other workspaces, and activating
+            // one, reads this workspace and the window root, which may be mid-update.
+            window.defer(cx, move |window, cx| {
+                let multi_workspace = window.root::<MultiWorkspace>().flatten();
+                // The workspace may have left the window before this ran, and a draft there
+                // would be unreachable.
+                let Some(this_workspace) = this_workspace.upgrade().filter(|this_workspace| {
+                    multi_workspace.as_ref().is_none_or(|multi_workspace| {
+                        multi_workspace
+                            .read(cx)
+                            .workspaces()
+                            .any(|workspace| workspace == this_workspace)
+                    })
+                }) else {
+                    return;
+                };
+                let elsewhere = multi_workspace.and_then(|multi_workspace| {
+                    multi_workspace
+                        .read(cx)
+                        .workspaces()
+                        .filter(|other| **other != this_workspace)
+                        .find_map(|other| {
+                            let tab = draft_tab_in(other.read(cx), &paseo_workspace_id, cx)?;
+                            Some((multi_workspace.clone(), other.clone(), tab))
+                        })
+                });
+                match elsewhere {
+                    Some((multi_workspace, owner, tab)) => {
+                        multi_workspace.update(cx, |multi_workspace, cx| {
+                            multi_workspace.activate(owner.clone(), None, window, cx)
+                        });
+                        owner.update(cx, |owner, cx| {
+                            owner.activate_item(&tab, true, true, window, cx);
+                        });
+                        focus_tab_composer(&tab, window, cx);
+                    }
+                    None => this_workspace.update(cx, |workspace, cx| {
+                        new_agent_in_paseo_workspace(workspace, &paseo_workspace_id, window, cx)
+                            .detach_and_log_err(cx)
+                    }),
+                }
+            });
+        }
     }
+}
+
+/// The open draft that will join `paseo_workspace_id`, so opening that empty workspace again
+/// shows it instead of starting another.
+fn draft_tab_in(
+    workspace: &Workspace,
+    paseo_workspace_id: &str,
+    cx: &App,
+) -> Option<Entity<AgentTab>> {
+    workspace.items_of_type::<AgentTab>(cx).find(|tab| {
+        let view = tab.read(cx).view().read(cx);
+        view.agent_id.is_none()
+            && view.composer.read(cx).draft_workspace_id.as_deref() == Some(paseo_workspace_id)
+    })
 }
 
 /// Drops an archived Paseo workspace's chats from `workspace`, and closes `workspace` when it was
@@ -1373,8 +1696,20 @@ pub fn open_draft_in(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Task<Result<Entity<AgentTab>>> {
+    let store = hosts::default_store(cx);
+    open_draft_in_on(workspace, store, directory, window, cx)
+}
+
+/// `open_draft_in` for a folder on `store`'s host.
+pub(crate) fn open_draft_in_on(
+    workspace: &mut Workspace,
+    store: Entity<PaseoStore>,
+    directory: PathBuf,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Task<Result<Entity<AgentTab>>> {
     let switched = project_switcher(cx).and_then(|switcher| {
-        let selected = directory_workspace(directory.clone(), cx)?;
+        let selected = directory_workspace(directory.clone(), store.read(cx))?;
         if (switcher.owns)(&selected, workspace, cx) {
             return Ok(None);
         }
@@ -1388,7 +1723,15 @@ pub fn open_draft_in(
         )))
     });
     let switch = match switched {
-        Ok(None) => return Task::ready(Ok(open_draft(workspace, Some(directory), window, cx))),
+        Ok(None) => {
+            return Task::ready(Ok(open_draft_on(
+                workspace,
+                store,
+                Some(directory),
+                window,
+                cx,
+            )));
+        }
         Ok(Some(switch)) => switch,
         Err(error) => {
             let error = error.context("Could not open the folder's workspace in the editor");
@@ -1398,7 +1741,7 @@ pub fn open_draft_in(
     };
     cx.spawn_in(window, async move |workspace, cx| match switch.await {
         Ok(target) => update_in_own_window(&target, cx, |target, window, cx| {
-            open_draft(target, Some(directory), window, cx)
+            open_draft_on(target, store, Some(directory), window, cx)
         }),
         Err(error) => {
             let error = error.context("Could not open the folder's workspace in the editor");
@@ -1410,13 +1753,21 @@ pub fn open_draft_in(
 
 /// Opens a draft that starts from the agent's conversation, like Paseo's "Fork in a new tab".
 pub fn fork_agent(
-    _workspace: &mut Workspace,
+    workspace: &mut Workspace,
+    store: Entity<PaseoStore>,
     agent_id: &str,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let store = store(cx);
+    if paseo_client::parse_subagent_timeline_id(agent_id).is_some() {
+        workspace.show_error(
+            anyhow!("A subagent can't be forked. Fork its parent agent instead."),
+            cx,
+        );
+        return;
+    }
     let Some(agent) = store.read(cx).agent(agent_id).cloned() else {
+        workspace.show_error(anyhow!("This agent is no longer on its host"), cx);
         return;
     };
     let task = store.update(cx, |store, cx| store.fork_context(agent_id, cx));
@@ -1438,15 +1789,19 @@ pub fn fork_agent(
                     .await?
             }
             (None, Some(directory)) => {
+                let store = store.clone();
                 workspace
                     .update_in(cx, |workspace, window, cx| {
-                        open_draft_in(workspace, directory, window, cx)
+                        open_draft_in_on(workspace, store, directory, window, cx)
                     })?
                     .await?
             }
-            (None, None) => workspace.update_in(cx, |workspace, window, cx| {
-                open_draft(workspace, None, window, cx)
-            })?,
+            (None, None) => {
+                let store = store.clone();
+                workspace.update_in(cx, |workspace, window, cx| {
+                    open_draft_on(workspace, store, None, window, cx)
+                })?
+            }
         };
         tab.update(cx, |tab, cx| {
             let composer = tab.view().read(cx).composer.clone();
@@ -1492,16 +1847,11 @@ pub fn open_tab(workspace: &mut Workspace, window: &mut Window, cx: &mut Context
         open_paseo_workspace_tabs(workspace, &paseo_workspace_id, window, cx);
         return;
     }
-    let recent = {
-        let store = store(cx);
-        let store = store.read(cx);
-        store
-            .state
-            .agents
-            .iter()
-            .max_by_key(|agent| store::agent_updated_at(agent))
-            .map(|agent| agent.id.clone())
-    };
+    let recent = hosts::stores(cx)
+        .iter()
+        .flat_map(|store| store.read(cx).state.agents().iter())
+        .max_by_key(|agent| store::agent_updated_at(agent))
+        .map(|agent| agent.id.clone());
     match recent {
         Some(agent_id) => open_agent(workspace, &agent_id, true, window, cx),
         None => {
@@ -1521,7 +1871,7 @@ pub fn test_add_agent_edit(
     new_text: &str,
     cx: &mut App,
 ) {
-    let store = store(cx);
+    let store = hosts::default_store(cx);
     store.update(cx, |store, cx| {
         store.active_profile = Some(PaseoConnectionProfile {
             name: "Local".into(),
@@ -1529,7 +1879,7 @@ pub fn test_add_agent_edit(
             editor_ssh_uri: None,
             client_id: "test-client".into(),
         });
-        let mut agents = store.state.agents.clone();
+        let mut agents = store.state.agents().to_vec();
         agents.push(paseo_client::AgentSummary {
             id: agent_id.into(),
             title: Some("Test agent".into()),
@@ -1566,7 +1916,7 @@ pub fn test_add_agent_edit(
 /// Adds a pending permission request, such as an agent's question, for tests.
 #[cfg(any(test, feature = "test-support"))]
 pub fn test_add_permission(request: paseo_client::PermissionRequest, cx: &mut App) {
-    store(cx).update(cx, |store, cx| {
+    hosts::default_store(cx).update(cx, |store, cx| {
         store
             .state
             .permissions
@@ -1575,10 +1925,99 @@ pub fn test_add_permission(request: paseo_client::PermissionRequest, cx: &mut Ap
     });
 }
 
+/// The globals the Paseo views need outside a workspace, for tests and benchmarks.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_init(cx: &mut App) {
+    if !cx.has_global::<settings::SettingsStore>() {
+        let settings_store = settings::SettingsStore::test(cx);
+        cx.set_global(settings_store);
+    }
+    cx.set_global(db::AppDatabase::test_new());
+    theme_settings::init(theme::LoadThemes::JustBase, cx);
+    editor::init(cx);
+    PaseoSettings::register(cx);
+    hosts::init(cx);
+}
+
+/// An idle agent in `/work/project`, updated at a fixed time, for tests and benchmarks.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_agent(id: &str, title: &str, status: &str) -> paseo_client::AgentSummary {
+    paseo_client::AgentSummary {
+        id: id.into(),
+        title: Some(title.into()),
+        status: status.into(),
+        directory: Some(std::path::PathBuf::from("/work/project")),
+        project: Some(serde_json::json!({"projectName": "project"})),
+        extra: serde_json::json!({"updatedAt": "2026-10-02T10:00:00Z"}),
+    }
+}
+
+/// The chat of `agent_id` on the default host, outside any workspace, for tests and benchmarks.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_chat(agent_id: &str, window: &mut Window, cx: &mut Context<AgentView>) -> AgentView {
+    AgentView::on_host(
+        hosts::default_store(cx),
+        Some(agent_id.into()),
+        None,
+        None,
+        window,
+        cx,
+    )
+}
+
+/// How many rows a chat shows, for checking a benchmark's setup.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_chat_rows(chat: &Entity<AgentView>, cx: &App) -> usize {
+    chat.read(cx).rows.len()
+}
+
+/// Adds `entries` to the default host's timelines the way the daemon streams them.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_stream_entries(entries: Vec<paseo_client::TimelineEntry>, cx: &mut App) {
+    hosts::default_store(cx).update(cx, |store, cx| {
+        let agent_ids = entries
+            .iter()
+            .map(|entry| entry.agent_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        for entry in entries {
+            store.state.insert_entry(entry);
+        }
+        for agent_id in agent_ids {
+            cx.emit(store::StoreEvent::TimelineChanged(agent_id));
+        }
+    });
+}
+
+/// Updates or adds one agent on the default host as a daemon `agent_update` does.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_upsert_agent(agent: paseo_client::AgentSummary, cx: &mut App) {
+    hosts::default_store(cx).update(cx, |store, cx| {
+        store.handle_event(paseo_client::PaseoEvent::AgentUpserted(agent), cx)
+    });
+}
+
+/// Lists `agents` on the default host in place of what it had, for tests and benchmarks.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_set_agents(agents: Vec<paseo_client::AgentSummary>, cx: &mut App) {
+    hosts::default_store(cx).update(cx, |store, cx| {
+        store.state.set_agents(agents);
+        cx.notify();
+    });
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub fn test_add_agent(agent: paseo_client::AgentSummary, cx: &mut App) {
-    store(cx).update(cx, |store, cx| {
-        store.state.agents.push(agent);
+    hosts::default_store(cx).update(cx, |store, cx| {
+        store.state.upsert_agent(agent);
+        cx.notify();
+    });
+}
+
+/// Lists `agent` on the host with profile name `host`, for tests.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_add_agent_on(host: &str, agent: paseo_client::AgentSummary, cx: &mut App) {
+    hosts::store_named(host, cx).update(cx, |store, cx| {
+        store.state.upsert_agent(agent);
         cx.notify();
     });
 }
@@ -1586,7 +2025,7 @@ pub fn test_add_agent(agent: paseo_client::AgentSummary, cx: &mut App) {
 /// Connects the store to a daemon on this machine, as far as opening workspaces goes, for tests.
 #[cfg(any(test, feature = "test-support"))]
 pub fn test_use_local_host(cx: &mut App) {
-    store(cx).update(cx, |store, cx| {
+    hosts::default_store(cx).update(cx, |store, cx| {
         store.active_profile = Some(PaseoConnectionProfile {
             name: "Local".into(),
             target_uri: "ws://127.0.0.1:6767/ws".into(),
@@ -1617,7 +2056,7 @@ pub fn test_add_paseo_workspace(
     worktree: bool,
     cx: &mut App,
 ) {
-    store(cx).update(cx, |store, cx| {
+    hosts::default_store(cx).update(cx, |store, cx| {
         store.state.workspaces.insert(
             workspace_id.to_owned(),
             paseo_client::WorkspaceDescriptor {
@@ -1648,11 +2087,10 @@ pub fn test_add_paseo_workspace(
 /// Archives a Paseo workspace and its agents the way the daemon announces it, for tests.
 #[cfg(any(test, feature = "test-support"))]
 pub fn test_archive_paseo_workspace(workspace_id: &str, cx: &mut App) {
-    store(cx).update(cx, |store, cx| {
+    hosts::default_store(cx).update(cx, |store, cx| {
         store
             .state
-            .agents
-            .retain(|agent| store::agent_workspace_id(agent) != Some(workspace_id));
+            .retain_agents(|agent| store::agent_workspace_id(agent) != Some(workspace_id));
         store.handle_event(
             paseo_client::PaseoEvent::WorkspaceRemoved {
                 workspace_id: workspace_id.to_owned(),
@@ -1675,6 +2113,59 @@ pub fn test_draft_workspace_id(tab: &Entity<AgentTab>, cx: &App) -> Option<Strin
         .clone()
 }
 
+/// Whether `workspace` shows the New Workspace window, for tests.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_new_workspace_open(workspace: &Workspace, cx: &App) -> bool {
+    workspace
+        .active_modal::<workspace_tools::NewWorkspaceModal>(cx)
+        .is_some()
+}
+
+/// The New Workspace window's message, for tests.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_new_workspace_text(workspace: &Entity<Workspace>, cx: &App) -> Option<String> {
+    let modal = workspace
+        .read(cx)
+        .active_modal::<workspace_tools::NewWorkspaceModal>(cx)?;
+    Some(modal.read(cx).composer_for_test().read(cx).text(cx))
+}
+
+/// Types `text` into the New Workspace window's message, for tests.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_new_workspace_set_text(
+    workspace: &Entity<Workspace>,
+    text: &str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let modal = workspace
+        .read(cx)
+        .active_modal::<workspace_tools::NewWorkspaceModal>(cx);
+    if let Some(modal) = modal {
+        let composer = modal.read(cx).composer_for_test();
+        composer.update(cx, |composer, cx| composer.set_text(text, window, cx));
+    }
+}
+
+/// Finishes the New Workspace window's draft the way its first message creating `agent_id`
+/// does, for tests.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_new_workspace_agent_created(
+    workspace: &Entity<Workspace>,
+    agent_id: &str,
+    cx: &mut App,
+) {
+    let modal = workspace
+        .read(cx)
+        .active_modal::<workspace_tools::NewWorkspaceModal>(cx);
+    if let Some(modal) = modal {
+        let composer = modal.read(cx).composer_for_test();
+        composer.update(cx, |composer, cx| {
+            composer.finish_creating_for_test(agent_id.to_owned(), cx)
+        });
+    }
+}
+
 /// Opens a tab the way restoring a workspace does, for tests.
 #[cfg(any(test, feature = "test-support"))]
 pub fn test_restore_agent_tab(
@@ -1685,14 +2176,14 @@ pub fn test_restore_agent_tab(
 ) {
     let workspace_handle = cx.weak_entity();
     let agent_id = agent_id.to_owned();
-    let tab = cx.new(|cx| AgentTab::restored(agent_id, workspace_handle, window, cx));
+    let tab = cx.new(|cx| AgentTab::restored(agent_id, None, workspace_handle, window, cx));
     workspace.add_item_to_active_pane(Box::new(tab), None, false, window, cx);
 }
 
 /// Records `agent_id` as the agent last focused in a Paseo view, for tests.
 #[cfg(any(test, feature = "test-support"))]
 pub fn test_set_focused_agent(agent_id: &str, cx: &mut App) {
-    store(cx).update(cx, |store, cx| {
+    hosts::default_store(cx).update(cx, |store, cx| {
         store.set_focused_agent(agent_id.to_owned(), cx)
     });
 }
@@ -1700,18 +2191,40 @@ pub fn test_set_focused_agent(agent_id: &str, cx: &mut App) {
 /// The store's error banner, which a request sent with no daemon connection sets, for tests.
 #[cfg(any(test, feature = "test-support"))]
 pub fn test_store_error(cx: &App) -> Option<String> {
-    store(cx).read(cx).state.error.clone()
+    hosts::default_store(cx).read(cx).state.error.clone()
 }
 
 /// The agent the store records as the one the user is looking at, for tests.
 #[cfg(any(test, feature = "test-support"))]
 pub fn test_focused_agent(cx: &App) -> Option<String> {
-    store(cx).read(cx).focused_agent.clone()
+    hosts::focused_agent(cx)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreadable_client_id_is_not_replaced() {
+        assert_eq!(
+            stored_client_id(Ok(Some("stable".into()))),
+            StoredClientId::Found("stable".into())
+        );
+        assert_eq!(stored_client_id(Ok(None)), StoredClientId::Missing);
+        assert_eq!(
+            stored_client_id(Ok(Some(String::new()))),
+            StoredClientId::Missing
+        );
+        assert!(matches!(
+            stored_client_id(Err(anyhow!("database is locked"))),
+            StoredClientId::Unreadable(_)
+        ));
+        assert_eq!(
+            session_client_id(),
+            session_client_id(),
+            "every host shares one ID for the session"
+        );
+    }
 
     #[gpui::test]
     fn system_notifications_only_while_unfocused(cx: &mut gpui::TestAppContext) {
@@ -1727,9 +2240,10 @@ mod tests {
             let settings_store = settings::SettingsStore::test(cx);
             cx.set_global(settings_store);
             cx.set_app_identity("local.zaseo.test", "Zaseo");
-            let store = cx.new(|_| PaseoStore::default());
-            init_system_notifications(&store, cx);
-            store
+            PaseoSettings::register(cx);
+            hosts::init(cx);
+            init_system_notifications(cx);
+            hosts::default_store(cx)
         });
         let window = cx.add_empty_window();
         window.update(|window, _| window.activate_window());
@@ -1786,7 +2300,7 @@ mod tests {
                 paseo.sidebar,
                 SidebarSettings {
                     grouping: None,
-                    title_lines: 2,
+                    title_lines: 1,
                     animate_status: true,
                 }
             );
@@ -1827,6 +2341,23 @@ mod tests {
             assert_eq!(
                 paseo.sidebar.grouping,
                 Some(settings::PaseoSidebarGrouping::Status)
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn chat_font_size_defaults_below_the_ui_size(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let mut store = settings::SettingsStore::test(cx);
+            store
+                .set_user_settings(r#"{"ui_font_size": 16}"#, cx)
+                .result()
+                .expect("valid settings");
+            cx.set_global(store);
+            assert_eq!(
+                chat_font_size(cx),
+                px(14.),
+                "chat prose matches Zed's label size, seven eighths of the UI font size"
             );
         });
     }

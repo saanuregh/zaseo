@@ -49,6 +49,9 @@ impl std::error::Error for AuthRejection {}
 /// What the connected daemon supports, from its `server_info` hello.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ServerInfo {
+    /// The daemon's own ID, which tells two profiles that reach the same daemon apart from two
+    /// daemons.
+    pub server_id: Option<String>,
     pub features: Value,
     pub capabilities: Value,
     /// Paseo Desktop runs this daemon, so only Paseo Desktop can update it.
@@ -128,6 +131,13 @@ pub struct WorkspaceDescriptor {
     pub current_branch: Option<String>,
     pub is_paseo_worktree: bool,
     pub extra: Value,
+}
+
+impl WorkspaceDescriptor {
+    /// Whether the workspace lives in a git worktree rather than the project's own checkout.
+    pub fn is_worktree(&self) -> bool {
+        self.kind == "worktree" || self.is_paseo_worktree
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -316,7 +326,15 @@ pub enum PaseoEvent {
     ConnectionFailed {
         reason: String,
     },
+    /// The whole agent directory, sent once its last page arrives. It replaces every agent the
+    /// receiver knew.
     AgentsChanged(Vec<AgentSummary>),
+    /// One agent was added or changed.
+    AgentUpserted(AgentSummary),
+    /// One agent left the directory.
+    AgentRemoved {
+        agent_id: String,
+    },
     /// An agent or subagent timeline item; subagent entries use `subagent_timeline_id`.
     TimelineEntry(TimelineEntry),
     SubagentUpserted(ProviderSubagent),

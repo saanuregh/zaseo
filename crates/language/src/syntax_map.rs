@@ -1023,14 +1023,17 @@ impl SyntaxSnapshot {
                     if let Some((prev_range, prev_language_id)) = prev_layer {
                         match layer.range.start.cmp(&prev_range.start, text) {
                             Ordering::Less => out_of_order("start decreased"),
+                            // Layers sharing a start are ordered widest first, as
+                            // `SyntaxLayerPosition` seeks them: a combined injection spans its
+                            // whole parent layer, ahead of injections that start with it.
                             Ordering::Equal => match layer.range.end.cmp(&prev_range.end, text) {
-                                Ordering::Less => out_of_order("end decreased at equal start"),
+                                Ordering::Greater => out_of_order("end increased at equal start"),
                                 Ordering::Equal => {
                                     if layer.content.language_id() < prev_language_id {
                                         out_of_order("language id decreased at equal range")
                                     }
                                 }
-                                Ordering::Greater => {}
+                                Ordering::Less => {}
                             },
                             Ordering::Greater => {}
                         }
@@ -1038,7 +1041,7 @@ impl SyntaxSnapshot {
                     prev_layer = Some((layer.range.clone(), layer.content.language_id()));
                 }
                 Ordering::Greater => {
-                    prev_layer = None;
+                    prev_layer = Some((layer.range.clone(), layer.content.language_id()));
                 }
             }
 

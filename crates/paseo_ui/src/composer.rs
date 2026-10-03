@@ -192,7 +192,7 @@ pub enum ComposerEvent {
 }
 
 pub struct Composer {
-    store: Entity<PaseoStore>,
+    pub(crate) store: Entity<PaseoStore>,
     agent_id: Option<String>,
     editor: Entity<Editor>,
     pub(crate) draft: AgentChoices,
@@ -417,7 +417,7 @@ impl Composer {
                 store
                     .read(cx)
                     .state
-                    .agents
+                    .agents()
                     .iter()
                     .max_by_key(|agent| crate::store::agent_updated_at(agent))
                     .and_then(|agent| agent.directory.clone())
@@ -515,8 +515,7 @@ impl Composer {
         cx.emit(ComposerEvent::AgentCreated(agent_id));
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn set_text_for_test(&self, text: &str, window: &mut Window, cx: &mut App) {
+    pub(crate) fn set_text(&self, text: &str, window: &mut Window, cx: &mut App) {
         self.editor
             .update(cx, |editor, cx| editor.set_text(text, window, cx));
     }
@@ -871,6 +870,14 @@ impl Composer {
         self.context_attachments = vec![attachment];
         self.fork_source_title = Some(source_title);
         self.draft = choices;
+        self.load_commands(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn clear_draft_directory(&mut self, cx: &mut Context<Self>) {
+        self.draft_directory = None;
+        self.worktree_base = None;
+        self.draft_workspace_id = None;
         self.load_commands(cx);
         cx.notify();
     }
@@ -1955,11 +1962,9 @@ impl Composer {
     }
 
     fn render_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let store = self.store.read(cx);
         let choices = self.choices(cx);
         let provider = self.current_provider(cx).cloned();
         let focus = self.editor.focus_handle(cx);
-        let is_draft = self.agent_id.is_none();
         let models = provider.as_ref().map(provider_models).unwrap_or_default();
         let model_label = choices
             .model
@@ -1977,70 +1982,14 @@ impl Composer {
             _ => Vec::new(),
         };
         let modes = self.mode_options(cx);
-        let providers = store.providers.clone();
-
         let this = cx.weak_entity();
-        let provider_picker = is_draft.then(|| {
-            let provider_label = provider
-                .as_ref()
-                .map(|provider| {
-                    provider
-                        .label
-                        .clone()
-                        .unwrap_or_else(|| provider.id.clone())
-                })
-                .unwrap_or_else(|| "No provider".into());
-            let this = this.clone();
-            let current = choices.provider.clone();
-            PopoverMenu::new("paseo-provider-picker")
-                .with_handle(self.provider_menu.clone())
-                .trigger_with_tooltip(
-                    Self::picker_chip(
-                        "paseo-provider-chip",
-                        provider_label,
-                        Some(crate::sidebar::provider_icon(
-                            choices.provider.as_deref().unwrap_or_default(),
-                        )),
-                    ),
-                    Tooltip::text("Agent provider"),
-                )
-                .anchor(gpui::Anchor::BottomLeft)
-                .menu(move |window, cx| {
-                    let this = this.clone();
-                    let choices = providers
-                        .iter()
-                        .map(|provider| Choice {
-                            id: provider.id.clone(),
-                            label: provider
-                                .label
-                                .clone()
-                                .unwrap_or_else(|| provider.id.clone()),
-                            description: (provider.status != "ready")
-                                .then(|| provider.status.clone()),
-                            is_default: false,
-                            color_tier: None,
-                        })
-                        .collect();
-                    Some(choice_picker(
-                        "Provider",
-                        choices,
-                        current.clone(),
-                        Rc::new(move |id, _, cx| {
-                            if let Err(error) =
-                                this.update(cx, |composer, cx| composer.select_provider(id, cx))
-                            {
-                                log::debug!("Paseo composer closed: {error}");
-                            }
-                        }),
-                        window,
-                        cx,
-                    ))
-                })
-        });
+
+        let provider_picker = self
+            .agent_id
+            .is_none()
+            .then(|| self.render_provider_picker(provider.as_ref(), &choices, this.clone()));
 
         let model_picker = (!models.is_empty()).then(|| {
-            let this = this.clone();
-            let current = choices.model.clone();
             let focus = focus.clone();
             PopoverMenu::new("paseo-model-picker")
                 .with_handle(self.model_menu.clone())
@@ -2051,23 +2000,13 @@ impl Composer {
                     },
                 )
                 .anchor(gpui::Anchor::BottomLeft)
-                .menu(move |window, cx| {
-                    let this = this.clone();
-                    Some(choice_picker(
-                        "Model",
-                        models.clone(),
-                        current.clone(),
-                        Rc::new(move |id, _, cx| {
-                            if let Err(error) =
-                                this.update(cx, |composer, cx| composer.select_model(id, cx))
-                            {
-                                log::debug!("Paseo composer closed: {error}");
-                            }
-                        }),
-                        window,
-                        cx,
-                    ))
-                })
+                .menu(Self::choice_menu(
+                    this.clone(),
+                    "Model",
+                    models,
+                    choices.model.clone(),
+                    Self::select_model,
+                ))
         });
 
         let thinking_picker = (!thinking.is_empty()).then(|| {
@@ -2077,8 +2016,6 @@ impl Composer {
                 .and_then(|id| thinking.iter().find(|option| option.id == id))
                 .map(|option| option.label.clone())
                 .unwrap_or_else(|| "Thinking".into());
-            let this = this.clone();
-            let current = choices.thinking.clone();
             let focus = focus.clone();
             PopoverMenu::new("paseo-thinking-picker")
                 .with_handle(self.thinking_menu.clone())
@@ -2094,23 +2031,13 @@ impl Composer {
                     },
                 )
                 .anchor(gpui::Anchor::BottomLeft)
-                .menu(move |window, cx| {
-                    let this = this.clone();
-                    Some(choice_picker(
-                        "Thinking",
-                        thinking.clone(),
-                        current.clone(),
-                        Rc::new(move |id, _, cx| {
-                            if let Err(error) =
-                                this.update(cx, |composer, cx| composer.select_thinking(id, cx))
-                            {
-                                log::debug!("Paseo composer closed: {error}");
-                            }
-                        }),
-                        window,
-                        cx,
-                    ))
-                })
+                .menu(Self::choice_menu(
+                    this.clone(),
+                    "Thinking",
+                    thinking,
+                    choices.thinking.clone(),
+                    Self::select_thinking,
+                ))
         });
 
         let mode_picker = (!modes.is_empty()).then(|| {
@@ -2122,8 +2049,6 @@ impl Composer {
                 .map(|option| option.label.clone())
                 .unwrap_or_else(|| "Mode".into());
             let color = mode_color(current_mode.and_then(|mode| mode.color_tier.as_deref()));
-            let this = this.clone();
-            let current = choices.mode.clone();
             let focus = focus.clone();
             PopoverMenu::new("paseo-mode-picker")
                 .with_handle(self.mode_menu.clone())
@@ -2138,23 +2063,13 @@ impl Composer {
                     move |_window, cx| Tooltip::for_action_in("Cycle mode", &CycleMode, &focus, cx),
                 )
                 .anchor(gpui::Anchor::BottomLeft)
-                .menu(move |window, cx| {
-                    let this = this.clone();
-                    Some(choice_picker(
-                        "Mode",
-                        modes.clone(),
-                        current.clone(),
-                        Rc::new(move |id, _, cx| {
-                            if let Err(error) =
-                                this.update(cx, |composer, cx| composer.select_mode(id, cx))
-                            {
-                                log::debug!("Paseo composer closed: {error}");
-                            }
-                        }),
-                        window,
-                        cx,
-                    ))
-                })
+                .menu(Self::choice_menu(
+                    this.clone(),
+                    "Mode",
+                    modes.clone(),
+                    choices.mode.clone(),
+                    Self::select_mode,
+                ))
         });
 
         let feature_controls = self
@@ -2173,6 +2088,91 @@ impl Composer {
             .children(thinking_picker)
             .children(mode_picker)
             .children(feature_controls)
+    }
+
+    /// A draft's provider picker. The providers are read when the menu opens, since the
+    /// composer renders every frame while an agent works.
+    fn render_provider_picker(
+        &self,
+        provider: Option<&Provider>,
+        choices: &AgentChoices,
+        this: WeakEntity<Self>,
+    ) -> PopoverMenu<Picker<ChoicePickerDelegate>> {
+        let provider_label = provider
+            .map(|provider| {
+                provider
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| provider.id.clone())
+            })
+            .unwrap_or_else(|| "No provider".into());
+        let current = choices.provider.clone();
+        PopoverMenu::new("paseo-provider-picker")
+            .with_handle(self.provider_menu.clone())
+            .trigger_with_tooltip(
+                Self::picker_chip(
+                    "paseo-provider-chip",
+                    provider_label,
+                    Some(crate::sidebar::provider_icon(
+                        choices.provider.as_deref().unwrap_or_default(),
+                    )),
+                ),
+                Tooltip::text("Agent provider"),
+            )
+            .anchor(gpui::Anchor::BottomLeft)
+            .menu(move |window, cx| {
+                let composer = this.upgrade()?;
+                let choices = composer
+                    .read(cx)
+                    .store
+                    .read(cx)
+                    .providers
+                    .iter()
+                    .map(|provider| Choice {
+                        id: provider.id.clone(),
+                        label: provider
+                            .label
+                            .clone()
+                            .unwrap_or_else(|| provider.id.clone()),
+                        description: (provider.status != "ready").then(|| provider.status.clone()),
+                        is_default: false,
+                        color_tier: None,
+                    })
+                    .collect();
+                Self::choice_menu(
+                    this.clone(),
+                    "Provider",
+                    choices,
+                    current.clone(),
+                    Self::select_provider,
+                )(window, cx)
+            })
+    }
+
+    /// A picker menu over `options` that applies the chosen one with `select`.
+    fn choice_menu(
+        this: WeakEntity<Self>,
+        title: &'static str,
+        options: Vec<Choice>,
+        current: Option<String>,
+        select: fn(&mut Self, String, &mut Context<Self>),
+    ) -> impl Fn(&mut Window, &mut App) -> Option<Entity<Picker<ChoicePickerDelegate>>> + 'static
+    {
+        move |window, cx| {
+            let this = this.clone();
+            Some(choice_picker(
+                title,
+                options.clone(),
+                current.clone(),
+                Rc::new(move |id, _, cx| {
+                    if let Err(error) = this.update(cx, |composer, cx| select(composer, id, cx)) {
+                        log::debug!("Paseo composer closed: {error}");
+                    }
+                }),
+                window,
+                cx,
+            ))
+        }
     }
 
     /// A provider feature as Paseo draws it: a toggle is an icon button coloured while on, a
@@ -2330,6 +2330,7 @@ impl Composer {
         let focus = self.editor.focus_handle(cx);
         let colors = cx.theme().colors();
         if running && !has_text {
+            let fill = cx.theme().status().error;
             return div()
                 .id("paseo-stop")
                 .size(rems_from_px(28_f32))
@@ -2338,9 +2339,9 @@ impl Composer {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(cx.theme().status().error)
+                .bg(fill)
                 .cursor_pointer()
-                .hover(|style| style.opacity(0.85))
+                .hover(move |style| style.bg(fill.opacity(0.85)))
                 .tooltip(move |_window, cx| {
                     Tooltip::for_action_in("Stop", &InterruptAgent, &focus, cx)
                 })
@@ -2351,7 +2352,7 @@ impl Composer {
                     div()
                         .size(rems_from_px(10_f32))
                         .rounded(rems_from_px(2_f32))
-                        .bg(gpui::white()),
+                        .bg(colors.background),
                 )
                 .into_any_element();
         }
@@ -2366,9 +2367,10 @@ impl Composer {
             .justify_center()
             .map(|this| {
                 if enabled {
-                    this.bg(colors.border_focused)
+                    let fill = colors.border_focused;
+                    this.bg(fill)
                         .cursor_pointer()
-                        .hover(|style| style.opacity(0.85))
+                        .hover(move |style| style.bg(fill.opacity(0.85)))
                 } else {
                     this.bg(colors.element_background)
                 }

@@ -49,3 +49,4 @@ which.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 fs = { workspace = true, features = ["test-support"] }
 util = { workspace = true, features = ["test-support"] }
+sha2.workspace = true

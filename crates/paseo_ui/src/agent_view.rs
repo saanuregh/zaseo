@@ -33,12 +33,14 @@ use crate::store::{
     agent_project_name, agent_provider, agent_turn_started_at, agent_worktree_name,
     subagent_bucket, subagent_title,
 };
+use crate::stream::{ToolSummary, tool_summary};
 use crate::timeline::{
-    FileChange, Segment, StreamContent, StreamItem, ToolStatus, Turn, group_turns, parse_timestamp,
-    project_items, tool_group_label, tool_runs, turn_changes,
+    FileChange, Segment, StreamContent, StreamItem, TimelineProjection, ToolKind, ToolStatus, Turn,
+    group_turns, latest_finished_turn, parse_timestamp, tool_group_label, tool_kind, tool_runs,
+    turn_changes, turn_text,
 };
 use crate::{
-    ArchiveAgent, CopyAgentId, FocusComposer, RenameAgent, ScrollToBottom, connection_picker, store,
+    ArchiveAgent, CopyAgentId, FocusComposer, RenameAgent, ScrollToBottom, hosts, workspace_tools,
 };
 use editor::Editor;
 
@@ -53,9 +55,7 @@ pub(crate) fn content_max_width(cx: &App) -> Pixels {
 fn is_thinking(item: &StreamItem) -> bool {
     match &item.content {
         StreamContent::Reasoning { .. } => true,
-        StreamContent::Tool(call) => {
-            crate::timeline::tool_display(call, None).kind == crate::timeline::ToolKind::Thinking
-        }
+        StreamContent::Tool(call) => tool_kind(call) == ToolKind::Thinking,
         _ => false,
     }
 }
@@ -63,15 +63,18 @@ fn is_thinking(item: &StreamItem) -> bool {
 /// The steps of a finished turn that its "Worked for" line folds away: everything between the
 /// user's message and the agent's final answer, or after the message when no answer came.
 /// `None` when there is nothing between them.
-pub(crate) fn folded_work(items: &[StreamItem], turn: Range<usize>) -> Option<Range<usize>> {
+pub(crate) fn folded_work<Item: std::borrow::Borrow<StreamItem>>(
+    items: &[Item],
+    turn: Range<usize>,
+) -> Option<Range<usize>> {
+    let item_at =
+        |index: usize| -> Option<&StreamItem> { items.get(index).map(|item| item.borrow()) };
     let is_user = |index: &usize| {
-        items
-            .get(*index)
-            .is_some_and(|item| matches!(item.content, StreamContent::User { .. }))
+        item_at(*index).is_some_and(|item| matches!(item.content, StreamContent::User { .. }))
     };
     let work_start = turn.clone().find(|index| !is_user(index))?;
     let final_answer = (work_start..turn.end).rev().find(|index| {
-        items.get(*index).is_some_and(|item| {
+        item_at(*index).is_some_and(|item| {
             matches!(&item.content, StreamContent::Assistant { text } if !text.trim().is_empty())
         })
     });
@@ -79,14 +82,17 @@ pub(crate) fn folded_work(items: &[StreamItem], turn: Range<usize>) -> Option<Ra
     (!work.is_empty()).then_some(work)
 }
 
+/// Rows share their items and changed files with the view, so building and comparing them stays
+/// cheap; `Rc<T>` compares by pointer before value when `T: Eq`.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Row {
     LoadOlder {
         loading: bool,
     },
     Item {
-        index: usize,
-        item: StreamItem,
+        item: Rc<StreamItem>,
+        /// A tool call's header, worked out when the rows are built.
+        tool: Option<Rc<ToolSummary>>,
         expanded: bool,
         streaming: bool,
     },
@@ -104,9 +110,10 @@ pub(crate) enum Row {
         expanded: bool,
     },
     TurnFooter {
-        turn: usize,
         /// The key of the turn's first item, which stays put when older turns load above.
         first_item_key: Option<u64>,
+        /// Whether the turn has assistant text to copy, which `AgentView::turn_copy_text` holds.
+        has_text: bool,
         duration_seconds: Option<i64>,
         finished_at: Option<chrono::DateTime<Utc>>,
     },
@@ -117,7 +124,7 @@ pub(crate) enum Row {
     },
     /// The files the latest finished turn changed, like waku's changed-files card.
     Changes {
-        files: Vec<FileChange>,
+        files: Rc<Vec<FileChange>>,
         expanded: Vec<bool>,
         show_all: bool,
     },
@@ -181,6 +188,30 @@ pub(crate) fn arriving_rows(old: &[Row], new: &[Row]) -> Vec<RowIdentity> {
     }
 }
 
+/// The old rows to replace and how many new rows replace them, leaving out the rows both start
+/// and end with so those keep their measured heights; `None` when nothing changed.
+pub(crate) fn row_splice(old: &[Row], new: &[Row]) -> Option<(Range<usize>, usize)> {
+    let common_prefix = old
+        .iter()
+        .zip(new)
+        .take_while(|(old, new)| old == new)
+        .count();
+    if common_prefix == old.len() && common_prefix == new.len() {
+        return None;
+    }
+    let common_suffix = old
+        .iter()
+        .skip(common_prefix)
+        .rev()
+        .zip(new.iter().skip(common_prefix).rev())
+        .take_while(|(old, new)| old == new)
+        .count();
+    Some((
+        common_prefix..old.len() - common_suffix,
+        new.len() - common_prefix - common_suffix,
+    ))
+}
+
 /// A section the user opened, whose body fades in.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum OpenedSection {
@@ -195,10 +226,22 @@ pub struct AgentView {
     pub(crate) composer: Entity<Composer>,
     focus_handle: FocusHandle,
     pub(crate) list_state: ListState,
-    pub(crate) rows: Vec<Row>,
-    pub(crate) items: Vec<StreamItem>,
+    /// Shared so a row renders from a borrow while the view is mutably borrowed.
+    pub(crate) rows: Rc<Vec<Row>>,
+    pub(crate) projection: TimelineProjection,
     pub(crate) turns: Vec<Turn>,
+    row_caches: RowCaches,
+    /// Set while a rebuild waits for the end of the effect cycle.
+    rebuild_pending: bool,
     pub(crate) markdown: HashMap<(u64, u8), Entity<Markdown>>,
+    /// The item each markdown was last synced from. Items are immutable once shared, so the same
+    /// item means the same text, and a render skips scanning and comparing it.
+    markdown_sources: HashMap<(u64, u8), Rc<StreamItem>>,
+    /// The image destinations each markdown linked when created, so fetched images are dropped
+    /// with the last markdown that shows them.
+    markdown_images: HashMap<(u64, u8), Vec<String>>,
+    /// The chat's markdown style, built once per render and shared by its rows.
+    pub(crate) markdown_style: Option<MarkdownStyle>,
     pub(crate) expanded: HashSet<u64>,
     /// Open tool groups, keyed by their first call's key. Kept apart from `expanded`, which holds
     /// that call's own open state under the same key.
@@ -226,7 +269,7 @@ pub struct AgentView {
     /// markdown image resolver, which can't fetch on its own.
     images: Rc<RefCell<HashMap<String, Arc<Image>>>>,
     requested_images: HashSet<String>,
-    code_spans: Rc<RefCell<HashMap<String, Option<SharedString>>>>,
+    code_spans: Rc<RefCell<CodeSpanCache>>,
     /// The chat font size of the last render; row heights are remeasured when it changes.
     font_size: Pixels,
     /// Messages parse in the background, so a newly loaded conversation stays hidden until its
@@ -244,17 +287,106 @@ pub struct AgentView {
 }
 
 /// What `AgentView::rebuild` reads from the store, compared to skip rebuilds for other agents.
-#[derive(PartialEq)]
+/// Rows read agent data only through it, so any change that affects them also changes it.
+#[derive(Clone, PartialEq)]
 struct RebuildInputs {
     generation: u64,
-    agent: Option<paseo_client::AgentSummary>,
-    subagent: Option<paseo_client::ProviderSubagent>,
     epoch: Option<String>,
-    entries: usize,
+    timeline_revision: u64,
+    timeline_rewrite: u64,
     has_older: bool,
     loading_older: bool,
-    has_permission: bool,
+    running: bool,
+    turn_started: Option<chrono::DateTime<Utc>>,
     title: Option<String>,
+    bucket: Option<AgentBucket>,
+    directory: Option<PathBuf>,
+}
+
+/// Where a turn sits: still running, or the latest finished one, whose changed files show.
+#[derive(Clone, Copy)]
+struct TurnPlacement {
+    live: bool,
+    latest_finished: bool,
+}
+
+/// Row parts that are slow to work out and rarely change, kept between rebuilds.
+#[derive(Default)]
+struct RowCaches {
+    /// Finished turns by their first item's key.
+    turns: HashMap<u64, TurnCache>,
+    /// Tool call headers by item key, with the item they were worked out from.
+    tools: HashMap<u64, (Rc<StreamItem>, Rc<ToolSummary>)>,
+    /// The agent directory tool paths were made relative to.
+    tools_directory: Option<PathBuf>,
+}
+
+/// A finished turn's copy text and changed files, valid while the turn holds the same items.
+struct TurnCache {
+    items: Vec<Rc<StreamItem>>,
+    copy_text: SharedString,
+    changes: Option<Rc<Vec<FileChange>>>,
+}
+
+impl RowCaches {
+    fn turn(&mut self, turn_items: &[Rc<StreamItem>]) -> Option<&mut TurnCache> {
+        let key = turn_items.first()?.key;
+        let current = self.turns.get(&key).is_some_and(|cache| {
+            cache.items.len() == turn_items.len()
+                && cache
+                    .items
+                    .iter()
+                    .zip(turn_items)
+                    .all(|(cached, item)| Rc::ptr_eq(cached, item))
+        });
+        if !current {
+            self.turns.insert(
+                key,
+                TurnCache {
+                    items: turn_items.to_vec(),
+                    copy_text: turn_text(turn_items).into(),
+                    changes: None,
+                },
+            );
+        }
+        self.turns.get_mut(&key)
+    }
+
+    fn turn_changes(&mut self, turn_items: &[Rc<StreamItem>]) -> Rc<Vec<FileChange>> {
+        match self.turn(turn_items) {
+            Some(cache) => cache
+                .changes
+                .get_or_insert_with(|| Rc::new(turn_changes(turn_items)))
+                .clone(),
+            None => Rc::default(),
+        }
+    }
+
+    fn tool(&mut self, item: &Rc<StreamItem>) -> Option<Rc<ToolSummary>> {
+        let StreamContent::Tool(call) = &item.content else {
+            return None;
+        };
+        if let Some((cached_item, summary)) = self.tools.get(&item.key)
+            && Rc::ptr_eq(cached_item, item)
+        {
+            return Some(summary.clone());
+        }
+        let summary = Rc::new(tool_summary(call, self.tools_directory.as_deref()));
+        self.tools.insert(item.key, (item.clone(), summary.clone()));
+        Some(summary)
+    }
+
+    fn set_directory(&mut self, directory: Option<PathBuf>) {
+        if directory != self.tools_directory {
+            self.tools.clear();
+            self.tools_directory = directory;
+        }
+    }
+
+    fn retain(&mut self, live_keys: &HashSet<u64>) {
+        self.turns.retain(|key, _| live_keys.contains(key));
+        self.tools.retain(|key, _| live_keys.contains(key));
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -273,6 +405,7 @@ pub enum AgentViewEvent {
 impl EventEmitter<AgentViewEvent> for AgentView {}
 
 impl AgentView {
+    /// A chat on its agent's host, or a draft on the default host.
     pub fn new(
         agent_id: Option<String>,
         directory: Option<PathBuf>,
@@ -280,7 +413,21 @@ impl AgentView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let store = store(cx);
+        let store = agent_id
+            .as_deref()
+            .and_then(|agent_id| hosts::store_for_agent(agent_id, cx))
+            .unwrap_or_else(|| hosts::default_store(cx));
+        Self::on_host(store, agent_id, directory, workspace, window, cx)
+    }
+
+    pub(crate) fn on_host(
+        store: Entity<PaseoStore>,
+        agent_id: Option<String>,
+        directory: Option<PathBuf>,
+        workspace: Option<WeakEntity<Workspace>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let composer =
             cx.new(|cx| Composer::new(store.clone(), agent_id.clone(), directory, window, cx));
         let list_state = ListState::new(0, ListAlignment::Bottom, px(2048.));
@@ -294,7 +441,7 @@ impl AgentView {
                 if let StoreEvent::TimelineChanged(timeline_id) = event
                     && view.agent_id.as_deref() == Some(timeline_id.as_str())
                 {
-                    view.rebuild(cx);
+                    view.schedule_rebuild(cx);
                 }
             }),
             cx.subscribe_in(&composer, window, Self::handle_composer_event),
@@ -349,10 +496,15 @@ impl AgentView {
             composer,
             focus_handle,
             list_state,
-            rows: Vec::new(),
-            items: Vec::new(),
+            rows: Rc::default(),
+            projection: TimelineProjection::default(),
             turns: Vec::new(),
+            row_caches: RowCaches::default(),
+            rebuild_pending: false,
             markdown: HashMap::new(),
+            markdown_sources: HashMap::new(),
+            markdown_images: HashMap::new(),
+            markdown_style: None,
             images: Rc::default(),
             requested_images: HashSet::new(),
             code_spans: Rc::default(),
@@ -404,16 +556,13 @@ impl AgentView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(workspace) = self.workspace.as_ref().and_then(WeakEntity::upgrade) else {
+        let Some(workspace) = self.workspace.clone() else {
             return;
         };
         let parent_agent_id = parent_agent_id.to_owned();
         let subagent_id = subagent_id.to_owned();
-        // Opening reads every agent tab, including this one, which is mid-update here.
-        window.defer(cx, move |window, cx| {
-            workspace.update(cx, |workspace, cx| {
-                crate::open_subagent(workspace, &parent_agent_id, &subagent_id, window, cx)
-            });
+        crate::defer_workspace_update(workspace, window, cx, move |workspace, window, cx| {
+            crate::open_subagent(workspace, &parent_agent_id, &subagent_id, window, cx)
         });
     }
 
@@ -442,10 +591,9 @@ impl AgentView {
         let Some(agent_id) = self.agent_id.clone() else {
             return;
         };
-        self.store.update(cx, |store, cx| {
-            store.set_focused_agent(agent_id.clone(), cx);
-            store.clear_attention(&agent_id, cx);
-        });
+        hosts::focus_agent_on(&self.store, agent_id.clone(), cx);
+        self.store
+            .update(cx, |store, cx| store.clear_attention(&agent_id, cx));
     }
 
     fn handle_composer_event(
@@ -458,25 +606,25 @@ impl AgentView {
         match event {
             ComposerEvent::AgentCreated(agent_id) => {
                 self.agent_id = Some(agent_id.clone());
-                self.store.update(cx, |store, cx| {
-                    store.watch(agent_id, cx);
-                    store.set_focused_agent(agent_id.clone(), cx);
-                });
+                self.store.update(cx, |store, cx| store.watch(agent_id, cx));
+                hosts::focus_agent_on(&self.store, agent_id.clone(), cx);
                 self.rebuild(cx);
-                if let Some(workspace) = self.workspace.as_ref().and_then(WeakEntity::upgrade) {
+                if let Some(workspace) = self.workspace.clone() {
                     let view = cx.entity();
                     let agent_id = agent_id.clone();
-                    // Deferred because the workspace may be mid-update while the composer emits.
-                    window.defer(cx, move |window, cx| {
-                        workspace.update(cx, |workspace, cx| {
+                    crate::defer_workspace_update(
+                        workspace,
+                        window,
+                        cx,
+                        move |workspace, window, cx| {
                             let tab = workspace
                                 .items_of_type::<AgentTab>(cx)
                                 .find(|tab| tab.read(cx).view == view);
                             if let Some(tab) = tab {
                                 crate::follow_created_agent(workspace, tab, &agent_id, window, cx);
                             }
-                        });
-                    });
+                        },
+                    );
                 }
             }
             ComposerEvent::ClearRequested {
@@ -484,10 +632,12 @@ impl AgentView {
                 workspace_id,
             } => {
                 let (directory, workspace_id) = (directory.clone(), workspace_id.clone());
-                if let Some(workspace) = self.workspace.as_ref().and_then(WeakEntity::upgrade) {
-                    // Deferred because showing the workspace's tabs reads this view.
-                    window.defer(cx, move |window, cx| {
-                        workspace.update(cx, |workspace, cx| {
+                if let Some(workspace) = self.workspace.clone() {
+                    crate::defer_workspace_update(
+                        workspace,
+                        window,
+                        cx,
+                        move |workspace, window, cx| {
                             crate::open_draft_joining(
                                 workspace,
                                 directory,
@@ -495,8 +645,8 @@ impl AgentView {
                                 window,
                                 cx,
                             );
-                        });
-                    });
+                        },
+                    );
                 }
             }
             ComposerEvent::Submitted => {
@@ -512,7 +662,7 @@ impl AgentView {
             .and_then(|agent_id| self.store.read(cx).agent(agent_id))
     }
 
-    fn load_older(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn load_older(&mut self, cx: &mut Context<Self>) {
         if let Some(agent_id) = self.agent_id.clone() {
             self.store
                 .update(cx, |store, cx| store.load_older(&agent_id, cx));
@@ -548,206 +698,134 @@ impl AgentView {
         self.opened_at.insert(section, now);
     }
 
-    /// Recomputes the display rows from the store and splices only the rows that changed, so the
-    /// list keeps measured heights and its tail-follow position while chunks stream in.
-    /// The store notifies for every agent's changes; rebuilding re-projects the whole timeline,
-    /// so skip it when nothing this view reads has changed.
+    /// The store notifies for every agent's changes, so skip rebuilding when nothing this view
+    /// reads has changed.
     fn rebuild_if_inputs_changed(&mut self, cx: &mut Context<Self>) {
-        if self.rebuild_inputs(cx) != self.last_rebuild_inputs {
-            self.rebuild(cx);
+        if !self.rebuild_pending && self.rebuild_inputs(cx) != self.last_rebuild_inputs {
+            self.schedule_rebuild(cx);
         }
+    }
+
+    /// Rebuilds once the current effect cycle ends, so the store changes of one cycle cost one
+    /// rebuild.
+    fn schedule_rebuild(&mut self, cx: &mut Context<Self>) {
+        if self.rebuild_pending {
+            return;
+        }
+        self.rebuild_pending = true;
+        let this = cx.weak_entity();
+        cx.defer(move |cx| {
+            if let Err(error) = this.update(cx, |view, cx| {
+                if view.rebuild_pending {
+                    view.rebuild(cx);
+                }
+            }) {
+                log::debug!("Paseo agent view released before rebuilding: {error}");
+            }
+        });
     }
 
     fn rebuild_inputs(&self, cx: &App) -> Option<RebuildInputs> {
         let agent_id = self.agent_id.as_deref()?;
         let store = self.store.read(cx);
+        let agent = store.agent(agent_id);
+        let subagent = store.subagent(agent_id);
         let paging = store.paging.get(agent_id);
+        let has_permission = store
+            .state
+            .permissions
+            .values()
+            .any(|request| request.agent_id == agent_id);
         Some(RebuildInputs {
             generation: store.connection_generation,
-            agent: store.agent(agent_id).cloned(),
-            subagent: store.subagent(agent_id).cloned(),
             epoch: store.state.current_epoch(agent_id).map(str::to_owned),
-            entries: store.entries_for(agent_id).count(),
+            timeline_revision: store.state.timeline_revision(agent_id),
+            timeline_rewrite: store.state.timeline_rewrite(agent_id),
             has_older: paging.is_some_and(|paging| paging.has_older),
             loading_older: paging.is_some_and(|paging| paging.loading_older),
-            has_permission: store
-                .state
-                .permissions
-                .values()
-                .any(|request| request.agent_id == agent_id),
-            title: store
-                .agent(agent_id)
-                .map(|agent| store.display_title(agent)),
+            running: agent.is_some_and(agent_is_running)
+                || subagent.is_some_and(|subagent| subagent.status == "running"),
+            turn_started: agent
+                .and_then(agent_turn_started_at)
+                .or_else(|| subagent.and_then(|subagent| parse_timestamp(&subagent.created_at))),
+            title: agent
+                .map(|agent| store.display_title(agent))
+                .or_else(|| subagent.map(subagent_title)),
+            bucket: agent
+                .map(|agent| agent_bucket(agent, has_permission))
+                .or_else(|| subagent.map(subagent_bucket)),
+            directory: store.timeline_directory(agent_id),
         })
     }
 
+    /// Recomputes the display rows from the store and splices only the rows that changed, so the
+    /// list keeps measured heights and its tail-follow position while chunks stream in.
     pub(crate) fn rebuild(&mut self, cx: &mut Context<Self>) {
-        self.last_rebuild_inputs = self.rebuild_inputs(cx);
-        let (items, running, turn_started, has_older, loading_older, title, bucket) = {
-            let store = self.store.read(cx);
-            let Some(agent_id) = self.agent_id.as_deref() else {
-                self.apply_rows(Vec::new(), cx);
-                return;
-            };
-            let items = project_items(store.entries_for(agent_id));
-            let agent = store.agent(agent_id);
-            let subagent = store.subagent(agent_id);
-            let paging = store.paging.get(agent_id);
-            let has_permission = store
-                .state
-                .permissions
-                .values()
-                .any(|request| request.agent_id == *agent_id);
-            (
-                items,
-                agent.is_some_and(agent_is_running)
-                    || subagent.is_some_and(|subagent| subagent.status == "running"),
-                agent.and_then(agent_turn_started_at).or_else(|| {
-                    subagent.and_then(|subagent| parse_timestamp(&subagent.created_at))
-                }),
-                paging.is_some_and(|paging| paging.has_older),
-                paging.is_some_and(|paging| paging.loading_older),
-                agent
-                    .map(|agent| store.display_title(agent))
-                    .or_else(|| subagent.map(subagent_title)),
-                agent
-                    .map(|agent| agent_bucket(agent, has_permission))
-                    .or_else(|| subagent.map(subagent_bucket)),
-            )
+        self.rebuild_pending = false;
+        let inputs = self.rebuild_inputs(cx);
+        self.last_rebuild_inputs = inputs.clone();
+        let (Some(agent_id), Some(inputs)) = (self.agent_id.clone(), inputs) else {
+            let live_keys = self.live_item_keys();
+            self.apply_rows(Vec::new(), &live_keys, cx);
+            return;
         };
+        let store = self.store.read(cx);
+        self.projection.sync(
+            inputs.epoch.as_deref(),
+            inputs.timeline_revision,
+            inputs.timeline_rewrite,
+            || store.entries_for(&agent_id),
+        );
         self.sync_terminal_directory(cx);
-        if let Some(title) = title {
+        if let Some(title) = inputs.title.clone() {
             let title = SharedString::from(title);
-            if title != self.title || bucket != self.bucket {
+            if title != self.title || inputs.bucket != self.bucket {
                 self.title = title;
-                self.bucket = bucket;
+                self.bucket = inputs.bucket;
                 cx.emit(AgentViewEvent::TabChanged);
             }
         }
-        let turns = group_turns(&items);
-        let mut rows = Vec::with_capacity(items.len() + turns.len() + 2);
-        if has_older {
+        self.turns = group_turns(self.projection.items());
+        let live_keys = self.live_item_keys();
+        let chat = crate::PaseoSettings::get_global(cx).chat.clone();
+        let rows = self.build_rows(&inputs, &live_keys, &chat);
+        self.apply_rows(rows, &live_keys, cx);
+        self.update_ticker(inputs.running, cx);
+    }
+
+    fn live_item_keys(&self) -> HashSet<u64> {
+        self.projection
+            .items()
+            .iter()
+            .map(|item| item.key)
+            .collect()
+    }
+
+    fn build_rows(
+        &mut self,
+        inputs: &RebuildInputs,
+        live_keys: &HashSet<u64>,
+        chat: &crate::ChatSettings,
+    ) -> Vec<Row> {
+        let mut caches = std::mem::take(&mut self.row_caches);
+        caches.set_directory(inputs.directory.clone());
+        let items = self.projection.items();
+        let mut rows = Vec::with_capacity(items.len() + self.turns.len() + 2);
+        if inputs.has_older {
             rows.push(Row::LoadOlder {
-                loading: loading_older,
+                loading: inputs.loading_older,
             });
         }
-        let chat = crate::PaseoSettings::get_global(cx).chat.clone();
-        let fold_by_default = chat.fold_finished_turns;
-        let last_turn = turns.len().saturating_sub(1);
-        let last_finished_turn = crate::timeline::latest_finished_turn(turns.len(), running);
-        for (turn_index, turn) in turns.iter().enumerate() {
-            let live_turn = running && turn_index == last_turn;
-            let item_row = |index: usize| {
-                let item = items.get(index)?;
-                Some(Row::Item {
-                    index,
-                    expanded: crate::stream::is_expandable(item)
-                        && self.expanded.contains(&item.key),
-                    item: item.clone(),
-                    streaming: live_turn && index + 1 == turn.items.end,
-                })
+        let last_turn = self.turns.len().saturating_sub(1);
+        let last_finished_turn = latest_finished_turn(self.turns.len(), inputs.running);
+        for (turn_index, turn) in self.turns.iter().enumerate() {
+            let placement = TurnPlacement {
+                live: inputs.running && turn_index == last_turn,
+                latest_finished: Some(turn_index) == last_finished_turn,
             };
-            let fold = if live_turn {
-                None
-            } else {
-                folded_work(&items, turn.items.clone())
-            };
-            let duration_seconds = turn
-                .started_at
-                .zip(turn.ended_at)
-                .map(|(start, end)| (end - start).num_seconds())
-                .filter(|seconds| *seconds > 0);
-            let fold_key = fold
-                .as_ref()
-                .and_then(|work| items.get(work.start))
-                .map(|item| item.key);
-            let fold_open =
-                fold_key.is_some_and(|key| self.expanded_turns.contains(&key) == fold_by_default);
-            for segment in tool_runs(&items, turn.items.clone()) {
-                let start = match &segment {
-                    Segment::Item(index) => *index,
-                    Segment::ToolRun(run) => run.start,
-                };
-                let in_open_fold = fold
-                    .as_ref()
-                    .is_some_and(|work| work.contains(&start) && fold_open);
-                if let (Some(work), Some(key)) = (&fold, fold_key) {
-                    if start == work.start {
-                        rows.push(Row::TurnFold {
-                            key,
-                            duration_seconds,
-                            expanded: fold_open,
-                        });
-                    }
-                    if work.contains(&start) && !fold_open {
-                        continue;
-                    }
-                }
-                if !chat.show_thinking
-                    && !in_open_fold
-                    && matches!(&segment, Segment::Item(index) if items.get(*index).is_some_and(is_thinking))
-                {
-                    continue;
-                }
-                let run = match segment {
-                    Segment::Item(index) => {
-                        rows.extend(item_row(index));
-                        continue;
-                    }
-                    Segment::ToolRun(run) => run,
-                };
-                let Some(run_items) = items.get(run.clone()) else {
-                    continue;
-                };
-                let Some(key) = run_items.first().map(|item| item.key) else {
-                    continue;
-                };
-                let calls = run_items
-                    .iter()
-                    .filter_map(|item| match &item.content {
-                        StreamContent::Tool(call) => Some(call),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                let expanded = self.expanded_groups.contains(&key);
-                rows.push(Row::ToolGroup {
-                    key,
-                    label: tool_group_label(calls.iter().copied()),
-                    running: calls.iter().any(|call| call.status == ToolStatus::Running),
-                    failed: calls.iter().any(|call| call.status == ToolStatus::Failed),
-                    expanded,
-                });
-                if expanded {
-                    rows.extend(run.filter_map(item_row));
-                }
-            }
-            if Some(turn_index) == last_finished_turn {
-                let files = items
-                    .get(turn.items.clone())
-                    .map(turn_changes)
-                    .unwrap_or_default();
-                if !files.is_empty() {
-                    rows.push(Row::Changes {
-                        expanded: files
-                            .iter()
-                            .map(|file| self.expanded_changes.contains(&file.path))
-                            .collect(),
-                        files,
-                        show_all: self.show_all_changes,
-                    });
-                }
-            }
-            if !live_turn {
-                rows.push(Row::TurnFooter {
-                    turn: turn_index,
-                    first_item_key: items.get(turn.items.start).map(|item| item.key),
-                    // The fold line above already says how long the turn took.
-                    duration_seconds: duration_seconds.filter(|_| fold.is_none()),
-                    finished_at: turn.ended_at,
-                });
-            }
+            self.push_turn_rows(&mut rows, turn, placement, chat, &mut caches);
         }
-        if running {
+        if inputs.running {
             let step_spins = rows.last().is_some_and(|row| match row {
                 Row::ToolGroup { running, .. } => *running,
                 Row::Item {
@@ -761,14 +839,142 @@ impl AgentView {
             });
             rows.push(Row::Working {
                 spinner: !step_spins,
-                since: turn_started.or_else(|| turns.last().and_then(|turn| turn.started_at)),
+                since: inputs
+                    .turn_started
+                    .or_else(|| self.turns.last().and_then(|turn| turn.started_at)),
             });
         }
         rows.push(Row::Spacer);
-        self.items = items;
-        self.turns = turns;
-        self.apply_rows(rows, cx);
-        self.update_ticker(running, cx);
+        caches.retain(live_keys);
+        self.row_caches = caches;
+        rows
+    }
+
+    /// One turn's rows: its items and tool groups, its fold line when finished, the changed
+    /// files of the latest finished turn, and its footer.
+    fn push_turn_rows(
+        &self,
+        rows: &mut Vec<Row>,
+        turn: &Turn,
+        placement: TurnPlacement,
+        chat: &crate::ChatSettings,
+        caches: &mut RowCaches,
+    ) {
+        let items = self.projection.items();
+        let item_row = |index: usize, caches: &mut RowCaches| {
+            let item = items.get(index)?;
+            Some(Row::Item {
+                expanded: crate::stream::is_expandable(item) && self.expanded.contains(&item.key),
+                tool: caches.tool(item),
+                item: item.clone(),
+                streaming: placement.live && index + 1 == turn.items.end,
+            })
+        };
+        let fold = if placement.live {
+            None
+        } else {
+            folded_work(items, turn.items.clone())
+        };
+        let duration_seconds = turn
+            .started_at
+            .zip(turn.ended_at)
+            .map(|(start, end)| (end - start).num_seconds())
+            .filter(|seconds| *seconds > 0);
+        let fold_key = fold
+            .as_ref()
+            .and_then(|work| items.get(work.start))
+            .map(|item| item.key);
+        let fold_open = fold_key
+            .is_some_and(|key| self.expanded_turns.contains(&key) == chat.fold_finished_turns);
+        for segment in tool_runs(items, turn.items.clone()) {
+            let start = match &segment {
+                Segment::Item(index) => *index,
+                Segment::ToolRun(run) => run.start,
+            };
+            let in_open_fold = fold
+                .as_ref()
+                .is_some_and(|work| work.contains(&start) && fold_open);
+            if let (Some(work), Some(key)) = (&fold, fold_key) {
+                if start == work.start {
+                    rows.push(Row::TurnFold {
+                        key,
+                        duration_seconds,
+                        expanded: fold_open,
+                    });
+                }
+                if work.contains(&start) && !fold_open {
+                    continue;
+                }
+            }
+            if !chat.show_thinking
+                && !in_open_fold
+                && matches!(&segment, Segment::Item(index) if items.get(*index).is_some_and(|item| is_thinking(item)))
+            {
+                continue;
+            }
+            let run = match segment {
+                Segment::Item(index) => {
+                    rows.extend(item_row(index, caches));
+                    continue;
+                }
+                Segment::ToolRun(run) => run,
+            };
+            let Some(run_items) = items.get(run.clone()) else {
+                continue;
+            };
+            let Some(key) = run_items.first().map(|item| item.key) else {
+                continue;
+            };
+            let calls = run_items
+                .iter()
+                .filter_map(|item| match &item.content {
+                    StreamContent::Tool(call) => Some(call),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let expanded = self.expanded_groups.contains(&key);
+            rows.push(Row::ToolGroup {
+                key,
+                label: tool_group_label(calls.iter().copied()),
+                running: calls.iter().any(|call| call.status == ToolStatus::Running),
+                failed: calls.iter().any(|call| call.status == ToolStatus::Failed),
+                expanded,
+            });
+            if expanded {
+                rows.extend(run.filter_map(|index| item_row(index, caches)));
+            }
+        }
+        let turn_items = items.get(turn.items.clone()).unwrap_or_default();
+        if placement.latest_finished {
+            let files = caches.turn_changes(turn_items);
+            if !files.is_empty() {
+                rows.push(Row::Changes {
+                    expanded: files
+                        .iter()
+                        .map(|file| self.expanded_changes.contains(&file.path))
+                        .collect(),
+                    files,
+                    show_all: self.show_all_changes,
+                });
+            }
+        }
+        if !placement.live {
+            rows.push(Row::TurnFooter {
+                first_item_key: turn_items.first().map(|item| item.key),
+                has_text: caches
+                    .turn(turn_items)
+                    .is_some_and(|cache| !cache.copy_text.is_empty()),
+                // The fold line above already says how long the turn took.
+                duration_seconds: duration_seconds.filter(|_| fold.is_none()),
+                finished_at: turn.ended_at,
+            });
+        }
+    }
+
+    /// The copyable text of the finished turn starting at `first_item_key`.
+    pub(crate) fn turn_copy_text(&self, first_item_key: Option<u64>) -> Option<SharedString> {
+        let cache = self.row_caches.turns.get(&first_item_key?)?;
+        Some(cache.copy_text.clone())
     }
 
     fn sync_terminal_directory(&mut self, cx: &mut Context<Self>) {
@@ -791,14 +997,8 @@ impl AgentView {
         });
     }
 
-    fn apply_rows(&mut self, rows: Vec<Row>, cx: &mut Context<Self>) {
-        let first_changed = self
-            .rows
-            .iter()
-            .zip(rows.iter())
-            .position(|(old, new)| old != new)
-            .unwrap_or(self.rows.len().min(rows.len()));
-        if first_changed < self.rows.len() || rows.len() != self.rows.len() {
+    fn apply_rows(&mut self, rows: Vec<Row>, live_keys: &HashSet<u64>, cx: &mut Context<Self>) {
+        if let Some((replaced, inserted)) = row_splice(&self.rows, &rows) {
             let now = Instant::now();
             self.row_appeared_at.retain(|_, appeared_at| {
                 now.duration_since(*appeared_at) < crate::stream::ENTRANCE * 2
@@ -806,17 +1006,35 @@ impl AgentView {
             for identity in arriving_rows(&self.rows, &rows) {
                 self.row_appeared_at.insert(identity, now);
             }
-            self.list_state
-                .splice(first_changed..self.rows.len(), rows.len() - first_changed);
-            self.rows = rows;
+            self.list_state.splice(replaced, inserted);
+            self.rows = Rc::new(rows);
         }
-        let live_keys = self
-            .items
-            .iter()
-            .map(|item| item.key)
-            .collect::<HashSet<_>>();
-        self.markdown.retain(|(key, _), _| live_keys.contains(key));
+        self.prune_markdown(live_keys);
         cx.notify();
+    }
+
+    /// Drops markdown, and the images only it showed, for items no longer in the timeline.
+    fn prune_markdown(&mut self, live_keys: &HashSet<u64>) {
+        self.markdown.retain(|(key, _), _| live_keys.contains(key));
+        self.markdown_sources
+            .retain(|(key, _), _| live_keys.contains(key));
+        let images_before = self.markdown_images.len();
+        self.markdown_images
+            .retain(|(key, _), _| live_keys.contains(key));
+        if self.markdown_images.len() == images_before {
+            return;
+        }
+        let linked = self
+            .markdown_images
+            .values()
+            .flatten()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        self.images
+            .borrow_mut()
+            .retain(|destination, _| linked.contains(destination.as_str()));
+        self.requested_images
+            .retain(|destination| linked.contains(destination.as_str()));
     }
 
     fn update_ticker(&mut self, running: bool, cx: &mut Context<Self>) {
@@ -849,21 +1067,33 @@ impl AgentView {
         }));
     }
 
+    /// The markdown for `text`, a field of `source`, synced to the text only when `source`
+    /// changed since the last call.
     pub(crate) fn markdown_for(
         &mut self,
-        key: u64,
+        source: &Rc<StreamItem>,
         role: u8,
         text: &str,
         cx: &mut Context<Self>,
     ) -> Entity<Markdown> {
+        let key = (source.key, role);
+        if let Some(markdown) = self.markdown.get(&key)
+            && self
+                .markdown_sources
+                .get(&key)
+                .is_some_and(|synced| Rc::ptr_eq(synced, source))
+        {
+            return markdown.clone();
+        }
+        self.markdown_sources.insert(key, source.clone());
         let text = separate_images(text);
         let text = text.as_ref();
-        if let Some(markdown) = self.markdown.get(&(key, role)) {
-            let source = markdown.read(cx).source();
-            if source.as_ref() != text {
+        if let Some(markdown) = self.markdown.get(&key) {
+            let current = markdown.read(cx).source();
+            if current.as_ref() != text {
                 let delta = text
-                    .strip_prefix(source.as_ref())
-                    .filter(|_| !source.is_empty());
+                    .strip_prefix(current.as_ref())
+                    .filter(|_| !current.is_empty());
                 markdown.update(cx, |markdown, cx| match delta {
                     Some(delta) => markdown.append(delta, cx),
                     None => markdown.reset(text.to_owned().into(), cx),
@@ -878,9 +1108,9 @@ impl AgentView {
             .and_then(WeakEntity::upgrade)
             .map(|workspace| workspace.read(cx).app_state().languages.clone());
         let markdown = cx.new(|cx| Markdown::new(text.to_owned().into(), languages, None, cx));
-        self.markdown.insert((key, role), markdown.clone());
-        self.unparsed_markdown.insert((key, role));
-        self.load_images(text, cx);
+        self.markdown.insert(key, markdown.clone());
+        self.unparsed_markdown.insert(key);
+        self.load_images(key, text, cx);
         markdown
     }
 
@@ -889,9 +1119,11 @@ impl AgentView {
         &self,
         markdown: Entity<Markdown>,
         style: MarkdownStyle,
+        cx: &Context<Self>,
     ) -> MarkdownElement {
         let images = self.images.clone();
         let links = ThreadLinks {
+            view: cx.weak_entity(),
             store: self.store.clone(),
             agent_id: self.agent_id.clone(),
             workspace: self.workspace.clone(),
@@ -916,9 +1148,19 @@ impl AgentView {
             .on_code_span_link(move |text, cx| links.code_span_link(text, cx))
     }
 
-    fn load_images(&mut self, text: &str, cx: &mut Context<Self>) {
+    fn load_images(&mut self, markdown_key: (u64, u8), text: &str, cx: &mut Context<Self>) {
         let directory = self.directory(cx);
-        for destination in image_destinations(text) {
+        let destinations = image_destinations(text);
+        if !destinations.is_empty() {
+            self.markdown_images.insert(
+                markdown_key,
+                destinations
+                    .iter()
+                    .map(|destination| (*destination).to_owned())
+                    .collect(),
+            );
+        }
+        for destination in destinations {
             let Some(path) = image_path(destination, directory.as_deref()) else {
                 continue;
             };
@@ -980,7 +1222,7 @@ impl AgentView {
             return;
         };
         workspace.update(cx, |workspace, cx| {
-            connection_picker::open_rename(workspace, agent_id, window, cx);
+            workspace_tools::open_agent_rename(workspace, agent_id, window, cx);
         });
     }
 
@@ -1337,7 +1579,7 @@ impl AgentView {
         let store = self.store.read(cx);
         let subagents = track_subagents(
             store.state.subagents_for(&parent_agent_id),
-            &store.archived_subagents,
+            &store.archived_subagents.items(),
         );
         if subagents.is_empty() {
             return None;
@@ -1644,15 +1886,66 @@ impl AgentView {
             .and_then(Value::as_str)
             .unwrap_or("tool");
         let colors = cx.theme().colors();
+        let request_id = request.request_id.clone();
+        let mut card = Self::permission_card(primary, kind, &request, cx);
+        if kind == "question" {
+            card = card.child(self.render_questions(&request, window, cx));
+        } else if let Some(preview) = crate::stream::permission_preview(&request, cx) {
+            let scroll = self
+                .permission_scrolls
+                .borrow_mut()
+                .entry(request_id.clone())
+                .or_default()
+                .clone();
+            card = card.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "paseo-permission-preview-{request_id}"
+                    )))
+                    .max_h(rems_from_px(200_f32))
+                    .overflow_y_scroll()
+                    .track_scroll(&scroll)
+                    .rounded_md()
+                    .bg(colors.editor_background)
+                    .border_1()
+                    .border_color(colors.border_variant)
+                    .p_2()
+                    .child(preview)
+                    .vertical_scrollbar_for(&scroll, window, cx),
+            );
+        }
+        card.child(
+            Label::new(if kind == "question" {
+                "Answer to continue"
+            } else {
+                "How would you like to proceed?"
+            })
+            .size(LabelSize::Small)
+            .color(Color::Muted),
+        )
+        .child(self.render_permission_buttons(primary, &request, cx))
+        .into_any_element()
+    }
+
+    /// A permission card's frame and header: the request's kind, title and description.
+    fn permission_card(
+        primary: bool,
+        kind: &str,
+        request: &PermissionRequest,
+        cx: &App,
+    ) -> gpui::Stateful<gpui::Div> {
+        let colors = cx.theme().colors();
         // A question's full text is in the card body, so its header only names the kind.
         let title = match kind {
             "plan" => "Plan".to_owned(),
             "question" => "Question".to_owned(),
             _ => request.title.clone(),
         };
-        let request_id = request.request_id.clone();
-        let mut card = v_flex()
-            .id(SharedString::from(format!("paseo-permission-{request_id}")))
+        v_flex()
+            .id(SharedString::from(format!(
+                "paseo-permission-{}",
+                request.request_id
+            )))
             .w_full()
             .p_3()
             .gap_2()
@@ -1690,46 +1983,31 @@ impl AgentView {
                         .size(LabelSize::Default)
                         .color(Color::Muted),
                 )
-            });
-        if kind == "question" {
-            card = card.child(self.render_questions(&request, window, cx));
-        } else if let Some(preview) = crate::stream::permission_preview(&request, cx) {
-            let scroll = self
-                .permission_scrolls
-                .borrow_mut()
-                .entry(request_id.clone())
-                .or_default()
-                .clone();
-            card = card.child(
-                div()
-                    .id(SharedString::from(format!(
-                        "paseo-permission-preview-{request_id}"
-                    )))
-                    .max_h(rems_from_px(200_f32))
-                    .overflow_y_scroll()
-                    .track_scroll(&scroll)
-                    .rounded_md()
-                    .bg(colors.editor_background)
-                    .border_1()
-                    .border_color(colors.border_variant)
-                    .p_2()
-                    .child(preview)
-                    .vertical_scrollbar_for(&scroll, window, cx),
-            );
-        }
-        let actions = permission_actions(&request);
-        let question_steps = Self::uses_question_steps(&request);
+            })
+    }
+
+    /// A permission's actions; a stepped question's allow action moves to the next question
+    /// until the last one.
+    fn render_permission_buttons(
+        &self,
+        primary: bool,
+        request: &PermissionRequest,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let request_id = &request.request_id;
+        let actions = permission_actions(request);
+        let question_steps = Self::uses_question_steps(request);
         let step = question_steps.then(|| {
-            let questions = questions(&request);
-            let index = self.current_question(&request_id, questions.len());
+            let questions = questions(request);
+            let index = self.current_question(request_id, questions.len());
             let is_last = index + 1 >= questions.len();
             let ready = if is_last {
                 questions.iter().enumerate().all(|(index, question)| {
-                    self.question_is_answered(&request_id, index, question, cx)
+                    self.question_is_answered(request_id, index, question, cx)
                 })
             } else {
                 questions.get(index).is_some_and(|question| {
-                    self.question_is_answered(&request_id, index, question, cx)
+                    self.question_is_answered(request_id, index, question, cx)
                 })
             };
             (is_last, ready)
@@ -1796,17 +2074,7 @@ impl AgentView {
                 })),
             );
         }
-        card.child(
-            Label::new(if kind == "question" {
-                "Answer to continue"
-            } else {
-                "How would you like to proceed?"
-            })
-            .size(LabelSize::Small)
-            .color(Color::Muted),
-        )
-        .child(buttons)
-        .into_any_element()
+        buttons
     }
 
     /// One question at a time, like Paseo: header tabs, the question's options, and a free-text
@@ -2006,6 +2274,7 @@ impl AgentView {
                     .color(Color::Muted),
             )
             .child(Headline::new("New agent").size(HeadlineSize::Medium))
+            .children(self.render_draft_host_picker(cx))
             .child(
                 ui::Button::new("paseo-draft-directory", label)
                     .style(ButtonStyle::Outlined)
@@ -2042,7 +2311,7 @@ impl AgentView {
             return false;
         };
         let store = self.store.read(cx);
-        !store.state.agents.iter().any(|agent| agent.id == agent_id)
+        store.state.agent(agent_id).is_none()
             && store
                 .archived
                 .iter()
@@ -2090,31 +2359,37 @@ impl AgentView {
     /// between the project's checkout and a new worktree, and the new worktree's base.
     fn render_checkout_footer(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let store = self.store.read(cx);
-        let (location, branch) = match self.agent_id.as_deref() {
+        let (location, branch, diff_stat) = match self.agent_id.as_deref() {
             Some(agent_id) => {
                 let agent = store.agent(agent_id)?;
+                let diff_stat = crate::store::agent_workspace_id(agent)
+                    .and_then(|workspace_id| store.state.workspaces.get(workspace_id))
+                    .and_then(|workspace| workspace.diff_stat);
                 let location = match agent_worktree_name(agent) {
                     Some(name) => checkout_label(IconName::GitWorktree, name),
                     None => checkout_label(IconName::Folder, "Local checkout".into()),
                 };
                 let branch =
                     agent_branch(agent).map(|branch| checkout_label(IconName::GitBranch, branch));
-                (location, branch)
+                (location, branch, diff_stat)
             }
             None => {
                 let composer = self.composer.read(cx);
                 let directory = composer.draft_directory.as_deref()?;
-                let current_branch = store
+                let workspace = store
                     .state
                     .workspaces
                     .values()
-                    .find(|workspace| workspace.directory == directory)
+                    .find(|workspace| workspace.directory == directory);
+                let diff_stat = workspace.and_then(|workspace| workspace.diff_stat);
+                let current_branch = workspace
                     .and_then(|workspace| workspace.current_branch.clone())
                     .map(|branch| checkout_label(IconName::GitBranch, branch));
                 if !composer.can_create_worktree(cx) {
                     (
                         checkout_label(IconName::Folder, "Local checkout".into()),
                         current_branch,
+                        diff_stat,
                     )
                 } else if composer.uses_new_worktree(cx) {
                     let base = composer.worktree_base();
@@ -2131,9 +2406,10 @@ impl AgentView {
                                 view.choose_worktree_base(window, cx);
                             }))
                             .into_any_element();
-                    (self.render_isolation_menu(true), Some(base))
+                    // A new worktree starts clean, so the checkout's changes aren't its own.
+                    (self.render_isolation_menu(true), Some(base), None)
                 } else {
-                    (self.render_isolation_menu(false), current_branch)
+                    (self.render_isolation_menu(false), current_branch, diff_stat)
                 }
             }
         };
@@ -2152,7 +2428,27 @@ impl AgentView {
                 .border_color(colors.border)
                 .bg(colors.elevated_surface_background)
                 .child(location)
-                .children(branch)
+                .child(
+                    h_flex().min_w_0().gap_2().children(branch).children(
+                        diff_stat
+                            .filter(|stat| stat.additions + stat.deletions > 0)
+                            .map(|stat| {
+                                h_flex()
+                                    .flex_none()
+                                    .gap_1()
+                                    .child(
+                                        Label::new(format!("+{}", stat.additions))
+                                            .size(LabelSize::Small)
+                                            .color(Color::Created),
+                                    )
+                                    .child(
+                                        Label::new(format!("−{}", stat.deletions))
+                                            .size(LabelSize::Small)
+                                            .color(Color::Deleted),
+                                    )
+                            }),
+                    ),
+                )
                 .into_any_element(),
         )
     }
@@ -2200,6 +2496,51 @@ impl AgentView {
                 }))
             })
             .into_any_element()
+    }
+
+    /// Which host the draft's agent will run on, shown only when there is more than one.
+    fn render_draft_host_picker(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let view = cx.weak_entity();
+        render_host_picker(
+            "paseo-draft-host",
+            "paseo-draft-host-button",
+            "The host the new agent runs on",
+            self.store.clone(),
+            move |store, window, cx| {
+                if let Err(error) =
+                    view.update(cx, |view, cx| view.switch_draft_host(store, window, cx))
+                {
+                    log::debug!("Paseo draft closed: {error}");
+                }
+            },
+            cx,
+        )
+    }
+
+    /// Replaces this draft with one on `store`'s host. A folder belongs to its host, so the new
+    /// draft starts without the old one's.
+    fn switch_draft_host(
+        &mut self,
+        store: Entity<PaseoStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if store == self.store || self.agent_id.is_some() {
+            return;
+        }
+        let Some(workspace) = self.workspace.clone() else {
+            return;
+        };
+        let this = cx.entity();
+        crate::defer_workspace_update(workspace, window, cx, move |workspace, window, cx| {
+            let old_tab = workspace
+                .items_of_type::<AgentTab>(cx)
+                .find(|tab| tab.read(cx).view() == &this);
+            crate::open_draft_on(workspace, store, None, window, cx);
+            if let Some(old_tab) = old_tab {
+                crate::workspace_tabs::detach_tab(workspace, &old_tab, window, cx);
+            }
+        });
     }
 
     pub(crate) fn choose_directory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2355,9 +2696,9 @@ pub(crate) struct Question {
 fn question_placeholder(question: &Question) -> String {
     question.placeholder.clone().unwrap_or_else(|| {
         if question.options.is_empty() {
-            "Type your answer...".to_owned()
+            "Type your answer…".to_owned()
         } else {
-            "Other...".to_owned()
+            "Other…".to_owned()
         }
     })
 }
@@ -2489,7 +2830,8 @@ impl Render for AgentView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let is_draft = self.agent_id.is_none();
-        let empty = self.items.is_empty();
+        let empty = self.projection.items().is_empty();
+        self.markdown_style = Some(Self::build_markdown_style(window, cx));
         let body = if is_draft && empty {
             self.render_draft_landing(cx)
         } else if empty {
@@ -2569,7 +2911,7 @@ impl Render for AgentView {
         }
         WithRemSize::new(font_size).size_full().child(
             v_flex()
-                .key_context("PaseoAgentView")
+                .key_context("PaseoAgentView PaseoView")
                 .track_focus(&self.focus_handle)
                 .on_mouse_down(
                     gpui::MouseButton::Left,
@@ -2731,6 +3073,11 @@ impl AgentTab {
         tab.read(cx).view.entity_id()
     }
 
+    /// The profile name of the host the tab's chat talks to.
+    pub fn test_host_name(tab: &Entity<Self>, cx: &App) -> Option<String> {
+        crate::hosts::host_name(&tab.read(cx).view.read(cx).store, cx)
+    }
+
     /// What Submit would send for the agent's first pending request.
     pub fn test_question_response(tab: &Entity<Self>, cx: &App) -> Option<PermissionResponse> {
         let view = tab.read(cx).view.read(cx);
@@ -2760,17 +3107,38 @@ impl AgentTab {
         Self::wrapping(view, cx)
     }
 
-    /// A tab rebuilt from a saved workspace. Its workspace checks the agent once it is known,
-    /// because a saved tab may belong to another workspace's agent.
+    pub(crate) fn on_host(
+        store: Entity<PaseoStore>,
+        agent_id: Option<String>,
+        directory: Option<PathBuf>,
+        workspace: Option<WeakEntity<Workspace>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let view =
+            cx.new(|cx| AgentView::on_host(store, agent_id, directory, workspace, window, cx));
+        Self::wrapping(view, cx)
+    }
+
+    /// A tab rebuilt from a saved workspace, on the host it was saved with (tabs saved before
+    /// hosts were recorded use the default host). Its workspace checks the agent once it is
+    /// known, because a saved tab may belong to another workspace's agent.
     pub(crate) fn restored(
         agent_id: String,
+        host: Option<String>,
         workspace: WeakEntity<Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let store = host.map_or_else(
+            || hosts::default_store(cx),
+            |host| hosts::store_named(&host, cx),
+        );
+        let view = cx
+            .new(|cx| AgentView::on_host(store, Some(agent_id), None, Some(workspace), window, cx));
         Self {
             owner_check_pending: true,
-            ..Self::new(Some(agent_id), None, Some(workspace), window, cx)
+            ..Self::wrapping(view, cx)
         }
     }
 
@@ -2868,9 +3236,7 @@ impl AgentTab {
         cx: &mut App,
     ) {
         let composer = tab.read(cx).view.read(cx).composer.clone();
-        composer.update(cx, |composer, cx| {
-            composer.set_text_for_test(text, window, cx)
-        });
+        composer.update(cx, |composer, cx| composer.set_text(text, window, cx));
     }
 }
 
@@ -2996,10 +3362,12 @@ impl SerializableItem for AgentTab {
     ) -> Task<anyhow::Result<Entity<Self>>> {
         let db = persistence::AgentTabDb::global(cx);
         window.spawn(cx, async move |cx| {
-            let agent_id = db
+            let (agent_id, host) = db
                 .get_agent_tab(item_id, workspace_id)?
                 .ok_or_else(|| anyhow::anyhow!("No Paseo agent tab to restore"))?;
-            cx.update(|window, cx| cx.new(|cx| AgentTab::restored(agent_id, workspace, window, cx)))
+            cx.update(|window, cx| {
+                cx.new(|cx| AgentTab::restored(agent_id, host, workspace, window, cx))
+            })
         })
     }
 
@@ -3014,9 +3382,11 @@ impl SerializableItem for AgentTab {
         let agent_id = self
             .agent_id(cx)
             .filter(|agent_id| paseo_client::parse_subagent_timeline_id(agent_id).is_none())?;
+        let host = hosts::host_name(&self.view.read(cx).store, cx);
         let db = persistence::AgentTabDb::global(cx);
         Some(cx.background_spawn(async move {
-            db.save_agent_tab(item_id, workspace_id, agent_id).await
+            db.save_agent_tab(item_id, workspace_id, agent_id, host)
+                .await
         }))
     }
 
@@ -3034,17 +3404,21 @@ mod persistence {
     impl Domain for AgentTabDb {
         const NAME: &str = stringify!(AgentTabDb);
 
-        const MIGRATIONS: &[&str] = &[sql!(
-            CREATE TABLE paseo_agent_tabs (
-                workspace_id INTEGER,
-                item_id INTEGER UNIQUE,
-                agent_id TEXT NOT NULL,
+        const MIGRATIONS: &[&str] = &[
+            sql!(
+                CREATE TABLE paseo_agent_tabs (
+                    workspace_id INTEGER,
+                    item_id INTEGER UNIQUE,
+                    agent_id TEXT NOT NULL,
 
-                PRIMARY KEY(workspace_id, item_id),
-                FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
-                ON DELETE CASCADE
-            ) STRICT;
-        )];
+                    PRIMARY KEY(workspace_id, item_id),
+                    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
+                    ON DELETE CASCADE
+                ) STRICT;
+            ),
+            // The Paseo profile name of the tab's host.
+            sql!(ALTER TABLE paseo_agent_tabs ADD COLUMN host TEXT),
+        ];
     }
 
     db::static_connection!(AgentTabDb, [WorkspaceDb]);
@@ -3054,10 +3428,11 @@ mod persistence {
             pub async fn save_agent_tab(
                 item_id: workspace::ItemId,
                 workspace_id: workspace::WorkspaceId,
-                agent_id: String
+                agent_id: String,
+                host: Option<String>
             ) -> Result<()> {
-                INSERT OR REPLACE INTO paseo_agent_tabs(item_id, workspace_id, agent_id)
-                VALUES (?, ?, ?)
+                INSERT OR REPLACE INTO paseo_agent_tabs(item_id, workspace_id, agent_id, host)
+                VALUES (?, ?, ?, ?)
             }
         }
 
@@ -3065,8 +3440,8 @@ mod persistence {
             pub fn get_agent_tab(
                 item_id: workspace::ItemId,
                 workspace_id: workspace::WorkspaceId
-            ) -> Result<Option<String>> {
-                SELECT agent_id
+            ) -> Result<Option<(String, Option<String>)>> {
+                SELECT agent_id, host
                 FROM paseo_agent_tabs
                 WHERE item_id = ? AND workspace_id = ?
             }
@@ -3254,7 +3629,7 @@ fn track_subagents<'a>(
         .collect()
 }
 
-fn checkout_label(icon: IconName, text: String) -> AnyElement {
+pub(crate) fn checkout_label(icon: IconName, text: String) -> AnyElement {
     h_flex()
         .min_w_0()
         .gap_1()
@@ -3268,7 +3643,54 @@ fn checkout_label(icon: IconName, text: String) -> AnyElement {
         .into_any_element()
 }
 
-fn checkout_picker(id: &'static str, icon: IconName, label: SharedString) -> ui::Button {
+/// A menu button choosing among the configured hosts, or `None` with fewer than two.
+pub(crate) fn render_host_picker(
+    menu_id: &'static str,
+    button_id: &'static str,
+    tooltip: &'static str,
+    own_store: Entity<PaseoStore>,
+    on_pick: impl Fn(Entity<PaseoStore>, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> Option<AnyElement> {
+    let hosts = hosts::configured_hosts(cx);
+    if hosts.len() < 2 {
+        return None;
+    }
+    let current = hosts
+        .iter()
+        .find(|(_, store)| *store == own_store)
+        .map(|(name, _)| name.clone())
+        .unwrap_or_default();
+    let on_pick = Rc::new(on_pick);
+    Some(
+        PopoverMenu::new(menu_id)
+            .trigger_with_tooltip(
+                checkout_picker(button_id, IconName::Server, current.into()),
+                Tooltip::text(tooltip),
+            )
+            .anchor(gpui::Anchor::TopLeft)
+            .menu(move |window, cx| {
+                let (hosts, own_store, on_pick) =
+                    (hosts.clone(), own_store.clone(), on_pick.clone());
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    for (name, store) in hosts.iter().cloned() {
+                        let on_pick = on_pick.clone();
+                        menu = menu.toggleable_entry(
+                            name,
+                            store == own_store,
+                            ui::IconPosition::End,
+                            None,
+                            move |window, cx| on_pick(store.clone(), window, cx),
+                        );
+                    }
+                    menu
+                }))
+            })
+            .into_any_element(),
+    )
+}
+
+pub(crate) fn checkout_picker(id: &'static str, icon: IconName, label: SharedString) -> ui::Button {
     ui::Button::new(id, label)
         .style(ButtonStyle::Subtle)
         .label_size(LabelSize::Small)
@@ -3367,15 +3789,58 @@ fn subagent_track_summary(subagents: &[&paseo_client::ProviderSubagent]) -> Stri
 /// Opens the files that thread links and `path:line` code spans point at.
 #[derive(Clone)]
 struct ThreadLinks {
+    view: WeakEntity<AgentView>,
     store: Entity<PaseoStore>,
     agent_id: Option<String>,
     workspace: Option<WeakEntity<Workspace>>,
-    /// Resolved code spans, because resolving runs on every render of every span.
-    code_spans: Rc<RefCell<HashMap<String, Option<SharedString>>>>,
+    code_spans: Rc<RefCell<CodeSpanCache>>,
 }
 
-/// Enough resolved code spans for a long thread; past this the cache starts over.
+/// Enough resolved code spans for a long thread; past this the oldest are forgotten.
 const CODE_SPAN_CACHE_LIMIT: usize = 4096;
+
+/// Resolved code spans, because resolving runs on every render of every span. A span that needs
+/// the disk or a project scan reads as no link until its lookup finishes.
+#[derive(Default)]
+struct CodeSpanCache {
+    links: HashMap<String, Option<SharedString>>,
+    /// Span texts oldest first, to forget the oldest past the limit.
+    order: std::collections::VecDeque<String>,
+}
+
+impl CodeSpanCache {
+    fn get(&self, text: &str) -> Option<Option<SharedString>> {
+        self.links.get(text).cloned()
+    }
+
+    fn insert(&mut self, text: &str, link: Option<SharedString>) {
+        if let Some(existing) = self.links.get_mut(text) {
+            *existing = link;
+            return;
+        }
+        while self.links.len() >= CODE_SPAN_CACHE_LIMIT {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.links.remove(&oldest);
+        }
+        self.links.insert(text.to_owned(), link);
+        self.order.push_back(text.to_owned());
+    }
+}
+
+/// How far a code span resolved without waiting.
+enum CodeSpanResolution {
+    Link(SharedString),
+    NotALink,
+    /// The span names no project entry, so it is looked up on disk and by file name off the
+    /// render path.
+    Lookup {
+        target: LinkTarget,
+        check_disk: bool,
+        relative: Option<String>,
+    },
+}
 
 impl ThreadLinks {
     fn directory(&self, cx: &App) -> Option<PathBuf> {
@@ -3398,46 +3863,94 @@ impl ThreadLinks {
             return is_symbol_like(text).then(|| format!("{SYMBOL_LINK_SCHEME}{text}").into());
         }
         if let Some(cached) = self.code_spans.borrow().get(text) {
-            return cached.clone();
+            return cached;
         }
-        let resolved = self.resolve_code_span(text, cx);
-        let mut code_spans = self.code_spans.borrow_mut();
-        if code_spans.len() >= CODE_SPAN_CACHE_LIMIT {
-            code_spans.clear();
-        }
-        code_spans.insert(text.to_owned(), resolved.clone());
-        resolved
+        let link = match self.resolve_code_span(text, cx) {
+            CodeSpanResolution::Link(link) => Some(link),
+            CodeSpanResolution::NotALink => None,
+            CodeSpanResolution::Lookup {
+                target,
+                check_disk,
+                relative,
+            } => {
+                self.look_up_code_span(text, target, check_disk, relative, cx);
+                None
+            }
+        };
+        self.code_spans.borrow_mut().insert(text, link.clone());
+        link
     }
 
-    fn resolve_code_span(&self, text: &str, cx: &App) -> Option<SharedString> {
-        let target = link_target(text, self.directory(cx).as_deref())?;
-        let project = self.workspace()?.read(cx).project().read(cx);
+    fn resolve_code_span(&self, text: &str, cx: &App) -> CodeSpanResolution {
+        let Some(target) = link_target(text, self.directory(cx).as_deref()) else {
+            return CodeSpanResolution::NotALink;
+        };
+        let Some(workspace) = self.workspace() else {
+            return CodeSpanResolution::NotALink;
+        };
+        let project = workspace.read(cx).project().read(cx);
         let entry = project
             .find_project_path(&target.path, cx)
             .and_then(|project_path| project.entry_for_path(&project_path, cx));
-        let path = match entry {
-            Some(_) => target.path,
-            // Ignored folders such as `.notes` have no project entries until expanded.
-            None if self.store.read(cx).is_local_host()
-                && std::fs::metadata(&target.path).is_ok_and(|metadata| metadata.is_file()) =>
-            {
-                target.path
-            }
-            // Agents often name a file without its folders, like `producer.rs:83`, or relative
-            // to a folder inside the project, like `phantom-bin/src/engine/book.rs`.
-            None => {
-                let relative = util::paths::PathWithPosition::parse_str(text).path;
-                if relative.is_absolute() {
-                    return None;
-                }
-                unique_project_file(project, relative.to_str()?, cx)?
-            }
-        };
-        let mut url = url::Url::from_file_path(&path).ok()?;
-        if let Some(row) = target.row {
-            url.set_fragment(Some(&format!("L{row}")));
+        if entry.is_some() {
+            return file_link(&target.path, target.row)
+                .map_or(CodeSpanResolution::NotALink, CodeSpanResolution::Link);
         }
-        Some(url.to_string().into())
+        // Agents often name a file without its folders, like `producer.rs:83`, or relative to a
+        // folder inside the project, like `phantom-bin/src/engine/book.rs`.
+        let relative = util::paths::PathWithPosition::parse_str(text).path;
+        let relative = (!relative.is_absolute())
+            .then(|| relative.to_str().map(str::to_owned))
+            .flatten();
+        CodeSpanResolution::Lookup {
+            target,
+            // Ignored folders such as `.notes` have no project entries until expanded.
+            check_disk: self.store.read(cx).is_local_host(),
+            relative,
+        }
+    }
+
+    /// Resolves a span the project has no entry for, then redraws the chat if it became a link.
+    fn look_up_code_span(
+        &self,
+        text: &str,
+        target: LinkTarget,
+        check_disk: bool,
+        relative: Option<String>,
+        cx: &App,
+    ) {
+        let Some(workspace) = self.workspace() else {
+            return;
+        };
+        let project = workspace.read(cx).project().clone();
+        let text = text.to_owned();
+        let code_spans = self.code_spans.clone();
+        let view = self.view.clone();
+        cx.spawn(async move |cx| {
+            let on_disk = check_disk && {
+                let path = target.path.clone();
+                cx.background_spawn(async move {
+                    std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file())
+                })
+                .await
+            };
+            let path = if on_disk {
+                Some(target.path.clone())
+            } else if let Some(relative) = relative {
+                cx.update(|cx| unique_project_file(project.read(cx), &relative, cx))
+                    .await
+            } else {
+                None
+            };
+            let Some(link) = path.and_then(|path| file_link(&path, target.row)) else {
+                return;
+            };
+            code_spans.borrow_mut().insert(&text, Some(link));
+            if let Err(error) = view.update(cx, |_, cx| cx.notify()) {
+                log::debug!("Paseo agent view released before a code span resolved: {error}");
+            }
+        })
+        .detach();
     }
 
     fn find_text(&self, name: &str, window: &mut Window, cx: &mut App) {
@@ -3483,7 +3996,9 @@ impl ThreadLinks {
                         .collect::<Vec<_>>();
                     match pick_symbol(&name, &keys) {
                         SymbolPick::One(index) => {
-                            open_symbol_definition(workspace, symbols[index].clone(), window, cx)
+                            if let Some(symbol) = symbols.get(index) {
+                                open_symbol_definition(workspace, symbol.clone(), window, cx)
+                            }
                         }
                         SymbolPick::Several => {
                             window
@@ -3643,29 +4158,50 @@ impl ThreadLinks {
     }
 }
 
-/// The project's only file with this name, or `None` when there is none or more than one.
-fn unique_project_file(project: &project::Project, relative: &str, cx: &App) -> Option<PathBuf> {
+/// A `file://` URL for `path`, at `row` when known.
+fn file_link(path: &std::path::Path, row: Option<u32>) -> Option<SharedString> {
+    let mut url = url::Url::from_file_path(path).ok()?;
+    if let Some(row) = row {
+        url.set_fragment(Some(&format!("L{row}")));
+    }
+    Some(url.to_string().into())
+}
+
+/// The project's only file with this name, or `None` when there is none or more than one. The
+/// worktrees are walked in the background, since a project can hold many files.
+fn unique_project_file(
+    project: &project::Project,
+    relative: &str,
+    cx: &App,
+) -> Task<Option<PathBuf>> {
     let relative = relative.trim_start_matches("./").replace('\\', "/");
-    let file_name = relative.rsplit('/').next()?.to_owned();
-    // Whole folder names only: `c/mod_a/lib.rs` must not match `src/mod_a/lib.rs`.
-    let ends_with_relative = |path: &str| {
-        path == relative
-            || path
-                .strip_suffix(relative.as_str())
-                .is_some_and(|parent| parent.ends_with('/'))
+    let Some(file_name) = relative.rsplit('/').next().map(str::to_owned) else {
+        return Task::ready(None);
     };
-    let mut matches = project.visible_worktrees(cx).flat_map(|worktree| {
-        let worktree = worktree.read(cx);
-        worktree
-            .files(false, 0)
-            .filter(|entry| entry.path.file_name() == Some(file_name.as_str()))
-            .filter(|entry| ends_with_relative(entry.path.as_unix_str()))
-            .take(2)
-            .map(|entry| worktree.absolutize(&entry.path))
-            .collect::<Vec<_>>()
-    });
-    let only = matches.next()?;
-    matches.next().is_none().then_some(only)
+    let snapshots = project
+        .visible_worktrees(cx)
+        .map(|worktree| worktree.read(cx).snapshot())
+        .collect::<Vec<_>>();
+    cx.background_spawn(async move {
+        // Whole folder names only: `c/mod_a/lib.rs` must not match `src/mod_a/lib.rs`.
+        let ends_with_relative = |path: &str| {
+            path == relative
+                || path
+                    .strip_suffix(relative.as_str())
+                    .is_some_and(|parent| parent.ends_with('/'))
+        };
+        let mut matches = snapshots.iter().flat_map(|snapshot| {
+            snapshot
+                .files(false, 0)
+                .filter(|entry| entry.path.file_name() == Some(file_name.as_str()))
+                .filter(|entry| ends_with_relative(entry.path.as_unix_str()))
+                .take(2)
+                .map(|entry| snapshot.absolutize(&entry.path))
+                .collect::<Vec<_>>()
+        });
+        let only = matches.next()?;
+        matches.next().is_none().then_some(only)
+    })
 }
 
 /// A file a thread link names, with its one-based line and column.
@@ -3862,9 +4398,9 @@ mod tests {
             failed: false,
             expanded: false,
         };
-        let footer = |turn: usize| Row::TurnFooter {
-            turn,
-            first_item_key: Some(1000 + turn as u64),
+        let footer = |turn: u64| Row::TurnFooter {
+            first_item_key: Some(1000 + turn),
+            has_text: false,
             duration_seconds: None,
             finished_at: None,
         };
@@ -3898,14 +4434,14 @@ mod tests {
 
         // An older turn loading above shifts every turn's index, not its first item.
         let older_turn = Row::TurnFooter {
-            turn: 0,
             first_item_key: Some(1),
+            has_text: false,
             duration_seconds: None,
             finished_at: None,
         };
         let shifted = Row::TurnFooter {
-            turn: 1,
             first_item_key: Some(1000),
+            has_text: false,
             duration_seconds: None,
             finished_at: None,
         };
@@ -3925,13 +4461,13 @@ mod tests {
 
     fn item_row(key: u64, content: StreamContent) -> Row {
         Row::Item {
-            index: key as usize,
-            item: StreamItem {
+            item: Rc::new(StreamItem {
                 key,
                 timestamp: None,
                 last_timestamp: None,
                 content,
-            },
+            }),
+            tool: None,
             expanded: false,
             streaming: false,
         }
@@ -3944,6 +4480,28 @@ mod tests {
                 text: format!("text {key}"),
             },
         )
+    }
+
+    #[test]
+    fn a_change_splices_only_the_rows_between_the_unchanged_ends() {
+        let rows = [text(1), text(2), text(3), Row::Spacer];
+        assert_eq!(row_splice(&rows, &rows), None);
+        assert_eq!(
+            row_splice(&rows, &[text(1), text(5), text(6), text(3), Row::Spacer]),
+            Some((1..2, 2)),
+            "a change in the middle keeps the rows after it"
+        );
+        assert_eq!(
+            row_splice(&rows, &[text(1), text(2), text(3), text(4), Row::Spacer]),
+            Some((3..3, 1)),
+            "a row added before the spacer"
+        );
+        assert_eq!(row_splice(&rows, &[text(1), Row::Spacer]), Some((1..3, 0)));
+        assert_eq!(
+            row_splice(&[Row::Spacer, Row::Spacer], &[Row::Spacer]),
+            Some((1..2, 0)),
+            "the ends never overlap"
+        );
     }
 
     #[test]
@@ -4148,27 +4706,27 @@ mod tests {
         .await;
         let project = project::Project::test(fs, [std::path::Path::new("/repo")], cx).await;
         cx.run_until_parked();
-        cx.update(|cx| {
-            let project = project.read(cx);
-            assert_eq!(
-                unique_project_file(project, "producer.rs", cx),
-                Some(PathBuf::from("/repo/src/producer.rs"))
-            );
-            assert_eq!(unique_project_file(project, "lib.rs", cx), None);
-            assert_eq!(unique_project_file(project, "missing.rs", cx), None);
-            // A path relative to some folder inside the project, like
-            // `phantom-bin/src/engine/book.rs` for `axon-rs/crates/phantom/phantom-bin/…`.
-            assert_eq!(
-                unique_project_file(project, "mod_a/lib.rs", cx),
-                Some(PathBuf::from("/repo/src/mod_a/lib.rs"))
-            );
-            assert_eq!(
-                unique_project_file(project, "./src/mod_b/lib.rs", cx),
-                Some(PathBuf::from("/repo/src/mod_b/lib.rs"))
-            );
-            // Folder names match whole, so `c/mod_a` is not the end of `src/mod_a`.
-            assert_eq!(unique_project_file(project, "c/mod_a/lib.rs", cx), None);
-        });
+        let find = |relative: &str, cx: &mut gpui::TestAppContext| {
+            cx.update(|cx| unique_project_file(project.read(cx), relative, cx))
+        };
+        assert_eq!(
+            find("producer.rs", cx).await,
+            Some(PathBuf::from("/repo/src/producer.rs"))
+        );
+        assert_eq!(find("lib.rs", cx).await, None);
+        assert_eq!(find("missing.rs", cx).await, None);
+        // A path relative to some folder inside the project, like
+        // `phantom-bin/src/engine/book.rs` for `axon-rs/crates/phantom/phantom-bin/…`.
+        assert_eq!(
+            find("mod_a/lib.rs", cx).await,
+            Some(PathBuf::from("/repo/src/mod_a/lib.rs"))
+        );
+        assert_eq!(
+            find("./src/mod_b/lib.rs", cx).await,
+            Some(PathBuf::from("/repo/src/mod_b/lib.rs"))
+        );
+        // Folder names match whole, so `c/mod_a` is not the end of `src/mod_a`.
+        assert_eq!(find("c/mod_a/lib.rs", cx).await, None);
     }
 
     #[test]
@@ -4328,20 +4886,172 @@ mod tests {
         assert!(!submit_empty_on_dismiss(&[]));
     }
 
+    fn chunk(sequence: u64, text: &str) -> paseo_client::TimelineEntry {
+        paseo_client::TimelineEntry {
+            agent_id: "agent".into(),
+            epoch: "epoch".into(),
+            sequence,
+            timestamp: "2026-10-02T00:00:00Z".into(),
+            payload: paseo_client::TimelinePayload::Message(
+                serde_json::json!({"type": "assistant_message", "text": text}),
+            ),
+            extra: serde_json::json!({}),
+        }
+    }
+
+    #[gpui::test]
+    fn streamed_chunks_reach_the_rows_once_the_store_update_ends(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            crate::PaseoSettings::register(cx);
+            editor::init(cx);
+        });
+        let store = cx.new(|_| PaseoStore::default());
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            AgentView::on_host(store.clone(), Some("agent".into()), None, None, window, cx)
+        });
+        let send = |chunks: Vec<paseo_client::TimelineEntry>, cx: &mut gpui::VisualTestContext| {
+            store.update(cx, |store, cx| {
+                for chunk in chunks {
+                    store.state.insert_entry(chunk);
+                    cx.emit(StoreEvent::TimelineChanged("agent".into()));
+                }
+            });
+        };
+        let item_texts = |view: &AgentView| {
+            view.rows
+                .iter()
+                .filter_map(|row| match row {
+                    Row::Item { item, .. } => match &item.content {
+                        StreamContent::Assistant { text } => Some(text.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        send(vec![chunk(1, "Hello"), chunk(2, ", wor")], cx);
+        let first = view.read_with(cx, |view, _| {
+            assert!(!view.rebuild_pending);
+            assert_eq!(item_texts(view), ["Hello, wor"]);
+            view.projection.items().first().cloned()
+        });
+
+        send(vec![chunk(3, "ld")], cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(item_texts(view), ["Hello, world"]);
+            let streamed = view.projection.items().first();
+            assert!(
+                first
+                    .zip(streamed)
+                    .is_some_and(|(before, after)| !Rc::ptr_eq(&before, after)),
+                "the streamed message is a new item, so its row re-renders"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn chat_rows_draw_and_a_streamed_chunk_grows_the_last(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::test_init);
+        let store = cx.new(|_| PaseoStore::default());
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            AgentView::on_host(store.clone(), Some("agent".into()), None, None, window, cx)
+        });
+        let send = |chunk: paseo_client::TimelineEntry, cx: &mut gpui::VisualTestContext| {
+            store.update(cx, |store, cx| {
+                store.state.insert_entry(chunk);
+                cx.emit(StoreEvent::TimelineChanged("agent".into()));
+            });
+            cx.run_until_parked();
+        };
+        send(chunk(1, "Hello"), cx);
+        let message_row = |cx: &mut gpui::VisualTestContext| {
+            let rows = view.read_with(cx, |view, _| view.rows.len());
+            (0..rows)
+                .filter_map(|index| cx.debug_bounds(format!("paseo-chat-row-{index}").leak()))
+                .next()
+                .expect("the message row is drawn")
+        };
+        let width = cx.update(|window, _| window.viewport_size().width);
+        let before = message_row(cx);
+        assert!(before.size.height > px(0.));
+        assert!(
+            before.left() >= px(0.) && before.right() <= width,
+            "the row {before:?} fits the chat's {width:?}"
+        );
+        send(chunk(2, &" and more".repeat(400)), cx);
+        let after = message_row(cx);
+        assert!(
+            after.size.height > before.size.height,
+            "the streamed text wraps onto more lines: {before:?} then {after:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn a_subagent_chat_follows_its_parents_directory(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::test_init);
+        let store = cx.new(|_| PaseoStore::default());
+        let parent = |directory: &str| {
+            let mut agent = crate::test_agent("parent", "Parent", "running");
+            agent.directory = Some(PathBuf::from(directory));
+            agent
+        };
+        store.update(cx, |store, _| {
+            store.state.upsert_agent(parent("/work/project"));
+            store.state.subagents.insert(
+                "parent".into(),
+                vec![paseo_client::ProviderSubagent {
+                    id: "task".into(),
+                    parent_agent_id: "parent".into(),
+                    parent_subagent_id: None,
+                    provider: "claude".into(),
+                    title: Some("reviewer".into()),
+                    description: None,
+                    status: "running".into(),
+                    created_at: "2026-10-03T10:00:00Z".into(),
+                    updated_at: "2026-10-03T10:00:00Z".into(),
+                    tool_call_id: None,
+                    cwd: None,
+                    subtitle: None,
+                }],
+            );
+        });
+        let timeline_id = paseo_client::subagent_timeline_id("parent", "task");
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            AgentView::on_host(store.clone(), Some(timeline_id), None, None, window, cx)
+        });
+        cx.run_until_parked();
+        let tools_directory = |cx: &mut gpui::VisualTestContext| {
+            view.read_with(cx, |view, _| view.row_caches.tools_directory.clone())
+        };
+        assert_eq!(tools_directory(cx), Some(PathBuf::from("/work/project")));
+
+        store.update(cx, |store, cx| {
+            store.state.upsert_agent(parent("/work/other"));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            tools_directory(cx),
+            Some(PathBuf::from("/work/other")),
+            "tool paths follow the directory the subagent works in"
+        );
+    }
+
     #[gpui::test]
     fn buffer_zoom_zooms_the_chat(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
             cx.set_global(settings_store);
-            let ui_font_size =
-                <theme_settings::ThemeSettings as settings::Settings>::get_global(cx)
-                    .ui_font_size(cx);
-            assert_eq!(crate::chat_font_size(cx), ui_font_size);
+            let base = crate::chat_font_size(cx);
             theme_settings::increase_buffer_font_size(cx);
             theme_settings::increase_buffer_font_size(cx);
-            assert_eq!(crate::chat_font_size(cx), ui_font_size + px(2.));
+            assert_eq!(crate::chat_font_size(cx), base + px(2.));
             theme_settings::reset_buffer_font_size(cx);
-            assert_eq!(crate::chat_font_size(cx), ui_font_size);
+            assert_eq!(crate::chat_font_size(cx), base);
         });
     }
 }

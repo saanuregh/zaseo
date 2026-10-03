@@ -2,16 +2,23 @@ use std::{path::PathBuf, rc::Rc};
 
 use gpui::{
     App, AppContext as _, ClipboardItem, Context, DismissEvent, Entity, EventEmitter, FocusHandle,
-    Focusable, PromptLevel, WeakEntity, Window, prelude::*, px,
+    Focusable, Global, PromptLevel, Subscription, WeakEntity, Window, prelude::*, px,
 };
 use menu::{Cancel, Confirm};
 use paseo_client::{AgentSummary, WorkspaceDescriptor, WorkspaceLabel};
-use serde_json::Value;
-use ui::{ContextMenu, prelude::*};
+use ui::{ContextMenu, IconPosition, PopoverMenu, Tooltip, prelude::*};
 use ui_input::InputField;
 use workspace::{ModalView, Workspace};
 
-use crate::{composer::BaseRef, sidebar::project_label, store, terminal, worktrees};
+use crate::{
+    InterruptAgent,
+    agent_view::{checkout_label, checkout_picker},
+    command_center::{BaseBranchPicker, DirectoryPicker, recent_directories},
+    composer::{Composer, ComposerEvent},
+    sidebar::project_label,
+    store::{self, PaseoStore},
+    terminal, worktrees,
+};
 
 /// Paseo's label colors, in the order new labels take them.
 const LABEL_COLORS: [&str; 10] = [
@@ -76,7 +83,7 @@ impl Render for TextPromptModal {
             .p_4()
             .gap_2()
             .elevation_3(cx)
-            .rounded_lg()
+            .rounded_md()
             .child(self.input.clone())
             .child(
                 Label::new("Enter to save · Esc to cancel")
@@ -113,20 +120,16 @@ fn prompt_from_menu(
     window: &mut Window,
     cx: &mut App,
 ) {
-    window.defer(cx, move |window, cx| {
-        if let Err(error) = workspace.update(cx, |workspace, cx| {
-            open_text_prompt(
-                workspace,
-                title,
-                placeholder,
-                &initial,
-                on_confirm,
-                window,
-                cx,
-            )
-        }) {
-            log::debug!("Paseo workspace closed: {error}");
-        }
+    crate::defer_workspace_update(workspace, window, cx, move |workspace, window, cx| {
+        open_text_prompt(
+            workspace,
+            title,
+            placeholder,
+            &initial,
+            on_confirm,
+            window,
+            cx,
+        )
     });
 }
 
@@ -167,12 +170,8 @@ fn workspace_agents<'a>(
 /// waiting for a permission, which only answering clears.
 pub(crate) fn has_clearable_attention(agents: &[AgentSummary], workspace_id: &str) -> bool {
     workspace_agents(agents, workspace_id).any(|agent| {
-        agent
-            .extra
-            .get("requiresAttention")
-            .and_then(Value::as_bool)
-            == Some(true)
-            && agent.extra.get("attentionReason").and_then(Value::as_str) != Some("permission")
+        store::agent_requires_attention(agent)
+            && store::agent_string(agent, "attentionReason") != Some("permission")
     })
 }
 
@@ -191,7 +190,7 @@ fn archive_detail(workspace: &WorkspaceDescriptor, agent_count: usize) -> String
         1 => "Its agent is archived.".to_owned(),
         count => format!("Its {count} agents are archived."),
     };
-    if workspace.is_paseo_worktree || workspace.kind == "worktree" {
+    if workspace.is_worktree() {
         format!(
             "{agents} Once no other workspace uses it, its worktree folder {} is removed from disk, including uncommitted and untracked changes. The branch is kept.",
             workspace.directory.display()
@@ -201,13 +200,22 @@ fn archive_detail(workspace: &WorkspaceDescriptor, agent_count: usize) -> String
     }
 }
 
-/// Runs a daemon request whose failure shows in the Paseo error banner.
-fn request<F, Fut>(cx: &mut App, make_request: F)
+/// Runs a daemon request on `host`, whose failure shows in the Paseo error banner. `None` is a
+/// workspace or project no host knows any more, which the banner says too.
+fn request_on<F, Fut>(host: Option<Entity<PaseoStore>>, cx: &mut App, make_request: F)
 where
     F: FnOnce(std::sync::Arc<paseo_client::PaseoSession>) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
 {
-    store(cx).update(cx, |store, cx| {
+    let Some(host) = host else {
+        crate::hosts::default_store(cx).update(cx, |store, cx| {
+            store.state.error =
+                Some("This workspace's host isn't connected any more, so nothing changed".into());
+            cx.notify();
+        });
+        return;
+    };
+    host.update(cx, |store, cx| {
         store.request_reporting_errors(cx, make_request)
     });
 }
@@ -215,11 +223,15 @@ where
 /// Sets a workspace's title; an empty name restores the default.
 fn rename_workspace(workspace_id: String, name: &str, cx: &mut App) {
     let title = Some(name.trim().to_owned()).filter(|name| !name.is_empty());
-    request(cx, move |session| async move {
-        session
-            .set_workspace_title(&workspace_id, title.as_deref())
-            .await
-    });
+    request_on(
+        crate::hosts::store_for_workspace(&workspace_id, cx),
+        cx,
+        move |session| async move {
+            session
+                .set_workspace_title(&workspace_id, title.as_deref())
+                .await
+        },
+    );
 }
 
 pub(crate) fn open_workspace_rename(
@@ -240,6 +252,45 @@ pub(crate) fn open_workspace_rename(
     );
 }
 
+/// Renames the title an agent shows: its workspace's name when it is alone in one, otherwise its
+/// own title.
+pub(crate) fn open_agent_rename(
+    workspace: &mut Workspace,
+    agent_id: String,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(host) = crate::hosts::store_for_agent(&agent_id, cx) else {
+        return;
+    };
+    let (lone_workspace, current) = {
+        let store = host.read(cx);
+        let Some(agent) = store.agent(&agent_id) else {
+            return;
+        };
+        (
+            store.lone_agent_workspace(agent).cloned(),
+            store::agent_title(agent),
+        )
+    };
+    if let Some(descriptor) = lone_workspace {
+        open_workspace_rename(workspace, &descriptor, window, cx);
+        return;
+    }
+    open_text_prompt(
+        workspace,
+        "Rename agent",
+        "Agent name",
+        &current,
+        move |name, _, cx| {
+            let agent_id = agent_id.clone();
+            host.update(cx, |store, cx| store.rename(&agent_id, name, cx));
+        },
+        window,
+        cx,
+    );
+}
+
 /// The workspace row's right-click menu, like Paseo's sidebar workspace menu.
 pub(crate) fn workspace_menu(
     menu: ContextMenu,
@@ -247,13 +298,15 @@ pub(crate) fn workspace_menu(
     workspace: WeakEntity<Workspace>,
     cx: &App,
 ) -> ContextMenu {
-    let store = store(cx);
-    let store = store.read(cx);
+    let Some(host) = crate::hosts::store_for_workspace(workspace_id, cx) else {
+        return menu.label("This workspace is gone");
+    };
+    let store = host.read(cx);
     let Some(descriptor) = store.state.workspaces.get(workspace_id).cloned() else {
         return menu.label("This workspace is gone");
     };
-    let agent_count = workspace_agents(&store.state.agents, workspace_id).count();
-    let clearable = has_clearable_attention(&store.state.agents, workspace_id);
+    let agent_count = workspace_agents(store.state.agents(), workspace_id).count();
+    let clearable = has_clearable_attention(store.state.agents(), workspace_id);
     let labels = store.state.labels.clone();
     let is_local = store.is_local_host();
     let setup = store.state.setup.get(workspace_id).cloned();
@@ -265,8 +318,6 @@ pub(crate) fn workspace_menu(
         id.clone(),
         descriptor.title.clone().unwrap_or(descriptor.name.clone()),
     );
-    let attention_id = id.clone();
-    let pin_id = id.clone();
     let pinned = descriptor.pinned_at.is_some();
     let copy_path = descriptor.directory.display().to_string();
     let branch = descriptor.current_branch.clone();
@@ -275,18 +326,14 @@ pub(crate) fn workspace_menu(
     let label_descriptor = descriptor.clone();
     let label_workspace = workspace;
     let scripts = descriptor.scripts;
-    let scripts_id = id;
+    let scripts_id = id.clone();
 
-    let mut menu = menu
+    let menu = menu
         .entry("New Agent Here", None, move |window, cx| {
             let (workspace, paseo_workspace_id) = new_agent.clone();
-            window.defer(cx, move |window, cx| {
-                if let Err(error) = workspace.update(cx, |workspace, cx| {
-                    crate::new_agent_in_paseo_workspace(workspace, &paseo_workspace_id, window, cx)
-                        .detach_and_log_err(cx);
-                }) {
-                    log::debug!("Paseo workspace closed: {error}");
-                }
+            crate::defer_workspace_update(workspace, window, cx, move |workspace, window, cx| {
+                crate::new_agent_in_paseo_workspace(workspace, &paseo_workspace_id, window, cx)
+                    .detach_and_log_err(cx);
             });
         })
         .separator()
@@ -302,35 +349,18 @@ pub(crate) fn workspace_menu(
                 cx,
             );
         });
-    menu = if clearable {
-        menu.entry("Mark as Read", None, move |_, cx| {
-            let workspace_id = attention_id.clone();
-            request(cx, move |session| async move {
-                session.clear_workspace_attention(vec![workspace_id]).await
-            });
-        })
-    } else {
-        menu.entry("Mark as Unread", None, move |_, cx| {
-            let workspace_id = attention_id.clone();
-            request(cx, move |session| async move {
-                session.mark_workspace_unread(&workspace_id).await
-            });
-        })
-    };
-    menu = menu
-        .entry(
-            if pinned { "Unpin" } else { "Pin to Top" },
-            None,
-            move |_, cx| {
-                let workspace_id = pin_id.clone();
-                request(cx, move |session| async move {
-                    session.set_workspace_pinned(&workspace_id, !pinned).await
-                });
-            },
-        )
-        .submenu("Labels", move |menu, _, _| {
-            labels_submenu(menu, &label_descriptor, &labels, label_workspace.clone())
-        });
+    let mut menu = add_attention_and_pin_entries(menu, &id, clearable, pinned).submenu(
+        "Labels",
+        move |menu, _, _| {
+            labels_submenu(
+                menu,
+                &label_descriptor,
+                &labels,
+                label_workspace.clone(),
+                host.clone(),
+            )
+        },
+    );
     if !scripts.is_empty()
         || setup
             .as_ref()
@@ -340,7 +370,71 @@ pub(crate) fn workspace_menu(
             scripts_submenu(menu, &scripts_id, &scripts, setup.as_ref())
         });
     }
-    menu = menu.separator().entry("Copy Path", None, move |_, cx| {
+    add_copy_and_archive_entries(
+        menu,
+        copy_path,
+        branch,
+        is_local.then_some(reveal_path),
+        archive,
+    )
+}
+
+/// "Mark as Read" or "Mark as Unread", and pinning, for a workspace's menu.
+fn add_attention_and_pin_entries(
+    menu: ContextMenu,
+    workspace_id: &str,
+    clearable: bool,
+    pinned: bool,
+) -> ContextMenu {
+    let attention_id = workspace_id.to_owned();
+    let pin_id = workspace_id.to_owned();
+    let menu = if clearable {
+        menu.entry("Mark as Read", None, move |_, cx| {
+            let workspace_id = attention_id.clone();
+            request_on(
+                crate::hosts::store_for_workspace(&workspace_id, cx),
+                cx,
+                move |session| async move {
+                    session.clear_workspace_attention(vec![workspace_id]).await
+                },
+            );
+        })
+    } else {
+        menu.entry("Mark as Unread", None, move |_, cx| {
+            let workspace_id = attention_id.clone();
+            request_on(
+                crate::hosts::store_for_workspace(&workspace_id, cx),
+                cx,
+                move |session| async move { session.mark_workspace_unread(&workspace_id).await },
+            );
+        })
+    };
+    menu.entry(
+        if pinned { "Unpin" } else { "Pin to Top" },
+        None,
+        move |_, cx| {
+            let workspace_id = pin_id.clone();
+            request_on(
+                crate::hosts::store_for_workspace(&workspace_id, cx),
+                cx,
+                move |session| async move {
+                    session.set_workspace_pinned(&workspace_id, !pinned).await
+                },
+            );
+        },
+    )
+}
+
+/// The copy entries, revealing a local folder, and archiving, which end a workspace's menu.
+/// `archive` is the workspace's ID and the confirmation's detail.
+fn add_copy_and_archive_entries(
+    menu: ContextMenu,
+    copy_path: String,
+    branch: Option<String>,
+    reveal_path: Option<PathBuf>,
+    archive: (String, String),
+) -> ContextMenu {
+    let mut menu = menu.separator().entry("Copy Path", None, move |_, cx| {
         cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
     });
     if let Some(branch) = branch {
@@ -348,7 +442,7 @@ pub(crate) fn workspace_menu(
             cx.write_to_clipboard(ClipboardItem::new_string(branch.clone()));
         });
     }
-    if is_local {
+    if let Some(reveal_path) = reveal_path {
         menu = menu.entry(
             ui::utils::reveal_in_file_manager_label(false),
             None,
@@ -365,7 +459,7 @@ pub(crate) fn workspace_menu(
                 &detail,
                 "Archive",
                 move |cx| {
-                    request(cx, move |session| async move {
+                    request_on(crate::hosts::store_for_workspace(&workspace_id, cx), cx, move |session| async move {
                         session.archive_workspace(&workspace_id).await
                     })
                 },
@@ -380,6 +474,7 @@ fn labels_submenu(
     workspace: &WorkspaceDescriptor,
     labels: &[WorkspaceLabel],
     workspace_handle: WeakEntity<Workspace>,
+    host: Entity<PaseoStore>,
 ) -> ContextMenu {
     for label in labels {
         let assigned = workspace.labels.contains(&label.name);
@@ -392,12 +487,16 @@ fn labels_submenu(
             None,
             move |_, cx| {
                 let (workspace_id, label) = (workspace_id.clone(), label.clone());
-                request(cx, move |session| async move {
-                    session
-                        .set_workspace_label(&workspace_id, &label, !assigned)
-                        .await
-                        .map(drop)
-                });
+                request_on(
+                    crate::hosts::store_for_workspace(&workspace_id, cx),
+                    cx,
+                    move |session| async move {
+                        session
+                            .set_workspace_label(&workspace_id, &label, !assigned)
+                            .await
+                            .map(drop)
+                    },
+                );
             },
         );
     }
@@ -425,12 +524,16 @@ fn labels_submenu(
                     name,
                     color: color.to_owned(),
                 };
-                request(cx, move |session| async move {
-                    session
-                        .set_workspace_label(&workspace_id, &label, true)
-                        .await
-                        .map(drop)
-                });
+                request_on(
+                    crate::hosts::store_for_workspace(&workspace_id, cx),
+                    cx,
+                    move |session| async move {
+                        session
+                            .set_workspace_label(&workspace_id, &label, true)
+                            .await
+                            .map(drop)
+                    },
+                );
             },
             window,
             cx,
@@ -438,7 +541,7 @@ fn labels_submenu(
     })
     .when(!manage_labels.is_empty(), |menu| {
         menu.submenu("Manage Labels", move |menu, _, _| {
-            manage_labels_submenu(menu, &manage_labels, workspace_handle.clone())
+            manage_labels_submenu(menu, &manage_labels, workspace_handle.clone(), host.clone())
         })
     })
 }
@@ -447,14 +550,18 @@ fn manage_labels_submenu(
     mut menu: ContextMenu,
     labels: &[WorkspaceLabel],
     workspace: WeakEntity<Workspace>,
+    host: Entity<PaseoStore>,
 ) -> ContextMenu {
     for label in labels {
         let label = label.clone();
         let workspace = workspace.clone();
+        let host = host.clone();
         menu = menu.submenu(label.name.clone(), move |mut menu, _, _| {
             let rename = (workspace.clone(), label.name.clone());
+            let rename_host = host.clone();
             menu = menu.entry("Rename…", None, move |window, cx| {
                 let (workspace, name) = rename.clone();
+                let host = rename_host.clone();
                 prompt_from_menu(
                     workspace,
                     "Rename label",
@@ -466,7 +573,7 @@ fn manage_labels_submenu(
                             return;
                         }
                         let name = name.clone();
-                        request(cx, move |session| async move {
+                        request_on(Some(host.clone()), cx, move |session| async move {
                             session
                                 .update_label(&name, Some(&new_name), None)
                                 .await
@@ -479,9 +586,11 @@ fn manage_labels_submenu(
             });
             let color_name = label.name.clone();
             let current_color = label.color.clone();
+            let color_host = host.clone();
             menu = menu.submenu("Color", move |mut menu, _, _| {
                 for color in LABEL_COLORS {
                     let name = color_name.clone();
+                    let host = color_host.clone();
                     menu = menu.toggleable_entry(
                         color,
                         current_color == color,
@@ -489,7 +598,7 @@ fn manage_labels_submenu(
                         None,
                         move |_, cx| {
                             let name = name.clone();
-                            request(cx, move |session| async move {
+                            request_on(Some(host.clone()), cx, move |session| async move {
                                 session
                                     .update_label(&name, None, Some(color))
                                     .await
@@ -501,9 +610,11 @@ fn manage_labels_submenu(
                 menu
             });
             let delete_name = label.name.clone();
+            let delete_host = host.clone();
             menu.separator().entry("Delete…", None, move |window, cx| {
                 let name = delete_name.clone();
-                let usage = store(cx).update(cx, |store, cx| {
+                let host = delete_host.clone();
+                let usage = host.update(cx, |store, cx| {
                     let name = name.clone();
                     store.session_request(cx, move |session| async move {
                         session.label_usage(&name).await
@@ -522,7 +633,7 @@ fn manage_labels_submenu(
                             &detail,
                             "Delete",
                             move |cx| {
-                                request(cx, move |session| async move {
+                                request_on(Some(host.clone()), cx, move |session| async move {
                                     session.delete_label(&name).await
                                 })
                             },
@@ -558,11 +669,15 @@ fn scripts_submenu(
         let (workspace_id, script_name) = (workspace_id.to_owned(), script.name.clone());
         menu = menu.entry(label, None, move |_, cx| {
             let (workspace_id, script_name) = (workspace_id.clone(), script_name.clone());
-            request(cx, move |session| async move {
-                session
-                    .set_workspace_script_running(&workspace_id, &script_name, !running)
-                    .await
-            });
+            request_on(
+                crate::hosts::store_for_workspace(&workspace_id, cx),
+                cx,
+                move |session| async move {
+                    session
+                        .set_workspace_script_running(&workspace_id, &script_name, !running)
+                        .await
+                },
+            );
         });
         if let Some(url) = script.proxy_url.clone().filter(|_| running) {
             menu = menu.entry(format!("Open {}", script.name), None, move |_, cx| {
@@ -580,96 +695,221 @@ fn scripts_submenu(
         let workspace_id = workspace_id.to_owned();
         menu = menu.entry("Run Setup", None, move |_, cx| {
             let workspace_id = workspace_id.clone();
-            request(cx, move |session| async move {
-                session.run_workspace_setup(&workspace_id).await
-            });
+            request_on(
+                crate::hosts::store_for_workspace(&workspace_id, cx),
+                cx,
+                move |session| async move { session.run_workspace_setup(&workspace_id).await },
+            );
         });
     }
     menu
 }
 
-/// Paseo's New Workspace dialog: isolation, base branch, title, and whether the workspace starts
-/// with a chat or only a terminal.
+/// Paseo's New Workspace window: where the workspace lives, how it is isolated, and whether it
+/// starts with a chat, written right here, or only a terminal. A chat never opens as a draft tab;
+/// its first message creates the workspace, which then opens in its own editor workspace.
+/// The New Workspace window's unsent message, kept from closing the window to reopening it until
+/// it creates an agent.
+#[derive(Default)]
+struct UnsentNewWorkspaceMessage(String);
+
+impl Global for UnsentNewWorkspaceMessage {}
+
 pub(crate) struct NewWorkspaceModal {
-    project_id: String,
-    project_name: String,
-    root: PathBuf,
     workspace: WeakEntity<Workspace>,
-    new_worktree: bool,
+    /// Holds the draft's folder, isolation and base branch for both launches.
+    composer: Entity<Composer>,
     launch_terminal: bool,
-    base: Entity<InputField>,
     title: Entity<InputField>,
     creating: bool,
+    agent_created: bool,
     error: Option<String>,
     /// Kept across retries, so trying again after a timeout can't create a second workspace.
     idempotency_key: String,
-    focus_handle: FocusHandle,
+    _composer_subscriptions: [Subscription; 3],
+    _keep_unsent_message: Subscription,
+}
+
+/// Opens the New Workspace window, starting in `project`'s folder on its host when given.
+pub(crate) fn open_new_workspace(
+    workspace: &mut Workspace,
+    project: Option<(PathBuf, Entity<PaseoStore>)>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let handle = cx.weak_entity();
+    workspace.toggle_modal(window, cx, move |window, cx| {
+        NewWorkspaceModal::new(handle, project, window, cx)
+    });
 }
 
 impl NewWorkspaceModal {
     fn new(
-        project: &paseo_client::ProjectDescriptor,
         workspace: WeakEntity<Workspace>,
+        project: Option<(PathBuf, Entity<PaseoStore>)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let base = cx.new(|cx| {
-            InputField::new(window, cx, "Default: the repository's default branch")
-                .label("Base branch")
+        let (directory, host) = match project {
+            Some((directory, host)) => (Some(directory), host),
+            None => (None, crate::hosts::default_store(cx)),
+        };
+        // The window shows the host's error for its own send, not one left by another chat.
+        host.update(cx, |store, cx| store.dismiss_error(cx));
+        let composer = cx.new(|cx| Composer::new(host, None, directory, window, cx));
+        let unsent = cx
+            .try_global::<UnsentNewWorkspaceMessage>()
+            .map(|unsent| unsent.0.clone())
+            .unwrap_or_default();
+        if !unsent.is_empty() {
+            composer.update(cx, |composer, cx| composer.set_text(&unsent, window, cx));
+        }
+        // Escape, clicking outside and the shortcut all close the window by releasing it.
+        let keep_unsent_message = cx.on_release(|modal, cx| {
+            let text = if modal.agent_created {
+                String::new()
+            } else {
+                modal.composer.read(cx).text(cx)
+            };
+            cx.set_global(UnsentNewWorkspaceMessage(text));
         });
         let title = cx.new(|cx| InputField::new(window, cx, "Optional").label("Title"));
-        let focus_handle = cx.focus_handle();
-        window.focus(&focus_handle, cx);
+        let subscriptions = Self::watch_composer(&composer, window, cx);
         Self {
-            project_id: project.id.clone(),
-            project_name: project_label(project),
-            root: project.root_path.clone(),
             workspace,
-            new_worktree: project.kind == "git",
+            composer,
             launch_terminal: false,
-            base,
             title,
             creating: false,
+            agent_created: false,
             error: None,
             idempotency_key: uuid::Uuid::new_v4().to_string(),
-            focus_handle,
+            _composer_subscriptions: subscriptions,
+            _keep_unsent_message: keep_unsent_message,
         }
     }
 
+    fn watch_composer(
+        composer: &Entity<Composer>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> [Subscription; 3] {
+        let store = composer.read(cx).store.clone();
+        [
+            cx.subscribe_in(composer, window, Self::handle_composer_event),
+            cx.observe(composer, |_, _, cx| cx.notify()),
+            cx.observe(&store, |_, _, cx| cx.notify()),
+        ]
+    }
+
+    fn handle_composer_event(
+        &mut self,
+        _composer: &Entity<Composer>,
+        event: &ComposerEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ComposerEvent::AgentCreated(agent_id) = event else {
+            return;
+        };
+        let (workspace, agent_id) = (self.workspace.clone(), agent_id.clone());
+        self.agent_created = true;
+        cx.emit(DismissEvent);
+        crate::defer_workspace_update(workspace, window, cx, move |workspace, window, cx| {
+            crate::open_agent(workspace, &agent_id, true, window, cx)
+        });
+    }
+
+    fn store(&self, cx: &App) -> Entity<PaseoStore> {
+        self.composer.read(cx).store.clone()
+    }
+
+    /// A composer runs agents on one host, so another host gets a fresh composer with the typed
+    /// text. A folder belongs to its host, so the new one starts without the old one's.
+    fn switch_host(
+        &mut self,
+        store: Entity<PaseoStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.store(cx) == store {
+            return;
+        }
+        let text = self.composer.read(cx).text(cx);
+        store.update(cx, |store, cx| store.dismiss_error(cx));
+        let composer = cx.new(|cx| Composer::new(store, None, None, window, cx));
+        composer.update(cx, |composer, cx| {
+            // The saved folder may be on the old host.
+            composer.clear_draft_directory(cx);
+            composer.set_text(&text, window, cx);
+            composer.focus(window, cx);
+        });
+        self._composer_subscriptions = Self::watch_composer(&composer, window, cx);
+        self.composer = composer;
+        cx.notify();
+    }
+
+    fn set_launch_terminal(
+        &mut self,
+        launch_terminal: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.launch_terminal = launch_terminal;
+        self.error = None;
+        let focus = self.focus_handle(cx);
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
-        self.create(window, cx);
+        if self.launch_terminal {
+            self.create_with_terminal(window, cx);
+        } else {
+            cx.propagate();
+        }
     }
 
     fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
         cx.emit(DismissEvent);
     }
 
-    fn create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn create_with_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.creating {
             return;
         }
-        let base =
-            Some(self.base.read(cx).text(cx).trim().to_owned()).filter(|base| !base.is_empty());
-        if !self.launch_terminal {
-            self.open_chat_draft(base, window, cx);
+        let composer = self.composer.read(cx);
+        let Some(root) = composer.draft_directory.clone() else {
+            self.error = Some("Choose a project for the new workspace".into());
+            cx.notify();
             return;
-        }
-        let root = self.root.display().to_string();
-        let source = if self.new_worktree {
+        };
+        let new_worktree = composer.uses_new_worktree(cx);
+        let base = composer.worktree_base().map(|base| base.ref_name.clone());
+        let host = composer.store.clone();
+        let project_id = host
+            .read(cx)
+            .state
+            .projects
+            .values()
+            .find(|project| project.root_path == root)
+            .map(|project| project.id.clone());
+        let root = root.display().to_string();
+        let source = if new_worktree {
             paseo_client::WorkspaceSource::Worktree {
                 cwd: root,
-                project_id: Some(self.project_id.clone()),
+                project_id,
                 base_ref: base,
             }
         } else {
             paseo_client::WorkspaceSource::Directory {
                 path: root,
-                project_id: Some(self.project_id.clone()),
+                project_id,
             }
         };
         let title = self.title.read(cx).text(cx);
         let idempotency_key = self.idempotency_key.clone();
-        let task = store(cx).update(cx, |store, cx| {
+        let task = host.update(cx, |store, cx| {
             store.session_request(cx, move |session| async move {
                 session
                     .create_workspace(&source, Some(&title), &idempotency_key)
@@ -684,10 +924,9 @@ impl NewWorkspaceModal {
             this.update_in(cx, |modal, window, cx| match result {
                 Ok(created) => {
                     let directory = created.directory.display().to_string();
-                    if let Err(error) = modal
-                        .workspace
-                        .update(cx, |_, cx| terminal::new_terminal(directory, window, cx))
-                    {
+                    if let Err(error) = modal.workspace.update(cx, |_, cx| {
+                        terminal::new_terminal(host.clone(), directory, window, cx)
+                    }) {
                         log::debug!("Paseo workspace closed: {error}");
                     }
                     cx.emit(DismissEvent);
@@ -702,64 +941,224 @@ impl NewWorkspaceModal {
         .detach_and_log_err(cx);
     }
 
-    /// A chat workspace starts with its first message, so this opens the agent draft set up the
-    /// same way.
-    fn open_chat_draft(
-        &mut self,
-        base: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let (root, new_worktree) = (self.root.clone(), self.new_worktree);
-        let workspace = self.workspace.clone();
-        cx.emit(DismissEvent);
-        window.defer(cx, move |window, cx| {
-            if let Err(error) = workspace.update(cx, |workspace, cx| {
-                let draft = crate::open_draft_in(workspace, root, window, cx);
-                cx.spawn(async move |_, cx| {
-                    let tab = draft.await?;
-                    let composer =
-                        tab.read_with(cx, |tab, cx| tab.view().read(cx).composer.clone());
-                    composer.update(cx, |composer, cx| {
-                        composer.set_new_worktree(new_worktree, cx);
-                        if let Some(base) = base {
-                            composer.set_worktree_base(
-                                BaseRef {
-                                    label: base.clone(),
-                                    ref_name: base,
-                                    detail: None,
-                                },
-                                cx,
-                            );
+    fn render_project_picker(&self, cx: &Context<Self>) -> AnyElement {
+        let directory = self.composer.read(cx).draft_directory.clone();
+        let label = directory
+            .as_ref()
+            .and_then(|directory| directory.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Choose a project".into());
+        let tooltip = directory
+            .map(|directory| directory.display().to_string())
+            .unwrap_or_else(|| "Where the workspace starts".into());
+        let (workspace, store, composer) = (
+            self.workspace.clone(),
+            self.store(cx),
+            self.composer.downgrade(),
+        );
+        PopoverMenu::new("paseo-new-workspace-project")
+            .trigger_with_tooltip(
+                checkout_picker(
+                    "paseo-new-workspace-project-button",
+                    IconName::Folder,
+                    label.into(),
+                ),
+                Tooltip::text(tooltip),
+            )
+            .anchor(gpui::Anchor::TopLeft)
+            .menu(move |window, cx| {
+                let recent = workspace
+                    .upgrade()
+                    .map(|workspace| recent_directories(workspace.read(cx), &store, cx))
+                    .unwrap_or_default();
+                let composer = composer.clone();
+                let on_choose: Rc<dyn Fn(PathBuf, &mut Window, &mut App)> =
+                    Rc::new(move |directory, window, cx| {
+                        if let Err(error) = composer.update(cx, |composer, cx| {
+                            composer.set_draft_directory(directory, cx);
+                            composer.focus(window, cx);
+                        }) {
+                            log::debug!("Paseo composer closed: {error}");
                         }
                     });
-                    anyhow::Ok(())
-                })
-                .detach_and_log_err(cx);
-            }) {
-                log::debug!("Paseo workspace closed: {error}");
-            }
-        });
+                let store = store.clone();
+                Some(cx.new(|cx| {
+                    DirectoryPicker::new(
+                        store,
+                        "Search directories, or type an absolute path…",
+                        on_choose,
+                        recent,
+                        window,
+                        cx,
+                    )
+                }))
+            })
+            .into_any_element()
     }
 
-    fn choice(
-        id: &'static str,
-        label: &'static str,
-        selected: bool,
-        on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        ui::Button::new(id, label)
-            .style(if selected {
-                ButtonStyle::Filled
-            } else {
-                ButtonStyle::Subtle
+    /// Which host the workspace starts on, shown only when there is more than one.
+    fn render_host_picker(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let modal = cx.weak_entity();
+        crate::agent_view::render_host_picker(
+            "paseo-new-workspace-host",
+            "paseo-new-workspace-host-button",
+            "Choose the host",
+            self.store(cx),
+            move |store, window, cx| {
+                if let Err(error) =
+                    modal.update(cx, |modal, cx| modal.switch_host(store, window, cx))
+                {
+                    log::debug!("Paseo new workspace closed: {error}");
+                }
+            },
+            cx,
+        )
+    }
+
+    fn render_isolation_picker(&self, cx: &Context<Self>) -> AnyElement {
+        let composer = self.composer.read(cx);
+        if !composer.can_create_worktree(cx) {
+            return checkout_label(IconName::Folder, "Local checkout".into());
+        }
+        let new_worktree = composer.uses_new_worktree(cx);
+        let (icon, label) = if new_worktree {
+            (IconName::GitWorktree, "New worktree")
+        } else {
+            (IconName::Folder, "Local checkout")
+        };
+        let composer = self.composer.downgrade();
+        PopoverMenu::new("paseo-new-workspace-isolation")
+            .trigger_with_tooltip(
+                checkout_picker("paseo-new-workspace-isolation-button", icon, label.into()),
+                Tooltip::text("Work in the project's checkout or a new worktree"),
+            )
+            .anchor(gpui::Anchor::TopLeft)
+            .menu(move |window, cx| {
+                let composer = composer.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    let choose = |new_worktree: bool| {
+                        let composer = composer.clone();
+                        move |_: &mut Window, cx: &mut App| {
+                            if let Err(error) = composer.update(cx, |composer, cx| {
+                                composer.set_new_worktree(new_worktree, cx)
+                            }) {
+                                log::debug!("Paseo composer closed: {error}");
+                            }
+                        }
+                    };
+                    menu.toggleable_entry(
+                        "Local checkout",
+                        !new_worktree,
+                        IconPosition::Start,
+                        None,
+                        choose(false),
+                    )
+                    .toggleable_entry(
+                        "New worktree",
+                        new_worktree,
+                        IconPosition::Start,
+                        None,
+                        choose(true),
+                    )
+                }))
             })
-            .toggle_state(selected)
-            .on_click(cx.listener(move |modal, _, _, cx| {
-                on_click(modal, cx);
-                cx.notify();
-            }))
+            .into_any_element()
+    }
+
+    /// The branch a new worktree starts from.
+    fn render_branch_picker(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let composer = self.composer.read(cx);
+        if !composer.uses_new_worktree(cx) {
+            return None;
+        }
+        let directory = composer.draft_directory.as_ref()?.to_str()?.to_owned();
+        let selected = composer.worktree_base().cloned();
+        let label = selected
+            .as_ref()
+            .map(|base| base.label.clone())
+            .unwrap_or_else(|| "Default branch".into());
+        let tooltip = selected
+            .as_ref()
+            .map(|base| format!("Branch off {}", base.ref_name))
+            .unwrap_or_else(|| "Branch off the repository's default branch".into());
+        let (store, composer) = (self.store(cx), self.composer.downgrade());
+        Some(
+            PopoverMenu::new("paseo-new-workspace-branch")
+                .trigger_with_tooltip(
+                    checkout_picker(
+                        "paseo-new-workspace-branch-button",
+                        IconName::GitBranch,
+                        label.into(),
+                    ),
+                    Tooltip::text(tooltip),
+                )
+                .anchor(gpui::Anchor::TopLeft)
+                .menu(move |window, cx| {
+                    let (store, composer, directory, selected) = (
+                        store.clone(),
+                        composer.clone(),
+                        directory.clone(),
+                        selected.clone(),
+                    );
+                    Some(cx.new(|cx| {
+                        BaseBranchPicker::new(store, composer, directory, selected, window, cx)
+                    }))
+                })
+                .into_any_element(),
+        )
+    }
+
+    fn render_launch_picker(&self, cx: &Context<Self>) -> AnyElement {
+        let launch_terminal = self.launch_terminal;
+        let (icon, label) = if launch_terminal {
+            (IconName::Terminal, "Terminal")
+        } else {
+            (IconName::Chat, "Chat")
+        };
+        let modal = cx.weak_entity();
+        PopoverMenu::new("paseo-new-workspace-launch")
+            .trigger_with_tooltip(
+                checkout_picker("paseo-new-workspace-launch-button", icon, label.into()),
+                Tooltip::text("Start with a chat or only a terminal"),
+            )
+            .anchor(gpui::Anchor::TopRight)
+            .menu(move |window, cx| {
+                let modal = modal.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    let choose = |launch_terminal: bool| {
+                        let modal = modal.clone();
+                        move |window: &mut Window, cx: &mut App| {
+                            if let Err(error) = modal.update(cx, |modal, cx| {
+                                modal.set_launch_terminal(launch_terminal, window, cx)
+                            }) {
+                                log::debug!("Paseo new workspace closed: {error}");
+                            }
+                        }
+                    };
+                    menu.toggleable_entry(
+                        "Chat",
+                        !launch_terminal,
+                        IconPosition::Start,
+                        None,
+                        choose(false),
+                    )
+                    .toggleable_entry(
+                        "Terminal",
+                        launch_terminal,
+                        IconPosition::Start,
+                        None,
+                        choose(true),
+                    )
+                }))
+            })
+            .into_any_element()
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl NewWorkspaceModal {
+    pub(crate) fn composer_for_test(&self) -> Entity<Composer> {
+        self.composer.clone()
     }
 }
 
@@ -767,99 +1166,76 @@ impl EventEmitter<DismissEvent> for NewWorkspaceModal {}
 impl ModalView for NewWorkspaceModal {}
 
 impl Focusable for NewWorkspaceModal {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus_handle.clone()
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        if self.launch_terminal {
+            self.title.focus_handle(cx)
+        } else {
+            self.composer.focus_handle(cx)
+        }
     }
 }
 
 impl Render for NewWorkspaceModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let new_worktree = self.new_worktree;
-        let launch_terminal = self.launch_terminal;
-        let row = |label: &'static str| {
-            h_flex().gap_2().child(
-                div()
-                    .w(px(90.))
-                    .child(Label::new(label).color(Color::Muted)),
-            )
-        };
+        let store_error = self.store(cx).read(cx).state.error.clone();
         v_flex()
-            .key_context("PaseoRename")
-            .track_focus(&self.focus_handle)
+            .key_context("PaseoNewWorkspace")
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))
-            .w(px(460.))
+            // Escape in the composer asks to interrupt, which a draft passes on.
+            .on_action(cx.listener(|_, _: &InterruptAgent, _, cx| cx.emit(DismissEvent)))
+            .w(px(860.))
             .p_4()
             .gap_3()
             .elevation_3(cx)
-            .rounded_lg()
-            .child(
-                Headline::new(format!("New workspace in {}", self.project_name))
-                    .size(HeadlineSize::Small),
-            )
-            .child(
-                row("Isolation")
-                    .child(Self::choice(
-                        "paseo-new-workspace-local",
-                        "Local",
-                        !new_worktree,
-                        |modal, _| modal.new_worktree = false,
-                        cx,
-                    ))
-                    .child(Self::choice(
-                        "paseo-new-workspace-worktree",
-                        "New worktree",
-                        new_worktree,
-                        |modal, _| modal.new_worktree = true,
-                        cx,
-                    )),
-            )
-            .when(new_worktree, |this| this.child(self.base.clone()))
-            .child(
-                row("Launch")
-                    .child(Self::choice(
-                        "paseo-new-workspace-chat",
-                        "Chat",
-                        !launch_terminal,
-                        |modal, _| modal.launch_terminal = false,
-                        cx,
-                    ))
-                    .child(Self::choice(
-                        "paseo-new-workspace-terminal",
-                        "Terminal",
-                        launch_terminal,
-                        |modal, _| modal.launch_terminal = true,
-                        cx,
-                    )),
-            )
-            .when(launch_terminal, |this| this.child(self.title.clone()))
-            .when_some(self.error.clone(), |this, error| {
-                this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
-            })
+            .rounded_md()
+            .child(Headline::new("New workspace").size(HeadlineSize::Small))
             .child(
                 h_flex()
-                    .justify_end()
-                    .gap_2()
-                    .child(
-                        ui::Button::new("paseo-new-workspace-cancel", "Cancel")
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
-                    )
-                    .child(
-                        ui::Button::new(
-                            "paseo-new-workspace-create",
-                            if self.creating {
-                                "Creating…"
-                            } else if launch_terminal {
-                                "Create"
-                            } else {
-                                "Open Draft"
-                            },
-                        )
-                        .style(ButtonStyle::Filled)
-                        .disabled(self.creating)
-                        .on_click(cx.listener(|modal, _, window, cx| modal.create(window, cx))),
-                    ),
+                    .gap_1()
+                    .child(self.render_project_picker(cx))
+                    .children(self.render_host_picker(cx))
+                    .child(self.render_isolation_picker(cx))
+                    .children(self.render_branch_picker(cx))
+                    .child(div().flex_1())
+                    .child(self.render_launch_picker(cx)),
             )
+            .when(!self.launch_terminal, |this| {
+                this.child(self.composer.clone())
+                    .when_some(store_error, |this, error| {
+                        this.child(crate::render_inline_error(error))
+                    })
+            })
+            .when(self.launch_terminal, |this| {
+                this.child(self.title.clone())
+                    .when_some(self.error.clone(), |this, error| {
+                        this.child(crate::render_inline_error(error))
+                    })
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                ui::Button::new("paseo-new-workspace-cancel", "Cancel")
+                                    .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                            )
+                            .child(
+                                ui::Button::new(
+                                    "paseo-new-workspace-create",
+                                    if self.creating {
+                                        "Creating…"
+                                    } else {
+                                        "Create"
+                                    },
+                                )
+                                .style(ButtonStyle::Filled)
+                                .disabled(self.creating)
+                                .on_click(cx.listener(
+                                    |modal, _, window, cx| modal.create_with_terminal(window, cx),
+                                )),
+                            ),
+                    )
+            })
     }
 }
 
@@ -870,8 +1246,10 @@ pub(crate) fn project_menu(
     workspace: WeakEntity<Workspace>,
     cx: &App,
 ) -> ContextMenu {
-    let store = store(cx);
-    let store = store.read(cx);
+    let Some(host) = crate::hosts::store_for_project(project_id, cx) else {
+        return menu.label("This project is gone");
+    };
+    let store = host.read(cx);
     let Some(project) = store.state.projects.get(project_id).cloned() else {
         return menu.label("This project is gone");
     };
@@ -882,8 +1260,8 @@ pub(crate) fn project_menu(
         .values()
         .filter(|workspace| workspace.project_id == project.id)
         .count();
-    let new_agent = (workspace.clone(), project.root_path.clone());
-    let new_workspace = (workspace.clone(), project.clone());
+    let new_agent = (workspace.clone(), project.root_path.clone(), host.clone());
+    let new_workspace = (workspace.clone(), project.root_path.clone(), host.clone());
     let worktrees_handle = (workspace.clone(), project.id.clone());
     let rename = (workspace, project.id.clone(), project_label(&project));
     let icon_project = project.id.clone();
@@ -894,36 +1272,22 @@ pub(crate) fn project_menu(
     let remove_name = project_label(&project);
     let mut menu = menu
         .entry("New Agent", None, move |window, cx| {
-            let (workspace, directory) = new_agent.clone();
-            window.defer(cx, move |window, cx| {
-                if let Err(error) = workspace.update(cx, |workspace, cx| {
-                    crate::open_draft_in(workspace, directory, window, cx).detach_and_log_err(cx);
-                }) {
-                    log::debug!("Paseo workspace closed: {error}");
-                }
+            let (workspace, directory, host) = new_agent.clone();
+            crate::defer_workspace_update(workspace, window, cx, move |workspace, window, cx| {
+                crate::open_draft_in_on(workspace, host, directory, window, cx)
+                    .detach_and_log_err(cx);
             });
         })
         .entry("New Workspace…", None, move |window, cx| {
-            let (workspace, project) = new_workspace.clone();
-            window.defer(cx, move |window, cx| {
-                let modal_workspace = workspace.clone();
-                if let Err(error) = workspace.update(cx, |workspace, cx| {
-                    workspace.toggle_modal(window, cx, move |window, cx| {
-                        NewWorkspaceModal::new(&project, modal_workspace, window, cx)
-                    });
-                }) {
-                    log::debug!("Paseo workspace closed: {error}");
-                }
+            let (workspace, directory, host) = new_workspace.clone();
+            crate::defer_workspace_update(workspace, window, cx, move |workspace, window, cx| {
+                open_new_workspace(workspace, Some((directory, host)), window, cx);
             });
         })
         .entry("Paseo Worktrees…", None, move |window, cx| {
             let (workspace, project_id) = worktrees_handle.clone();
-            window.defer(cx, move |window, cx| {
-                if let Err(error) = workspace.update(cx, |workspace, cx| {
-                    worktrees::open_worktrees(workspace, &project_id, window, cx);
-                }) {
-                    log::debug!("Paseo workspace closed: {error}");
-                }
+            crate::defer_workspace_update(workspace, window, cx, move |workspace, window, cx| {
+                worktrees::open_worktrees(workspace, &project_id, window, cx);
             });
         })
         .separator()
@@ -937,9 +1301,13 @@ pub(crate) fn project_menu(
                 move |name, _, cx| {
                     let project_id = project_id.clone();
                     let name = Some(name.trim().to_owned()).filter(|name| !name.is_empty());
-                    request(cx, move |session| async move {
-                        session.rename_project(&project_id, name.as_deref()).await
-                    });
+                    request_on(
+                        crate::hosts::store_for_project(&project_id, cx),
+                        cx,
+                        move |session| async move {
+                            session.rename_project(&project_id, name.as_deref()).await
+                        },
+                    );
                 },
                 window,
                 cx,
@@ -950,9 +1318,11 @@ pub(crate) fn project_menu(
         })
         .entry("Use Automatic Icon", None, move |_, cx| {
             let project_id = automatic_icon.clone();
-            request(cx, move |session| async move {
-                session.set_project_icon(&project_id, None).await
-            });
+            request_on(
+                crate::hosts::store_for_project(&project_id, cx),
+                cx,
+                move |session| async move { session.set_project_icon(&project_id, None).await },
+            );
         })
         .separator()
         .entry("Copy Path", None, move |_, cx| {
@@ -982,14 +1352,22 @@ pub(crate) fn project_menu(
                 &detail,
                 "Remove",
                 move |cx| {
-                    request(cx, move |session| async move {
-                        session.remove_project(&project_id).await
-                    })
+                    request_on(
+                        crate::hosts::store_for_project(&project_id, cx),
+                        cx,
+                        move |session| async move { session.remove_project(&project_id).await },
+                    )
                 },
                 window,
                 cx,
             );
         })
+}
+
+/// The host of a project, else the default host, for errors about it.
+fn project_host(project_id: &str, cx: &App) -> Entity<PaseoStore> {
+    crate::hosts::store_for_project(project_id, cx)
+        .unwrap_or_else(|| crate::hosts::default_store(cx))
 }
 
 /// Uploads an image chosen on this machine as the project's icon.
@@ -1006,7 +1384,7 @@ fn choose_project_icon(project_id: String, cx: &mut App) {
             Ok(Ok(None)) | Err(_) => return anyhow::Ok(()),
             Ok(Err(error)) => {
                 cx.update(|cx| {
-                    store(cx).update(cx, |store, cx| {
+                    project_host(&project_id, cx).update(cx, |store, cx| {
                         store.state.error = Some(format!("Could not choose an icon: {error}"));
                         cx.notify();
                     })
@@ -1021,10 +1399,10 @@ fn choose_project_icon(project_id: String, cx: &mut App) {
             .background_spawn(async move { std::fs::read(&path) })
             .await;
         cx.update(|cx| match bytes {
-            Ok(bytes) => request(cx, move |session| async move {
+            Ok(bytes) => request_on(crate::hosts::store_for_project(&project_id, cx), cx, move |session| async move {
                 session.set_project_icon(&project_id, Some(&bytes)).await
             }),
-            Err(error) => store(cx).update(cx, |store, cx| {
+            Err(error) => project_host(&project_id, cx).update(cx, |store, cx| {
                 store.state.error = Some(format!("Could not read the icon image: {error}"));
                 cx.notify();
             }),
@@ -1040,12 +1418,14 @@ pub(crate) fn add_project(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    let host = crate::hosts::default_store(cx);
     crate::command_center::pick_directory(
         workspace,
+        host.clone(),
         "Add a project: search directories, or type an absolute path…",
-        |directory, _, cx| {
+        move |directory, _, cx| {
             let cwd = directory.display().to_string();
-            request(cx, move |session| async move {
+            request_on(Some(host.clone()), cx, move |session| async move {
                 session.add_project(&cwd).await.map(drop)
             });
         },
@@ -1061,11 +1441,14 @@ pub(crate) fn new_project_directory(
     cx: &mut Context<Workspace>,
 ) {
     let handle = cx.weak_entity();
+    let host = crate::hosts::default_store(cx);
     crate::command_center::pick_directory(
         workspace,
+        host.clone(),
         "New project: choose the parent directory…",
         move |parent: PathBuf, window, cx| {
             let parent = parent.display().to_string();
+            let host = host.clone();
             prompt_from_menu(
                 handle.clone(),
                 "New project directory",
@@ -1077,7 +1460,7 @@ pub(crate) fn new_project_directory(
                         return;
                     }
                     let parent = parent.clone();
-                    request(cx, move |session| async move {
+                    request_on(Some(host.clone()), cx, move |session| async move {
                         session
                             .create_project_directory(&parent, &name)
                             .await
@@ -1096,7 +1479,7 @@ pub(crate) fn new_project_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     fn agent(id: &str, extra: Value) -> AgentSummary {
         AgentSummary {

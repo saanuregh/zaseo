@@ -69,6 +69,14 @@ fn last_finished_turn_edits(store: &PaseoStore, agent_id: &str) -> LastTurnEdits
     }
 }
 
+/// What the shown edits were collected from: the timeline's revision and whether the agent ran.
+fn timeline_signature(store: &PaseoStore, agent_id: &str) -> (u64, bool) {
+    (
+        store.state.timeline_revision(agent_id),
+        store.agent(agent_id).is_some_and(agent_is_running),
+    )
+}
+
 enum ViewState {
     Loading,
     Ready,
@@ -94,9 +102,10 @@ pub struct LastTurnView {
     editor: Entity<Editor>,
     multibuffer: Entity<MultiBuffer>,
     shown_edits: Option<Vec<TurnFileEdits>>,
-    /// Entry count and running state when the edits were last collected; the store notifies on
-    /// every streamed chunk of any agent, and collecting walks the whole timeline.
-    timeline_signature: Option<(usize, bool)>,
+    /// Timeline revision and running state when the edits were last collected; the store
+    /// notifies on every streamed chunk of any agent, and collecting walks the whole timeline.
+    /// The revision also changes when entries are replaced in place.
+    timeline_signature: Option<(u64, bool)>,
     state: ViewState,
     file_count: usize,
     load_task: Option<Task<()>>,
@@ -106,12 +115,12 @@ pub struct LastTurnView {
 
 impl LastTurnView {
     fn new(
+        store: Entity<PaseoStore>,
         agent_id: String,
         project: Entity<Project>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let store = crate::store(cx);
         let multibuffer = cx.new(|cx| {
             let mut multibuffer = MultiBuffer::new(Capability::ReadWrite);
             multibuffer.set_all_diff_hunks_expanded(cx);
@@ -170,8 +179,8 @@ impl LastTurnView {
             }
             return;
         }
-        let running = store.agent(&self.agent_id).is_some_and(agent_is_running);
-        let signature = (store.entries_for(&self.agent_id).count(), running);
+        let signature = timeline_signature(store, &self.agent_id);
+        let running = signature.1;
         let was_running = self
             .timeline_signature
             .is_some_and(|(_, was_running)| was_running);
@@ -179,7 +188,7 @@ impl LastTurnView {
             return;
         }
         self.timeline_signature = Some(signature);
-        // Chunks of a running turn change the entry count, but not the turn before it.
+        // Chunks of a running turn change the timeline, but not the turn before it.
         if running && was_running && self.shown_edits.is_some() {
             return;
         }
@@ -288,15 +297,6 @@ impl LastTurnView {
             Some(agent_title) => format!("Last turn · {agent_title}").into(),
             None => "Last turn".into(),
         }
-    }
-
-    fn render_message(message: impl Into<SharedString>, cx: &App) -> AnyElement {
-        Self::centered(
-            Label::new(message.into())
-                .color(Color::Muted)
-                .into_any_element(),
-            cx,
-        )
     }
 
     fn centered(content: AnyElement, cx: &App) -> AnyElement {
@@ -559,26 +559,34 @@ impl Render for LastTurnView {
             }
             // Only a failed file load can be retried; a disconnected host reloads on reconnect.
             ViewState::Failed(error) if self.shown_edits.is_some() => Self::centered(
-                v_flex()
-                    .items_center()
-                    .gap_2()
-                    .child(Label::new(error.clone()).color(Color::Muted))
-                    .child(
-                        Button::new("paseo-last-turn-retry", "Retry")
-                            .style(ButtonStyle::Filled)
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                if let Some(edits) = view.shown_edits.clone() {
-                                    view.load(edits, window, cx);
-                                }
-                            })),
-                    )
-                    .into_any_element(),
+                crate::render_error(
+                    "Unable to load the last turn",
+                    error.clone(),
+                    Some(
+                        h_flex()
+                            .child(
+                                Button::new("paseo-last-turn-retry", "Try again")
+                                    .style(ButtonStyle::Filled)
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        if let Some(edits) = view.shown_edits.clone() {
+                                            view.load(edits, window, cx);
+                                        }
+                                    })),
+                            )
+                            .into_any_element(),
+                    ),
+                    cx,
+                ),
                 cx,
             ),
-            ViewState::Failed(error) => Self::render_message(error.clone(), cx),
-            ViewState::Ready if self.file_count == 0 => {
-                Self::render_message("The last turn changed no files", cx)
-            }
+            ViewState::Failed(error) => Self::centered(
+                crate::render_error("Unable to load the last turn", error.clone(), None, cx),
+                cx,
+            ),
+            ViewState::Ready if self.file_count == 0 => Self::centered(
+                crate::render_message("The last turn changed no files", None, None),
+                cx,
+            ),
             ViewState::Ready => self.editor.clone().into_any_element(),
         }
     }
@@ -723,19 +731,20 @@ impl Item for LastTurnView {
 
 /// Opens the current agent's latest finished turn as a diff tab, reusing its open tab.
 pub fn open_last_turn(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
-    let Some(agent_id) = crate::current_agent_id(workspace, cx) else {
+    let Some((store, agent_id)) = crate::current_agent(workspace, cx) else {
         workspace.show_error(anyhow!("Open a Paseo agent to review its last turn"), cx);
         return;
     };
-    let existing = workspace
-        .items_of_type::<LastTurnView>(cx)
-        .find(|view| view.read(cx).agent_id == agent_id);
+    let existing = workspace.items_of_type::<LastTurnView>(cx).find(|view| {
+        let view = view.read(cx);
+        view.agent_id == agent_id && view.store == store
+    });
     if let Some(existing) = existing {
         workspace.activate_item(&existing, true, true, window, cx);
         return;
     }
     let project = workspace.project().clone();
-    let view = cx.new(|cx| LastTurnView::new(agent_id, project, window, cx));
+    let view = cx.new(|cx| LastTurnView::new(store, agent_id, project, window, cx));
     workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
 }
 
@@ -848,6 +857,19 @@ mod tests {
         };
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].path, "/project/main.rs");
+    }
+
+    #[test]
+    fn last_turn_notices_an_entry_replaced_in_place() {
+        let mut store = PaseoStore::default();
+        store.state.insert_entry(edit_entry(5));
+        let before = timeline_signature(&store, "agent");
+        store.state.insert_entry(timeline_entry(
+            5,
+            json!({"type":"user_message","text":"Replaced"}),
+        ));
+        assert_eq!(store.entries_for("agent").count(), 1);
+        assert_ne!(timeline_signature(&store, "agent"), before);
     }
 
     #[test]

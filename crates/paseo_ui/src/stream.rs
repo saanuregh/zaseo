@@ -7,7 +7,8 @@ use markdown::{MarkdownFont, MarkdownStyle};
 use paseo_client::{PermissionRequest, RewindMode};
 use serde_json::Value;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 use ui::{
     CommonAnimationExt, ContextMenu, ContextMenuEntry, CopyButton, ElevationIndex, IconButton,
@@ -19,9 +20,9 @@ use theme_settings::ThemeSettings;
 
 use crate::agent_view::{AgentView, OpenedSection, Row, RowIdentity, content_max_width};
 use crate::timeline::{
-    DiffLineKind, FileChange, NoticeLevel, StreamContent, StreamItem, ToolCall, ToolKind,
-    ToolStatus, diff_stat, edit_diff_lines, format_duration, format_message_time,
-    parse_subagent_log, tool_display, turn_text,
+    DiffLineKind, FileChange, NoticeLevel, StreamContent, StreamItem, TodoEntry, ToolCall,
+    ToolDisplay, ToolKind, ToolStatus, diff_stat, edit_diff_lines, format_duration,
+    format_message_time, parse_subagent_log, tool_display,
 };
 
 const MARKDOWN_BODY: u8 = 0;
@@ -179,6 +180,35 @@ enum ExpandableStyle {
     ToolGroup,
 }
 
+/// A tool call's header, worked out when rows are built because rows re-render every frame
+/// while an agent works, and a subagent's log can be long.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ToolSummary {
+    pub(crate) display: ToolDisplay,
+    pub(crate) subagent_action_count: usize,
+}
+
+/// The header of a tool call: its label, with a running subagent's latest action after its
+/// summary.
+pub(crate) fn tool_summary(call: &ToolCall, cwd: Option<&Path>) -> ToolSummary {
+    let mut display = tool_display(call, cwd);
+    let subagent_actions = (display.kind == ToolKind::SubAgent)
+        .then(|| parse_subagent_log(detail_str(&call.detail, "log").unwrap_or_default()).0);
+    if call.status == ToolStatus::Running
+        && let Some(latest) = subagent_actions.as_ref().and_then(|actions| actions.last())
+    {
+        let latest = latest.describe();
+        display.summary = Some(match display.summary.take() {
+            Some(description) => format!("{description} · {latest}"),
+            None => latest,
+        });
+    }
+    ToolSummary {
+        display,
+        subagent_action_count: subagent_actions.as_ref().map_or(0, Vec::len),
+    }
+}
+
 /// Items that render as a collapsed summary row with expandable details.
 pub(crate) fn is_expandable(item: &StreamItem) -> bool {
     matches!(
@@ -313,7 +343,7 @@ impl AgentView {
             return;
         };
         workspace.update(cx, |workspace, cx| {
-            crate::fork_agent(workspace, &agent_id, window, cx)
+            crate::fork_agent(workspace, self.store.clone(), &agent_id, window, cx)
         });
     }
 
@@ -451,7 +481,14 @@ impl AgentView {
         });
     }
 
-    fn markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
+    /// The chat's markdown style from this render, or a new one outside a render.
+    fn chat_markdown_style(&self, window: &Window, cx: &App) -> MarkdownStyle {
+        self.markdown_style
+            .clone()
+            .unwrap_or_else(|| Self::build_markdown_style(window, cx))
+    }
+
+    pub(crate) fn build_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
         let font_size = crate::chat_font_size(cx);
         let chat = &crate::PaseoSettings::get_global(cx).chat;
         let mut style = MarkdownStyle::themed(MarkdownFont::Editor, window, cx);
@@ -465,16 +502,12 @@ impl AgentView {
         style.paragraph_line_height = relative(chat.line_height);
         style.paragraph_spacing = font_size * 0.7;
         style.list_spacing = font_size * 0.35;
-        // Prose and code share a monospace font here, so inline code needs its own colour to
-        // stand out; the theme's function colour reads as code in any theme.
+        // Code reads as code from its font and tint, like Zed's agent panel. Sized in rems of
+        // the chat, it follows the chat font size and zoom instead of the editor's size.
         let colors = cx.theme().colors();
-        style.inline_code.color = cx
-            .theme()
-            .syntax()
-            .style_for_name("function")
-            .and_then(|highlight| highlight.color)
-            .or(Some(colors.text_accent));
-        style.inline_code.background_color = Some(colors.editor_foreground.opacity(0.1));
+        style.inline_code.color = Some(colors.text);
+        style.inline_code.background_color = Some(colors.editor_foreground.opacity(0.08));
+        style.inline_code.font_size = Some(rems(0.9).into());
         // A symbol span stays styled as code; it is a link only to its click.
         style.link_callback = Some(std::rc::Rc::new(|url, _| {
             url.starts_with(crate::agent_view::SYMBOL_LINK_SCHEME)
@@ -490,7 +523,8 @@ impl AgentView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(row) = self.rows.get(index).cloned() else {
+        let rows = self.rows.clone();
+        let Some(row) = rows.get(index) else {
             return div().into_any_element();
         };
         let identity = row.identity();
@@ -502,7 +536,7 @@ impl AgentView {
                 .child(
                     ui::Button::new(
                         "paseo-load-older",
-                        if loading {
+                        if *loading {
                             "Loading earlier messages…"
                         } else {
                             "Load earlier messages"
@@ -510,21 +544,16 @@ impl AgentView {
                     )
                     .label_size(LabelSize::Default)
                     .color(Color::Muted)
-                    .disabled(loading)
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        if let Some(agent_id) = view.agent_id.clone() {
-                            view.store
-                                .update(cx, |store, cx| store.load_older(&agent_id, cx));
-                        }
-                    })),
+                    .disabled(*loading)
+                    .on_click(cx.listener(|view, _, _, cx| view.load_older(cx))),
                 )
                 .into_any_element(),
             Row::Item {
                 item,
+                tool,
                 expanded,
                 streaming,
-                ..
-            } => self.render_item(&item, expanded, streaming, window, cx),
+            } => self.render_item(item, tool.as_deref(), *expanded, *streaming, window, cx),
             Row::ToolGroup {
                 key,
                 label,
@@ -532,83 +561,101 @@ impl AgentView {
                 failed,
                 expanded,
             } => self.render_expandable(
-                key,
+                *key,
                 IconName::ToolHammer,
-                label.into(),
+                label.clone().into(),
                 None,
                 None,
-                running,
-                failed,
-                expanded,
+                *running,
+                *failed,
+                *expanded,
                 None,
                 ExpandableStyle::ToolGroup,
                 cx,
             ),
             Row::TurnFooter {
-                turn,
+                first_item_key,
+                has_text,
                 duration_seconds,
                 finished_at,
-                ..
-            } => self.render_turn_footer(turn, duration_seconds, finished_at, cx),
-            Row::Working { since, spinner } => {
-                let elapsed = since
-                    .map(|since| (chrono::Utc::now() - since).num_seconds())
-                    .filter(|seconds| *seconds >= 0)
-                    .map(format_duration);
-                h_flex()
-                    .py_1p5()
-                    .gap_1p5()
-                    .when(spinner, |this| {
-                        this.child(
-                            Icon::new(IconName::LoadCircle)
-                                .size(IconSize::Small)
-                                .color(Color::Muted)
-                                .with_rotate_animation(2),
-                        )
-                    })
-                    .child(shimmer_label(
-                        "paseo-working-shimmer",
-                        match elapsed {
-                            Some(elapsed) => format!("Working · {elapsed}").into(),
-                            None => "Working".into(),
-                        },
-                        cx,
-                    ))
-                    .when(!self.is_subagent(), |this| {
-                        this.child(
-                            Label::new("Esc to interrupt")
-                                .size(LabelSize::XSmall)
-                                .color(Color::Placeholder),
-                        )
-                    })
-                    .into_any_element()
-            }
+            } => self.render_turn_footer(
+                *first_item_key,
+                *has_text,
+                *duration_seconds,
+                *finished_at,
+                cx,
+            ),
+            Row::Working { since, spinner } => self.render_working(*since, *spinner, cx),
             Row::Changes {
                 files,
                 expanded,
                 show_all,
-            } => self.render_changes(&files, &expanded, show_all, cx),
+            } => self.render_changes(files, expanded, *show_all, cx),
             Row::Spacer => div().h(rems_from_px(16_f32)).into_any_element(),
             Row::TurnFold {
                 key,
                 duration_seconds,
                 expanded,
-            } => self.render_turn_fold(key, duration_seconds, expanded, cx),
+            } => self.render_turn_fold(*key, *duration_seconds, *expanded, cx),
         };
         let appeared_at =
             identity.and_then(|identity| self.row_appeared_at.get(&identity).copied());
         fade_in_since(
-            h_flex().w_full().justify_center().px_4().child(
-                v_flex()
-                    .w_full()
-                    .max_w(content_max_width(cx))
-                    .min_w_0()
-                    .child(content),
-            ),
+            h_flex()
+                .debug_selector(|| format!("paseo-chat-row-{index}"))
+                .w_full()
+                .justify_center()
+                .px_4()
+                .child(
+                    v_flex()
+                        .w_full()
+                        .max_w(content_max_width(cx))
+                        .min_w_0()
+                        .child(content),
+                ),
             ("paseo-row-entrance", entrance_key(identity)),
             appeared_at,
             px(4.),
         )
+    }
+
+    fn render_working(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        spinner: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let elapsed = since
+            .map(|since| (chrono::Utc::now() - since).num_seconds())
+            .filter(|seconds| *seconds >= 0)
+            .map(format_duration);
+        h_flex()
+            .py_1p5()
+            .gap_1p5()
+            .when(spinner, |this| {
+                this.child(
+                    Icon::new(IconName::LoadCircle)
+                        .size(IconSize::Small)
+                        .color(Color::Muted)
+                        .with_rotate_animation(2),
+                )
+            })
+            .child(shimmer_label(
+                "paseo-working-shimmer",
+                match elapsed {
+                    Some(elapsed) => format!("Working · {elapsed}").into(),
+                    None => "Working".into(),
+                },
+                cx,
+            ))
+            .when(!self.is_subagent(), |this| {
+                this.child(
+                    Label::new("Esc to interrupt")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Placeholder),
+                )
+            })
+            .into_any_element()
     }
 
     /// A finished turn's "Worked for" line: a click shows or hides the steps before its answer.
@@ -650,121 +697,36 @@ impl AgentView {
 
     fn render_item(
         &mut self,
-        item: &StreamItem,
+        item: &Rc<StreamItem>,
+        tool: Option<&ToolSummary>,
         expanded: bool,
         streaming: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let colors = cx.theme().colors().clone();
         match &item.content {
             StreamContent::User { text, message_id } => {
-                let rewind = message_id
-                    .clone()
-                    .filter(|_| !self.rewind_modes(cx).is_empty())
-                    .map(|message_id| {
-                        self.render_rewind_menu(item.key, message_id, text.clone(), cx)
-                    });
-                let markdown = self.markdown_for(item.key, MARKDOWN_BODY, text, cx);
-                let group = SharedString::from(format!("paseo-user-{}", item.key));
-                let copy_text = text.clone();
-                let timestamp = item
-                    .timestamp
-                    .map(|timestamp| {
-                        format_message_time(
-                            timestamp.with_timezone(&chrono::Local),
-                            chrono::Local::now(),
-                        )
-                    })
-                    .unwrap_or_default();
-                let sent_images = message_id
-                    .as_ref()
-                    .and_then(|message_id| self.store.read(cx).sent_images.get(message_id))
-                    .cloned()
-                    .unwrap_or_default();
-                let show_bubble = !text.trim().is_empty() || sent_images.is_empty();
-                let fixed_width = needs_fixed_bubble_width(text);
-                v_flex()
-                    .id(("paseo-user-message", item.key))
-                    .group(group.clone())
-                    .w_full()
-                    .items_end()
-                    .pt_3()
-                    .gap_0p5()
-                    .when(!sent_images.is_empty(), |column| {
-                        column.child(
-                            h_flex()
-                                .gap_1p5()
-                                .flex_wrap()
-                                .justify_end()
-                                .max_w(relative(0.85))
-                                .children(sent_images.into_iter().map(|image| {
-                                    div()
-                                        .rounded(rems_from_px(CARD_RADIUS))
-                                        .overflow_hidden()
-                                        .border_1()
-                                        .border_color(colors.border)
-                                        .child(
-                                            gpui::img(image)
-                                                .max_w(rems_from_px(240_f32))
-                                                .max_h(rems_from_px(180_f32))
-                                                .object_fit(gpui::ObjectFit::Contain),
-                                        )
-                                })),
-                        )
-                    })
-                    .when(show_bubble, |column| {
-                        column.child(
-                            div()
-                                .min_w_0()
-                                .max_w(relative(0.85))
-                                .when(fixed_width, |bubble| bubble.w(relative(0.85)))
-                                .px_4()
-                                .py_2p5()
-                                .rounded(rems_from_px(CARD_RADIUS))
-                                .rounded_tr(rems_from_px(4_f32))
-                                .map(|bubble| raised_card(bubble, cx))
-                                .child(
-                                    self.markdown_element(
-                                        markdown,
-                                        Self::markdown_style(window, cx),
-                                    ),
-                                ),
-                        )
-                    })
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .h(rems_from_px(20_f32))
-                            .visible_on_hover(group)
-                            .child(
-                                Label::new(timestamp)
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                            .children(rewind)
-                            .child(CopyButton::new(
-                                SharedString::from(format!("paseo-copy-user-{}", item.key)),
-                                copy_text,
-                            )),
-                    )
-                    .into_any_element()
+                self.render_user_message(item, text, message_id.as_deref(), window, cx)
             }
             StreamContent::Assistant { text } => {
-                let markdown = self.markdown_for(item.key, MARKDOWN_BODY, text, cx);
+                let markdown = self.markdown_for(item, MARKDOWN_BODY, text, cx);
                 div()
                     .w_full()
                     .py_1p5()
-                    .child(self.markdown_element(markdown, Self::markdown_style(window, cx)))
+                    .child(self.markdown_element(
+                        markdown,
+                        self.chat_markdown_style(window, cx),
+                        cx,
+                    ))
                     .into_any_element()
             }
             StreamContent::Reasoning { text } => {
                 let body = expanded.then(|| {
-                    let markdown = self.markdown_for(item.key, MARKDOWN_DETAIL, text, cx);
-                    let mut style = Self::markdown_style(window, cx);
-                    style.base_text_style.color = colors.text_muted;
+                    let markdown = self.markdown_for(item, MARKDOWN_DETAIL, text, cx);
+                    let mut style = self.chat_markdown_style(window, cx);
+                    style.base_text_style.color = cx.theme().colors().text_muted;
                     div()
-                        .child(self.markdown_element(markdown, style))
+                        .child(self.markdown_element(markdown, style, cx))
                         .into_any_element()
                 });
                 self.render_expandable(
@@ -781,129 +743,176 @@ impl AgentView {
                     cx,
                 )
             }
-            StreamContent::Tool(call) => self.render_tool(item.key, call, expanded, window, cx),
-            StreamContent::Todo { items } => {
-                let completed = items.iter().filter(|entry| entry.completed).count();
-                let current = items
-                    .iter()
-                    .find(|entry| entry.in_progress)
-                    .or_else(|| items.iter().find(|entry| !entry.completed))
-                    .map(|entry| entry.text.clone());
-                let body = expanded.then(|| {
-                    v_flex()
-                        .gap_1()
-                        .children(items.iter().map(|entry| {
-                            h_flex()
-                                .gap_2()
-                                .child(
-                                    Icon::new(if entry.completed {
-                                        IconName::TodoComplete
-                                    } else if entry.in_progress {
-                                        IconName::TodoProgress
-                                    } else {
-                                        IconName::TodoPending
-                                    })
-                                    .size(IconSize::Small)
-                                    .color(
-                                        if entry.completed {
-                                            Color::Success
-                                        } else if entry.in_progress {
-                                            Color::Accent
-                                        } else {
-                                            Color::Muted
-                                        },
-                                    ),
-                                )
-                                .child(
-                                    Label::new(entry.text.clone())
-                                        .size(LabelSize::Default)
-                                        .color(if entry.completed {
-                                            Color::Muted
-                                        } else {
-                                            Color::Default
-                                        })
-                                        .when(entry.completed, |label| label.strikethrough()),
-                                )
-                        }))
-                        .into_any_element()
-                });
-                self.render_expandable(
-                    item.key,
-                    IconName::ListTodo,
-                    format!("Tasks {completed}/{}", items.len()).into(),
-                    current,
-                    None,
-                    false,
-                    false,
-                    expanded,
-                    body,
-                    ExpandableStyle::Bordered,
-                    cx,
-                )
-            }
-            StreamContent::Notice { level, message } => {
-                let status = cx.theme().status();
-                let (icon, color, background) = match level {
-                    NoticeLevel::Info => (IconName::Info, Color::Info, status.info_background),
-                    NoticeLevel::Warning => {
-                        (IconName::Warning, Color::Warning, status.warning_background)
-                    }
-                    NoticeLevel::Error => {
-                        (IconName::XCircle, Color::Error, status.error_background)
-                    }
-                };
-                h_flex()
-                    .my_1()
-                    .px_3()
-                    .py_2p5()
-                    .gap_2()
-                    .items_start()
-                    .rounded_md()
-                    .bg(background)
-                    .child(Icon::new(icon).size(IconSize::Small).color(color))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_ui(cx)
-                            .text_color(colors.text)
-                            .child(message.clone()),
-                    )
-                    .into_any_element()
-            }
+            StreamContent::Tool(call) => self.render_tool(item, call, tool, expanded, window, cx),
+            StreamContent::Todo { items } => self.render_todo(item.key, items, expanded, cx),
+            StreamContent::Notice { level, message } => render_notice(*level, message, cx),
             StreamContent::Compaction {
                 loading,
                 pre_tokens,
-            } => {
-                let label = if *loading {
-                    "Compacting…".to_owned()
-                } else {
-                    match pre_tokens {
-                        Some(tokens) => format!(
-                            "Context compacted ({})",
-                            crate::composer::format_tokens(*tokens)
-                        ),
-                        None => "Context compacted".to_owned(),
-                    }
-                };
-                h_flex()
-                    .py_3()
-                    .gap_2()
-                    .child(div().flex_1().h_px().bg(colors.border_variant))
-                    .child(
-                        Icon::new(if *loading {
-                            IconName::LoadCircle
-                        } else {
-                            IconName::Scissors
-                        })
-                        .size(IconSize::Small)
-                        .color(Color::Muted),
-                    )
-                    .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
-                    .child(div().flex_1().h_px().bg(colors.border_variant))
-                    .into_any_element()
-            }
+            } => render_compaction(*loading, *pre_tokens, cx),
         }
+    }
+
+    fn render_user_message(
+        &mut self,
+        item: &Rc<StreamItem>,
+        text: &str,
+        message_id: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let rewind = message_id
+            .filter(|_| !self.rewind_modes(cx).is_empty())
+            .map(|message_id| {
+                self.render_rewind_menu(item.key, message_id.to_owned(), text.to_owned(), cx)
+            });
+        let markdown = self.markdown_for(item, MARKDOWN_BODY, text, cx);
+        let group = SharedString::from(format!("paseo-user-{}", item.key));
+        let copy_text = text.to_owned();
+        let timestamp = item
+            .timestamp
+            .map(|timestamp| {
+                format_message_time(
+                    timestamp.with_timezone(&chrono::Local),
+                    chrono::Local::now(),
+                )
+            })
+            .unwrap_or_default();
+        let sent_images = message_id
+            .and_then(|message_id| self.store.read(cx).sent_images.get(message_id))
+            .cloned()
+            .unwrap_or_default();
+        let show_bubble = !text.trim().is_empty() || sent_images.is_empty();
+        let fixed_width = needs_fixed_bubble_width(text);
+        v_flex()
+            .id(("paseo-user-message", item.key))
+            .group(group.clone())
+            .w_full()
+            .items_end()
+            .pt_3()
+            .gap_0p5()
+            .when(!sent_images.is_empty(), |column| {
+                column.child(
+                    h_flex()
+                        .gap_1p5()
+                        .flex_wrap()
+                        .justify_end()
+                        .max_w(relative(0.85))
+                        .children(sent_images.into_iter().map(|image| {
+                            div()
+                                .rounded(rems_from_px(CARD_RADIUS))
+                                .overflow_hidden()
+                                .border_1()
+                                .border_color(colors.border)
+                                .child(
+                                    gpui::img(image)
+                                        .max_w(rems_from_px(240_f32))
+                                        .max_h(rems_from_px(180_f32))
+                                        .object_fit(gpui::ObjectFit::Contain),
+                                )
+                        })),
+                )
+            })
+            .when(show_bubble, |column| {
+                column.child(
+                    div()
+                        .min_w_0()
+                        .max_w(relative(0.85))
+                        .when(fixed_width, |bubble| bubble.w(relative(0.85)))
+                        .px_4()
+                        .py_2p5()
+                        .rounded(rems_from_px(CARD_RADIUS))
+                        .rounded_tr(rems_from_px(4_f32))
+                        .map(|bubble| raised_card(bubble, cx))
+                        .child(self.markdown_element(
+                            markdown,
+                            self.chat_markdown_style(window, cx),
+                            cx,
+                        )),
+                )
+            })
+            .child(
+                h_flex()
+                    .gap_1()
+                    .h(rems_from_px(20_f32))
+                    .visible_on_hover(group)
+                    .child(
+                        Label::new(timestamp)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .children(rewind)
+                    .child(CopyButton::new(
+                        SharedString::from(format!("paseo-copy-user-{}", item.key)),
+                        copy_text,
+                    )),
+            )
+            .into_any_element()
+    }
+
+    fn render_todo(
+        &mut self,
+        key: u64,
+        items: &[TodoEntry],
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let completed = items.iter().filter(|entry| entry.completed).count();
+        let current = items
+            .iter()
+            .find(|entry| entry.in_progress)
+            .or_else(|| items.iter().find(|entry| !entry.completed))
+            .map(|entry| entry.text.clone());
+        let body = expanded.then(|| {
+            v_flex()
+                .gap_1()
+                .children(items.iter().map(|entry| {
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Icon::new(if entry.completed {
+                                IconName::TodoComplete
+                            } else if entry.in_progress {
+                                IconName::TodoProgress
+                            } else {
+                                IconName::TodoPending
+                            })
+                            .size(IconSize::Small)
+                            .color(if entry.completed {
+                                Color::Success
+                            } else if entry.in_progress {
+                                Color::Accent
+                            } else {
+                                Color::Muted
+                            }),
+                        )
+                        .child(
+                            Label::new(entry.text.clone())
+                                .size(LabelSize::Default)
+                                .color(if entry.completed {
+                                    Color::Muted
+                                } else {
+                                    Color::Default
+                                })
+                                .when(entry.completed, |label| label.strikethrough()),
+                        )
+                }))
+                .into_any_element()
+        });
+        self.render_expandable(
+            key,
+            IconName::ListTodo,
+            format!("Tasks {completed}/{}", items.len()).into(),
+            current,
+            None,
+            false,
+            false,
+            expanded,
+            body,
+            ExpandableStyle::Bordered,
+            cx,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1068,26 +1077,24 @@ impl AgentView {
 
     fn render_tool(
         &mut self,
-        key: u64,
+        item: &Rc<StreamItem>,
         call: &ToolCall,
+        tool: Option<&ToolSummary>,
         expanded: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let cwd = self.directory(cx);
-        let mut display = tool_display(call, cwd.as_deref());
+        let key = item.key;
+        let summary;
+        let tool = match tool {
+            Some(tool) => tool,
+            None => {
+                summary = tool_summary(call, self.directory(cx).as_deref());
+                &summary
+            }
+        };
+        let display = &tool.display;
         let detail = &call.detail;
-        let subagent_actions = (display.kind == ToolKind::SubAgent)
-            .then(|| parse_subagent_log(detail_str(detail, "log").unwrap_or_default()).0);
-        if call.status == ToolStatus::Running
-            && let Some(latest) = subagent_actions.as_ref().and_then(|actions| actions.last())
-        {
-            let latest = latest.describe();
-            display.summary = Some(match display.summary.take() {
-                Some(description) => format!("{description} · {latest}"),
-                None => latest,
-            });
-        }
         let trailing = match display.kind {
             ToolKind::Edit => detail_str(detail, "unifiedDiff")
                 .map(diff_stat)
@@ -1122,12 +1129,9 @@ impl AgentView {
                         .color(Color::Error)
                         .into_any_element()
                 }),
-            ToolKind::SubAgent => Some(self.render_subagent_trailing(
-                key,
-                call,
-                subagent_actions.as_ref().map_or(0, Vec::len),
-                cx,
-            )),
+            ToolKind::SubAgent => {
+                Some(self.render_subagent_trailing(key, call, tool.subagent_action_count, cx))
+            }
             _ => None,
         };
         let open_file = matches!(
@@ -1158,12 +1162,12 @@ impl AgentView {
             ),
             (trailing, None) => trailing,
         };
-        let body = expanded.then(|| self.render_tool_detail(key, call, display.kind, window, cx));
+        let body = expanded.then(|| self.render_tool_detail(item, call, display.kind, window, cx));
         self.render_expandable(
             key,
             tool_icon(display.kind),
-            display.label.into(),
-            display.summary,
+            display.label.clone().into(),
+            display.summary.clone(),
             trailing,
             call.status == ToolStatus::Running,
             call.status == ToolStatus::Failed,
@@ -1231,7 +1235,7 @@ impl AgentView {
 
     fn render_tool_detail(
         &mut self,
-        key: u64,
+        item: &Rc<StreamItem>,
         call: &ToolCall,
         kind: ToolKind,
         window: &mut Window,
@@ -1276,9 +1280,12 @@ impl AgentView {
                     );
                 }
                 if let Some(result) = detail_str(detail, "result") {
-                    let markdown = self.markdown_for(key, MARKDOWN_DETAIL, result, cx);
-                    body = body
-                        .child(self.markdown_element(markdown, Self::markdown_style(window, cx)));
+                    let markdown = self.markdown_for(item, MARKDOWN_DETAIL, result, cx);
+                    body = body.child(self.markdown_element(
+                        markdown,
+                        self.chat_markdown_style(window, cx),
+                        cx,
+                    ));
                 }
             }
             ToolKind::SubAgent => {
@@ -1325,9 +1332,12 @@ impl AgentView {
             }
             ToolKind::Plan => {
                 if let Some(text) = detail_str(detail, "text") {
-                    let markdown = self.markdown_for(key, MARKDOWN_DETAIL, text, cx);
-                    body = body
-                        .child(self.markdown_element(markdown, Self::markdown_style(window, cx)));
+                    let markdown = self.markdown_for(item, MARKDOWN_DETAIL, text, cx);
+                    body = body.child(self.markdown_element(
+                        markdown,
+                        self.chat_markdown_style(window, cx),
+                        cx,
+                    ));
                 }
             }
             ToolKind::Thinking | ToolKind::Other => {
@@ -1341,7 +1351,12 @@ impl AgentView {
                         if let Some(value) = value.filter(|value| !value.is_null()) {
                             let text = match value {
                                 Value::String(text) => text.clone(),
-                                other => serde_json::to_string_pretty(other).unwrap_or_default(),
+                                other => {
+                                    serde_json::to_string_pretty(other).unwrap_or_else(|error| {
+                                        log::warn!("Paseo could not format tool {label}: {error}");
+                                        String::new()
+                                    })
+                                }
                             };
                             body = body
                                 .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
@@ -1543,31 +1558,30 @@ impl AgentView {
 
     fn render_turn_footer(
         &mut self,
-        turn: usize,
+        first_item_key: Option<u64>,
+        has_text: bool,
         duration_seconds: Option<i64>,
         finished_at: Option<chrono::DateTime<chrono::Utc>>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(range) = self.turns.get(turn).map(|turn| turn.items.clone()) else {
-            return div().into_any_element();
-        };
-        let text = self.items.get(range).map(turn_text).unwrap_or_default();
-        let has_agent_output = !text.is_empty() || duration_seconds.is_some();
+        let has_agent_output = has_text || duration_seconds.is_some();
         if !has_agent_output {
             return div().h(rems_from_px(4_f32)).into_any_element();
         }
+        let id = first_item_key.unwrap_or_default();
+        let copy_text = self.turn_copy_text(first_item_key).filter(|_| has_text);
         h_flex()
             .pb_2()
             .gap_1()
-            .when(!text.is_empty(), |this| {
+            .when_some(copy_text, |this, text| {
                 this.child(CopyButton::new(
-                    SharedString::from(format!("paseo-copy-turn-{turn}")),
+                    SharedString::from(format!("paseo-copy-turn-{id}")),
                     text,
                 ))
             })
             .when(!self.is_subagent(), |this| {
                 this.child(
-                    IconButton::new(("paseo-fork-turn", turn), IconName::GitBranchPlus)
+                    IconButton::new(("paseo-fork-turn", id), IconName::GitBranchPlus)
                         .icon_size(IconSize::XSmall)
                         .icon_color(Color::Muted)
                         .tooltip(Tooltip::text("Fork in a new tab"))
@@ -1644,6 +1658,64 @@ pub(crate) fn permission_preview(request: &PermissionRequest, cx: &App) -> Optio
         }
         None => None,
     }
+}
+
+fn render_notice(level: NoticeLevel, message: &str, cx: &App) -> AnyElement {
+    let status = cx.theme().status();
+    let (icon, color, background) = match level {
+        NoticeLevel::Info => (IconName::Info, Color::Info, status.info_background),
+        NoticeLevel::Warning => (IconName::Warning, Color::Warning, status.warning_background),
+        NoticeLevel::Error => (IconName::XCircle, Color::Error, status.error_background),
+    };
+    h_flex()
+        .my_1()
+        .px_3()
+        .py_2p5()
+        .gap_2()
+        .items_start()
+        .rounded_md()
+        .bg(background)
+        .child(Icon::new(icon).size(IconSize::Small).color(color))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_ui(cx)
+                .text_color(cx.theme().colors().text)
+                .child(message.to_owned()),
+        )
+        .into_any_element()
+}
+
+fn render_compaction(loading: bool, pre_tokens: Option<u64>, cx: &App) -> AnyElement {
+    let border = cx.theme().colors().border_variant;
+    let label = if loading {
+        "Compacting…".to_owned()
+    } else {
+        match pre_tokens {
+            Some(tokens) => format!(
+                "Context compacted ({})",
+                crate::composer::format_tokens(tokens)
+            ),
+            None => "Context compacted".to_owned(),
+        }
+    };
+    h_flex()
+        .py_3()
+        .gap_2()
+        .child(div().flex_1().h_px().bg(border))
+        .child(
+            Icon::new(if loading {
+                IconName::LoadCircle
+            } else {
+                IconName::Scissors
+            })
+            .size(IconSize::Small)
+            .color(Color::Muted),
+        )
+        .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+        .child(div().flex_1().h_px().bg(border))
+        .into_any_element()
 }
 
 /// Markdown lists lay out at zero width until given one (see `push_markdown_list_item`), and

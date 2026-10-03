@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    FontWeight, IntoElement, SharedString, Subscription, TaskExt, Window, prelude::*, px,
+    IntoElement, SharedString, Subscription, TaskExt, Window, prelude::*, px,
 };
 use paseo_client::{AgentSummary, PaseoWorktree, WorkspaceDescriptor};
 use std::collections::{BTreeMap, HashSet};
@@ -112,7 +112,8 @@ pub struct PaseoWorktreesView {
 
 impl PaseoWorktreesView {
     fn new(project_id: String, cx: &mut Context<Self>) -> Self {
-        let store = crate::store(cx);
+        let store = crate::hosts::store_for_project(&project_id, cx)
+            .unwrap_or_else(|| crate::hosts::default_store(cx));
         let store_subscription = cx.observe(&store, |_, _, cx| cx.notify());
         let mut view = Self {
             store,
@@ -227,25 +228,6 @@ impl PaseoWorktreesView {
         .detach_and_log_err(cx);
     }
 
-    fn render_message(message: impl Into<SharedString>) -> AnyElement {
-        Label::new(message.into())
-            .color(Color::Muted)
-            .into_any_element()
-    }
-
-    fn render_error(title: &str, error: String, cx: &App) -> AnyElement {
-        v_flex()
-            .p_4()
-            .gap_2()
-            .rounded(px(12.))
-            .border_1()
-            .border_color(cx.theme().status().error_border)
-            .bg(cx.theme().status().error_background)
-            .child(Label::new(title.to_owned()).weight(FontWeight::SEMIBOLD))
-            .child(Label::new(error).size(LabelSize::Small))
-            .into_any_element()
-    }
-
     fn render_row(&self, index: usize, row: WorktreeRow, cx: &mut Context<Self>) -> AnyElement {
         let archiving = self.archiving.contains(&row.path);
         let mut metadata = vec![row.branch.clone().unwrap_or_else(|| "detached".into())];
@@ -269,7 +251,7 @@ impl PaseoWorktreesView {
             .id(("paseo-worktree", index))
             .p_3()
             .gap_2()
-            .rounded(px(8.))
+            .rounded_md()
             .border_1()
             .border_color(cx.theme().colors().border_variant)
             .tooltip(Tooltip::text(full_path))
@@ -317,24 +299,24 @@ impl Render for PaseoWorktreesView {
         let project_name = self.project_name(cx);
         let loading = matches!(self.state, WorktreesState::Loading);
         let body = if project_name.is_none() {
-            Self::render_message("This project is not known to the host")
+            crate::render_message("This project is not known to the host", None, None)
         } else if !connected {
-            Self::render_message("Connect to this host to see its worktrees")
+            crate::render_message("Connect to this host to see its worktrees", None, None)
         } else {
             match &self.state {
                 WorktreesState::Loading => crate::render_loading("Loading worktrees…"),
                 WorktreesState::Failed(error) => {
-                    Self::render_error("Unable to load worktrees", error.clone(), cx)
+                    crate::render_error("Unable to load worktrees", error.clone(), None, cx)
                 }
                 WorktreesState::Loaded(worktrees) if worktrees.is_empty() => {
-                    Self::render_message("No Paseo worktrees")
+                    crate::render_message("No Paseo worktrees", None, None)
                 }
                 WorktreesState::Loaded(worktrees) => {
                     let store = self.store.read(cx);
                     let rows = worktree_rows(
                         worktrees,
                         &store.state.workspaces,
-                        &store.state.agents,
+                        store.state.agents(),
                         Utc::now(),
                     );
                     v_flex()
@@ -353,11 +335,11 @@ impl Render for PaseoWorktreesView {
                 .size(LabelSize::Small)
                 .color(Color::Success)
                 .into_any_element(),
-            Err(error) => Self::render_error("Unable to archive the worktree", error, cx),
+            Err(error) => crate::render_error("Unable to archive the worktree", error, None, cx),
         });
         div()
             .id("paseo-worktrees")
-            .key_context("PaseoWorktrees")
+            .key_context("PaseoWorktrees PaseoView")
             .track_focus(&self.focus_handle)
             .size_full()
             .overflow_y_scroll()

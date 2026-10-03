@@ -13,11 +13,14 @@ use ui::{ListItem, ListItemSpacing, prelude::*};
 use workspace::{ModalView, Workspace};
 
 use crate::composer::{BaseRef, Composer, base_ref_choices};
-use crate::store::{agent_bucket, agent_project_directory, agent_project_name, agent_updated_at};
+use crate::sidebar::WorkspaceAgentCounts;
+use crate::store::{
+    PaseoStore, agent_bucket, agent_project_directory, agent_project_name, agent_updated_at,
+};
 use crate::{
     ArchiveAgent, CopyAgentId, CycleMode, FocusComposer, ManageHosts, NewAgent, OpenHistory,
     OpenWorkspace, Reconnect, RenameAgent, ToggleGroupByStatus, ToggleModePicker,
-    ToggleModelPicker, TogglePanel, ToggleThinkingPicker, store,
+    ToggleModelPicker, TogglePanel, ToggleThinkingPicker,
 };
 
 /// A Paseo result for Zed's command palette: the text shown and matched, and what it does.
@@ -45,11 +48,11 @@ fn palette_results(
 ) -> Task<Vec<CommandInterceptItem>> {
     let query = query.trim().to_owned();
     if query.is_empty() {
-        return Task::ready(Vec::new());
+        return Task::ready(recent_agent_results(cx));
     }
     let current_agent = workspace
         .upgrade()
-        .and_then(|workspace| crate::current_agent_id(workspace.read(cx), cx));
+        .and_then(|workspace| crate::current_agent(workspace.read(cx), cx));
     let entries = palette_entries(current_agent, cx);
     let candidates = entries
         .iter()
@@ -117,7 +120,23 @@ fn pick_matches(
         .collect()
 }
 
-fn palette_entries(current_agent: Option<String>, cx: &App) -> Vec<PaletteEntry> {
+/// The most recently active agents, which the palette lists above its commands before anything is
+/// typed.
+fn recent_agent_results(cx: &App) -> Vec<CommandInterceptItem> {
+    agent_entries(Some(MAX_PLACE_RESULTS), cx)
+        .into_iter()
+        .map(|entry| CommandInterceptItem {
+            action: entry.action,
+            string: entry.label,
+            positions: Vec::new(),
+        })
+        .collect()
+}
+
+fn palette_entries(
+    current_agent: Option<(Entity<PaseoStore>, String)>,
+    cx: &App,
+) -> Vec<PaletteEntry> {
     let action = |label: &str, action: Box<dyn Action>| PaletteEntry {
         label: label.to_owned(),
         action,
@@ -152,8 +171,8 @@ fn palette_entries(current_agent: Option<String>, cx: &App) -> Vec<PaletteEntry>
         action("Manage hosts", Box::new(ManageHosts)),
         action("Reconnect to host", Box::new(Reconnect)),
     ];
-    if let Some(directory) = crate::terminal::agent_directory(current_agent, cx) {
-        for info in crate::terminal::terminals_for(&directory, cx) {
+    if let Some((store, directory)) = crate::terminal::agent_directory(current_agent, cx) {
+        for info in crate::terminal::terminals_for(&store, &directory, cx) {
             entries.push(PaletteEntry {
                 label: format!("Terminal: {}", crate::terminal::terminal_title(&info)),
                 action: Box::new(crate::OpenPaseoTerminal {
@@ -164,30 +183,76 @@ fn palette_entries(current_agent: Option<String>, cx: &App) -> Vec<PaletteEntry>
             });
         }
     }
-    let store = store(cx);
-    let store = store.read(cx);
-    let mut agents = store.state.agents.iter().collect::<Vec<_>>();
-    agents.sort_by_key(|agent| std::cmp::Reverse(agent_updated_at(agent)));
-    for agent in agents {
-        let has_permission = store
-            .state
-            .permissions
-            .values()
-            .any(|request| request.agent_id == agent.id);
-        entries.push(PaletteEntry {
-            label: format!(
-                "Agent: {} — {} · {}",
-                store.display_title(agent),
-                agent_project_name(agent),
-                agent_bucket(agent, has_permission).label()
-            ),
-            action: Box::new(crate::OpenAgentById {
-                agent_id: agent.id.clone(),
-            }),
-            is_agent_or_terminal: true,
-        });
-    }
+    entries.extend(agent_entries(None, cx));
     entries
+}
+
+/// Every host's agents, most recently active first, or only the first `limit` of them.
+fn agent_entries(limit: Option<usize>, cx: &App) -> Vec<PaletteEntry> {
+    let stores = crate::hosts::stores(cx);
+    let hosts = stores
+        .iter()
+        .map(|store| {
+            let store = store.read(cx);
+            (
+                store,
+                WorkspaceAgentCounts::new(store.state.agents()),
+                crate::attention::pending_permission_agents(store),
+            )
+        })
+        .collect::<Vec<_>>();
+    let agents = hosts
+        .iter()
+        .enumerate()
+        .flat_map(|(host, (store, _, _))| {
+            store.state.agents().iter().map(move |agent| (host, agent))
+        })
+        .collect::<Vec<_>>();
+    most_recent_first(agents, limit, |(_, agent)| agent_updated_at(agent))
+        .into_iter()
+        .filter_map(|(host, agent)| {
+            let (store, titles, pending) = hosts.get(host)?;
+            Some(PaletteEntry {
+                label: format!(
+                    "Agent: {} — {} · {}",
+                    titles.display_title(&store.state.workspaces, agent),
+                    agent_project_name(agent),
+                    agent_bucket(agent, pending.contains(agent.id.as_str())).label()
+                ),
+                action: Box::new(crate::OpenAgentById {
+                    agent_id: agent.id.clone(),
+                }),
+                is_agent_or_terminal: true,
+            })
+        })
+        .collect()
+}
+
+/// `items` by `updated_at`, latest first and in their listed order on ties, keeping only the first
+/// `limit` when there is one. A limit picks those before sorting them, so the rest are never
+/// sorted.
+fn most_recent_first<T>(
+    items: Vec<T>,
+    limit: Option<usize>,
+    updated_at: impl Fn(&T) -> Option<chrono::DateTime<chrono::Utc>>,
+) -> Vec<T> {
+    // The listed position breaks ties, so picking the first few matches a stable sort's order.
+    let mut keyed = items
+        .into_iter()
+        .enumerate()
+        .map(|(position, item)| ((std::cmp::Reverse(updated_at(&item)), position), item))
+        .collect::<Vec<_>>();
+    if let Some(limit) = limit
+        && limit < keyed.len()
+    {
+        if limit == 0 {
+            return Vec::new();
+        }
+        keyed.select_nth_unstable_by_key(limit - 1, |(key, _)| *key);
+        keyed.truncate(limit);
+    }
+    keyed.sort_unstable_by_key(|(key, _)| *key);
+    keyed.into_iter().map(|(_, item)| item).collect()
 }
 
 pub(crate) fn choose_directory(
@@ -196,8 +261,13 @@ pub(crate) fn choose_directory(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    let store = composer
+        .upgrade()
+        .map(|composer| composer.read(cx).store.clone())
+        .unwrap_or_else(|| crate::hosts::default_store(cx));
     pick_directory(
         workspace,
+        store,
         "Search directories, or type an absolute path…",
         move |directory, window, cx| {
             if let Err(error) = composer.update(cx, |composer, cx| {
@@ -212,37 +282,44 @@ pub(crate) fn choose_directory(
     );
 }
 
-/// Picks a directory on the Paseo host: recent project directories first, then the host's
+/// Picks a directory on `store`'s host: recent project directories first, then the host's
 /// suggestions for what is typed, or any typed absolute path.
 pub(crate) fn pick_directory(
     workspace: &mut Workspace,
+    store: Entity<PaseoStore>,
     placeholder: &'static str,
     on_choose: impl Fn(PathBuf, &mut Window, &mut App) + 'static,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
     let on_choose: Rc<dyn Fn(PathBuf, &mut Window, &mut App)> = Rc::new(on_choose);
+    let recent = recent_directories(workspace, &store, cx);
+    workspace.toggle_modal(window, cx, move |window, cx| {
+        DirectoryPicker::new(store, placeholder, on_choose, recent, window, cx)
+    });
+}
+
+/// The editor's folders on the local host, then the folders of `store`'s agents.
+pub(crate) fn recent_directories(
+    workspace: &Workspace,
+    store: &Entity<PaseoStore>,
+    cx: &App,
+) -> Vec<PathBuf> {
     let mut recent = BTreeSet::new();
-    if store(cx).read(cx).is_local_host() {
+    let store = store.read(cx);
+    if store.is_local_host() {
         for worktree in workspace.project().read(cx).visible_worktrees(cx) {
             recent.insert(worktree.read(cx).abs_path().to_path_buf());
         }
     }
-    {
-        let store = store(cx);
-        let store = store.read(cx);
-        let mut agents = store.state.agents.iter().collect::<Vec<_>>();
-        agents.sort_by_key(|agent| std::cmp::Reverse(agent_updated_at(agent)));
-        for agent in agents {
-            if let Some(directory) = agent_project_directory(agent) {
-                recent.insert(directory);
-            }
+    let mut agents = store.state.agents().iter().collect::<Vec<_>>();
+    agents.sort_by_cached_key(|agent| std::cmp::Reverse(agent_updated_at(agent)));
+    for agent in agents {
+        if let Some(directory) = agent_project_directory(agent) {
+            recent.insert(directory);
         }
     }
-    let recent = recent.into_iter().collect::<Vec<_>>();
-    workspace.toggle_modal(window, cx, move |window, cx| {
-        DirectoryPicker::new(placeholder, on_choose, recent, window, cx)
-    });
+    recent.into_iter().collect()
 }
 
 pub struct DirectoryPicker {
@@ -250,7 +327,8 @@ pub struct DirectoryPicker {
 }
 
 impl DirectoryPicker {
-    fn new(
+    pub(crate) fn new(
+        store: Entity<PaseoStore>,
         placeholder: &'static str,
         on_choose: Rc<dyn Fn(PathBuf, &mut Window, &mut App)>,
         recent: Vec<PathBuf>,
@@ -258,6 +336,7 @@ impl DirectoryPicker {
         cx: &mut Context<Self>,
     ) -> Self {
         let delegate = DirectoryPickerDelegate {
+            store,
             directory_picker: cx.weak_entity(),
             placeholder,
             on_choose,
@@ -291,6 +370,7 @@ impl EventEmitter<DismissEvent> for DirectoryPicker {}
 impl ModalView for DirectoryPicker {}
 
 pub struct DirectoryPickerDelegate {
+    store: Entity<PaseoStore>,
     directory_picker: WeakEntity<DirectoryPicker>,
     placeholder: &'static str,
     on_choose: Rc<dyn Fn(PathBuf, &mut Window, &mut App)>,
@@ -352,7 +432,7 @@ impl PickerDelegate for DirectoryPickerDelegate {
             .filter(|path| path.to_string_lossy().to_lowercase().contains(&lower))
             .cloned()
             .collect::<Vec<_>>();
-        let suggestions = store(cx).update(cx, |store, cx| {
+        let suggestions = self.store.update(cx, |store, cx| {
             store.directory_suggestions(query.clone(), None, false, true, cx)
         });
         cx.spawn_in(window, async move |picker, cx| {
@@ -464,8 +544,31 @@ pub(crate) fn choose_worktree_base(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    let store = composer
+        .upgrade()
+        .map(|composer| composer.read(cx).store.clone())
+        .unwrap_or_else(|| crate::hosts::default_store(cx));
     workspace.toggle_modal(window, cx, move |window, cx| {
+        BaseBranchPicker::new(store, composer, directory, selected, window, cx)
+    });
+}
+
+pub struct BaseBranchPicker {
+    picker: Entity<Picker<BaseBranchPickerDelegate>>,
+}
+
+impl BaseBranchPicker {
+    /// Picks the base branch for `composer`'s new worktree from `directory`'s branches.
+    pub(crate) fn new(
+        store: Entity<PaseoStore>,
+        composer: WeakEntity<Composer>,
+        directory: String,
+        selected: Option<BaseRef>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let delegate = BaseBranchPickerDelegate {
+            store,
             base_branch_picker: cx.weak_entity(),
             composer,
             directory,
@@ -478,12 +581,8 @@ pub(crate) fn choose_worktree_base(
         };
         let picker =
             cx.new(|cx| Picker::uniform_list(delegate, window, cx).initial_width(rems(30.)));
-        BaseBranchPicker { picker }
-    });
-}
-
-pub struct BaseBranchPicker {
-    picker: Entity<Picker<BaseBranchPickerDelegate>>,
+        Self { picker }
+    }
 }
 
 impl Render for BaseBranchPicker {
@@ -504,6 +603,7 @@ impl EventEmitter<DismissEvent> for BaseBranchPicker {}
 impl ModalView for BaseBranchPicker {}
 
 pub struct BaseBranchPickerDelegate {
+    store: Entity<PaseoStore>,
     base_branch_picker: WeakEntity<BaseBranchPicker>,
     composer: WeakEntity<Composer>,
     directory: String,
@@ -556,7 +656,7 @@ impl PickerDelegate for BaseBranchPickerDelegate {
     ) -> Task<()> {
         self.query = query.clone();
         let directory = self.directory.clone();
-        let suggestions = store(cx).update(cx, |store, cx| {
+        let suggestions = self.store.update(cx, |store, cx| {
             let query = query.clone();
             store.session_request(cx, move |session| async move {
                 session
@@ -713,6 +813,68 @@ mod tests {
         assert_eq!(
             picked.first().map(|(_, positions)| positions.clone()),
             Some(vec![0])
+        );
+    }
+
+    #[gpui::test]
+    fn empty_query_lists_recent_agents_first(cx: &mut gpui::TestAppContext) {
+        use settings::Settings as _;
+        let store = cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            crate::PaseoSettings::register(cx);
+            crate::hosts::init(cx);
+            crate::hosts::default_store(cx)
+        });
+        let agents = (0..MAX_PLACE_RESULTS + 2)
+            .map(|index| paseo_client::AgentSummary {
+                title: Some(format!("Task {index}")),
+                ..crate::store::test_agent(
+                    &format!("agent-{index}"),
+                    "idle",
+                    serde_json::json!({ "updatedAt": format!("2026-10-01T10:{index:02}:00Z") }),
+                )
+            })
+            .collect();
+        store.update(cx, |store, cx| {
+            store.handle_event(paseo_client::PaseoEvent::AgentsChanged(agents), cx)
+        });
+        let labels = cx.update(|cx| {
+            recent_agent_results(cx)
+                .into_iter()
+                .map(|item| item.string)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(labels.len(), MAX_PLACE_RESULTS);
+        assert!(labels[0].starts_with("Agent: Task 9"), "{labels:?}");
+        assert!(labels[7].starts_with("Agent: Task 2"), "{labels:?}");
+    }
+
+    #[test]
+    fn picking_the_most_recent_matches_a_full_sort() {
+        let time = |minute: u32| {
+            crate::timeline::parse_timestamp(&format!("2026-10-01T10:{minute:02}:00Z"))
+        };
+        // Ties and agents without a time keep their listed order, as a stable sort keeps them.
+        let items = [3, 7, 7, 1, 9, 0, 7, 4, 2, 9, 5]
+            .into_iter()
+            .enumerate()
+            .map(|(position, minute)| (position, (minute > 0).then(|| time(minute)).flatten()))
+            .collect::<Vec<_>>();
+        let mut sorted = items.clone();
+        sorted.sort_by_key(|(_, updated_at)| std::cmp::Reverse(*updated_at));
+        for limit in [0, 1, 4, MAX_PLACE_RESULTS, items.len(), items.len() + 2] {
+            let picked =
+                most_recent_first(items.clone(), Some(limit), |(_, updated_at)| *updated_at);
+            assert_eq!(
+                picked,
+                sorted.iter().take(limit).cloned().collect::<Vec<_>>(),
+                "limit {limit}"
+            );
+        }
+        assert_eq!(
+            most_recent_first(items, None, |(_, updated_at)| *updated_at),
+            sorted
         );
     }
 }

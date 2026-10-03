@@ -1571,7 +1571,9 @@
     "context": "Welcome",
     "use_key_equivalents": true,
     "bindings": {
-      "cmd-n": "workspace::NewFile",
+      // Here too, Zaseo's cmd-n starts a Paseo workspace; the Welcome page handles menu
+      // navigation, so the context-free menu binding would win over the Workspace one.
+      "cmd-n": "paseo_ui::NewAgentWorkspace",
       "cmd-=": ["zed::IncreaseUiFontSize", { "persist": false }],
       "cmd-+": ["zed::IncreaseUiFontSize", { "persist": false }],
       "cmd--": ["zed::DecreaseUiFontSize", { "persist": false }],
@@ -1776,34 +1778,57 @@
   {
     "context": "Workspace",
     "use_key_equivalents": true,
+    // Zaseo is agent-first, so these take Zed's New File, Project Symbols and pane focus keys
+    // everywhere; all three stay in the command palette.
+    "unbind": {
+      "cmd-n": "workspace::NewFile",
+      "cmd-t": "project_symbols::Toggle",
+      "cmd-1": ["workspace::ActivatePane", 0],
+      "cmd-2": ["workspace::ActivatePane", 1],
+      "cmd-3": ["workspace::ActivatePane", 2],
+      "cmd-4": ["workspace::ActivatePane", 3],
+      "cmd-5": ["workspace::ActivatePane", 4],
+      "cmd-6": ["workspace::ActivatePane", 5],
+      "cmd-7": ["workspace::ActivatePane", 6],
+      "cmd-8": ["workspace::ActivatePane", 7],
+      "cmd-9": ["workspace::ActivatePane", 8],
+    },
     "bindings": {
-      "cmd-alt-p": "paseo_ui::TogglePanel",
-      "cmd-alt-k": "command_palette::Toggle",
       "cmd-alt-n": "paseo_ui::NewAgentWorkspace",
       "cmd-alt-t": "paseo_ui::NewAgent",
+      "cmd-n": "paseo_ui::NewAgentWorkspace",
+      "cmd-t": "paseo_ui::NewAgent",
+      "cmd-alt-shift-e": "paseo_ui::ReviewLastTurn",
+      "cmd-1": ["paseo_ui::OpenSidebarRowAtIndex", { "index": 1 }],
+      "cmd-2": ["paseo_ui::OpenSidebarRowAtIndex", { "index": 2 }],
+      "cmd-3": ["paseo_ui::OpenSidebarRowAtIndex", { "index": 3 }],
+      "cmd-4": ["paseo_ui::OpenSidebarRowAtIndex", { "index": 4 }],
+      "cmd-5": ["paseo_ui::OpenSidebarRowAtIndex", { "index": 5 }],
+      "cmd-6": ["paseo_ui::OpenSidebarRowAtIndex", { "index": 6 }],
+      "cmd-7": ["paseo_ui::OpenSidebarRowAtIndex", { "index": 7 }],
+      "cmd-8": ["paseo_ui::OpenSidebarRowAtIndex", { "index": 8 }],
+      "cmd-9": ["paseo_ui::OpenSidebarRowAtIndex", { "index": 9 }],
+      "cmd-alt-p": "paseo_ui::TogglePanel",
       "cmd-alt-]": "paseo_ui::NextAgent",
       "cmd-alt-[": "paseo_ui::PreviousAgent",
+    },
+  },
+  {
+    // Repeated from the Workspace block so they beat Zed's context-free menu bindings in views
+    // that handle menus, such as the sidebar. Every Paseo screen adds `PaseoView` to its context.
+    "context": "PaseoView",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-n": "paseo_ui::NewAgentWorkspace",
+      "cmd-t": "paseo_ui::NewAgent",
     },
   },
   {
     "context": "PaseoAgentView || PaseoSidebar",
     "use_key_equivalents": true,
     "bindings": {
-      "cmd-k": "command_palette::Toggle",
-      "cmd-n": "paseo_ui::NewAgentWorkspace",
-      "cmd-t": "paseo_ui::NewAgent",
       "cmd-shift-backspace": "paseo_ui::ArchiveAgent",
-      "cmd-e": "paseo_ui::ReviewLastTurn",
       "cmd-shift-t": "paseo_ui::NewTerminal",
-      "cmd-1": ["paseo_ui::OpenAgentAtIndex", { "index": 1 }],
-      "cmd-2": ["paseo_ui::OpenAgentAtIndex", { "index": 2 }],
-      "cmd-3": ["paseo_ui::OpenAgentAtIndex", { "index": 3 }],
-      "cmd-4": ["paseo_ui::OpenAgentAtIndex", { "index": 4 }],
-      "cmd-5": ["paseo_ui::OpenAgentAtIndex", { "index": 5 }],
-      "cmd-6": ["paseo_ui::OpenAgentAtIndex", { "index": 6 }],
-      "cmd-7": ["paseo_ui::OpenAgentAtIndex", { "index": 7 }],
-      "cmd-8": ["paseo_ui::OpenAgentAtIndex", { "index": 8 }],
-      "cmd-9": ["paseo_ui::OpenAgentAtIndex", { "index": 9 }],
     },
   },
   {
@@ -1849,7 +1874,6 @@
     "bindings": {
       "escape": "paseo_ui::InterruptAgent",
       "cmd-d": "paseo_ui::ToggleDictation",
-      "cmd-e": "paseo_ui::ReviewLastTurn",
       "cmd-shift-t": "paseo_ui::NewTerminal",
       "shift-tab": "paseo_ui::CycleMode",
       "cmd-/": "paseo_ui::ToggleModelPicker",

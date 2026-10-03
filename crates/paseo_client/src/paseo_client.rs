@@ -3,7 +3,7 @@ mod protocol;
 mod transport;
 
 pub use model::*;
-pub use protocol::{is_absolute_workspace_path, parse_features};
+pub use protocol::{is_absolute_workspace_path, parse_features, pending_permissions};
 pub use transport::parse_ssh_uri;
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -60,9 +60,12 @@ enum Command {
 }
 
 struct Pending {
-    message: Value,
+    /// The request to send again after a reconnect. Only creations are replayed, because their
+    /// idempotency key makes a second delivery safe.
+    replay: Option<Value>,
+    /// Whether the request sends a chat message, whose outcome is unknown once the connection drops.
+    sends_message: bool,
     response_type: &'static str,
-    retry_creation: bool,
     reply: oneshot::Sender<Result<Value>>,
 }
 
@@ -148,10 +151,12 @@ impl PaseoSession {
         }
     }
 
+    #[cfg(test)]
     pub async fn select_agent(&self, id: &str) -> Result<Vec<TimelineEntry>> {
         Ok(self.select_agent_page(id).await?.entries)
     }
 
+    #[cfg(test)]
     pub async fn select_agent_page(&self, id: &str) -> Result<TimelinePage> {
         self.set_timeline_subscriptions(vec![id.to_owned()]).await?;
         self.timeline_tail(id).await
@@ -247,6 +252,7 @@ impl PaseoSession {
         )
     }
 
+    #[cfg(test)]
     pub async fn send(&self, id: &str, text: &str, message_id: &str) -> Result<()> {
         self.send_message(SendMessage {
             agent_id: id.to_owned(),
@@ -292,6 +298,7 @@ impl PaseoSession {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn answer_permission(&self, request_id: &str, allow: bool) -> Result<()> {
         let response = if allow {
             PermissionResponse::Allow {
@@ -1536,7 +1543,7 @@ fn emit_subagent_update(payload: &Value, events: &Sender<PaseoEvent>) {
                 sequence,
                 timestamp: timestamp.to_owned(),
                 payload: protocol::timeline_payload(Value::Object(item.clone())),
-                extra: payload.clone(),
+                extra: protocol::entry_extra(payload, "item"),
             })
         }
         _ => return,
@@ -1983,6 +1990,7 @@ async fn open_socket(
         }
     }
     let server_info = ServerInfo {
+        server_id: info["payload"]["serverId"].as_str().map(str::to_owned),
         features: features.clone(),
         capabilities: info["payload"]["capabilities"].clone(),
         desktop_managed: info["payload"]["desktopManaged"] == true,
@@ -2060,42 +2068,217 @@ async fn subscribe(socket: &mut Socket, timeline: &TimelineSubscriptions) -> Res
     Ok(())
 }
 
-async fn run(
-    mut socket: Socket,
+/// The daemon socket, with everything a reconnect needs to replace it.
+struct Connection {
+    socket: Socket,
     target: ConnectionTarget,
     credentials: Credentials,
     client_id: String,
     ssh_executable: PathBuf,
-    mut commands: mpsc::Receiver<Command>,
+    commands: mpsc::Receiver<Command>,
+    events: Sender<PaseoEvent>,
+    pending: HashMap<String, Pending>,
+    timeline: TimelineSubscriptions,
+    ping_pending: bool,
+}
+
+impl Connection {
+    /// Sends a session message, reconnecting when the socket fails. Returns `false` once the
+    /// session has ended.
+    async fn send_or_reconnect(&mut self, message: Value) -> bool {
+        match send_message(&mut self.socket, message).await {
+            Ok(()) => true,
+            Err(error) => self.reconnect_after(&error).await,
+        }
+    }
+
+    async fn send_frame_or_reconnect(&mut self, frame: Message) -> bool {
+        match self.socket.send(frame).await {
+            Ok(()) => true,
+            Err(error) => self.reconnect_after(&error.into()).await,
+        }
+    }
+
+    async fn reconnect_after(&mut self, error: &anyhow::Error) -> bool {
+        // Socket errors can carry request details, so only their kind is logged.
+        match error.downcast_ref::<transport::WebSocketError>() {
+            Some(socket_error) => log::warn!(
+                "Paseo connection lost ({}); reconnecting",
+                transport::websocket_error_kind(socket_error)
+            ),
+            None => log::warn!("{error}; reconnecting"),
+        }
+        self.reconnect().await
+    }
+
+    /// Opens a replacement socket, waiting longer after each failed attempt. Returns `false` when
+    /// the session ends instead.
+    async fn reconnect(&mut self) -> bool {
+        emit_event(
+            &self.events,
+            PaseoEvent::Disconnected {
+                reason: "Paseo connection lost; reconnecting".into(),
+            },
+        );
+        let mut retry = HashMap::new();
+        for (request_id, request) in self.pending.drain() {
+            if request.reply.is_closed() {
+                continue;
+            }
+            if request.replay.is_some() {
+                retry.insert(request_id, request);
+            } else {
+                let message = if request.sends_message {
+                    "Paseo connection lost; message outcome unknown"
+                } else {
+                    "Paseo connection lost; request outcome unknown"
+                };
+                deliver(request.reply, Err(anyhow!(message)));
+            }
+        }
+        self.pending = retry;
+        let mut failed_attempts = 0;
+        loop {
+            if self.events.is_closed() {
+                return false;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(reconnect_delay(failed_attempts)) => {},
+                command = self.commands.recv() => match command {
+                    Some(Command::Request { reply, .. }) => {
+                        deliver(reply, Err(anyhow!("Paseo is reconnecting")));
+                        continue;
+                    }
+                    Some(Command::Notify(_) | Command::ReleaseTerminal { .. } | Command::Binary(_)) => continue,
+                    Some(Command::Close(reply)) => {
+                        deliver(reply, Ok(()));
+                        return false;
+                    }
+                    None => return false,
+                }
+            }
+            failed_attempts = failed_attempts.saturating_add(1);
+            let (mut replacement, server_info) = match open_socket(
+                &self.target,
+                &self.credentials,
+                &self.client_id,
+                &self.ssh_executable,
+            )
+            .await
+            {
+                Ok(opened) => opened,
+                Err(error) => {
+                    if let Some(rejection) = error.downcast_ref::<AuthRejection>() {
+                        // Retrying the same credentials cannot succeed, so the user has to enter
+                        // new ones.
+                        for (_, request) in self.pending.drain() {
+                            deliver(request.reply, Err(anyhow!("{rejection}")));
+                        }
+                        emit_event(
+                            &self.events,
+                            PaseoEvent::ConnectionFailed {
+                                reason: rejection.to_string(),
+                            },
+                        );
+                        return false;
+                    }
+                    log::debug!("Paseo reconnect attempt failed: {error}");
+                    continue;
+                }
+            };
+            if let Err(error) = subscribe(&mut replacement, &self.timeline).await {
+                log::debug!("Paseo reconnect could not subscribe: {error}");
+                continue;
+            }
+            let mut replay_failed = false;
+            for message in self
+                .pending
+                .values()
+                .filter_map(|request| request.replay.as_ref())
+            {
+                if let Err(error) = send_message(&mut replacement, message.clone()).await {
+                    log::debug!("Paseo reconnect could not replay a request: {error}");
+                    replay_failed = true;
+                    break;
+                }
+            }
+            if replay_failed {
+                continue;
+            }
+            self.socket = replacement;
+            self.ping_pending = false;
+            emit_event(&self.events, PaseoEvent::ServerInfo(server_info));
+            emit_event(&self.events, PaseoEvent::Connected);
+            return true;
+        }
+    }
+}
+
+const RECONNECT_DELAY_LIMIT: Duration = Duration::from_secs(30);
+
+/// One second before the first attempt, doubling after each failure up to the limit, so a host
+/// that stays down is not retried every second; an SSH host starts a new `ssh` per attempt.
+fn reconnect_delay(failed_attempts: u32) -> Duration {
+    Duration::from_secs(2u64.saturating_pow(failed_attempts)).min(RECONNECT_DELAY_LIMIT)
+}
+
+async fn run(
+    socket: Socket,
+    target: ConnectionTarget,
+    credentials: Credentials,
+    client_id: String,
+    ssh_executable: PathBuf,
+    commands: mpsc::Receiver<Command>,
     events: Sender<PaseoEvent>,
 ) {
-    let mut pending: HashMap<String, Pending> = HashMap::new();
+    let mut connection = Connection {
+        socket,
+        target,
+        credentials,
+        client_id,
+        ssh_executable,
+        commands,
+        events,
+        pending: HashMap::new(),
+        timeline: TimelineSubscriptions::default(),
+        ping_pending: false,
+    };
     let mut agents: HashMap<String, AgentSummary> = HashMap::new();
     let mut permissions: HashMap<String, String> = HashMap::new();
     let mut subscriptions: HashMap<&'static str, String> = HashMap::new();
-    let mut timeline = TimelineSubscriptions::default();
     let mut terminal_slots: HashMap<u8, String> = HashMap::new();
-    let mut ping_pending = false;
+    // The directory page this loop asked for, whose failure must still deliver the directory.
+    let mut directory_page_request: Option<String> = None;
     let mut ping_timer =
         tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
     loop {
         tokio::select! {
             _ = ping_timer.tick() => {
-                pending.retain(|_, request| !request.reply.is_closed());
-                if ping_pending || socket.send(Message::Text(json!({"type":"ping"}).to_string().into())).await.is_err() {
-                    if !reconnect(&mut socket, &target, &ssh_executable, &credentials, &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
+                connection.pending.retain(|_, request| !request.reply.is_closed());
+                let ping = if connection.ping_pending {
+                    Err(anyhow!("Paseo daemon did not answer a ping"))
                 } else {
-                    ping_pending = true;
+                    connection
+                        .socket
+                        .send(Message::Text(json!({"type":"ping"}).to_string().into()))
+                        .await
+                        .map_err(anyhow::Error::from)
+                };
+                match ping {
+                    Ok(()) => connection.ping_pending = true,
+                    Err(error) => {
+                        if !connection.reconnect_after(&error).await { break; }
+                    }
                 }
             },
-            command = commands.recv() => match command {
+            command = connection.commands.recv() => match command {
                 Some(Command::Request { message, response_type, retry_creation, reply }) => {
                     let Some(request_id) = message.get("requestId").and_then(Value::as_str).map(str::to_owned) else {
                         deliver(reply, Err(anyhow!("request ID missing")));
                         continue;
                     };
                     if message["type"] == "agent.timeline.set_subscription.request" {
-                        timeline.replace(
+                        connection.timeline.replace(
                             message["agentIds"]
                                 .as_array()
                                 .into_iter()
@@ -2109,127 +2292,154 @@ async fn run(
                         && message["direction"] == "tail"
                         && let Some(agent_id) = message["agentId"].as_str()
                     {
-                        timeline.cursors.remove(agent_id);
+                        connection.timeline.cursors.remove(agent_id);
                     }
+                    let request = Pending {
+                        replay: retry_creation.then(|| message.clone()),
+                        sends_message: message["type"] == "send_agent_message_request",
+                        response_type,
+                        reply,
+                    };
                     if message["type"] == "agent_permission_response" {
                         if let Some(agent_id) = permissions.get(&request_id) {
                             let mut message = message;
                             message["agentId"] = json!(agent_id);
-                            if send_message(&mut socket, message.clone()).await.is_err() {
-                                deliver(reply, Err(anyhow!("Paseo connection lost; permission outcome unknown")));
-                                if !reconnect(&mut socket, &target, &ssh_executable, &credentials, &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
-                            } else {
-                                pending.insert(request_id, Pending { message, response_type, retry_creation, reply });
+                            match send_message(&mut connection.socket, message).await {
+                                Ok(()) => {
+                                    connection.pending.insert(request_id, request);
+                                }
+                                Err(error) => {
+                                    deliver(request.reply, Err(anyhow!("Paseo connection lost; permission outcome unknown")));
+                                    if !connection.reconnect_after(&error).await { break; }
+                                }
                             }
                             continue;
                         }
-                        deliver(reply, Err(anyhow!("permission request is no longer pending")));
+                        deliver(request.reply, Err(anyhow!("permission request is no longer pending")));
                         continue;
                     }
-                    if send_message(&mut socket, message.clone()).await.is_err() {
-                        if retry_creation { pending.insert(request_id, Pending { message, response_type, retry_creation, reply }); }
-                        else { deliver(reply, Err(anyhow!("Paseo connection lost; request outcome unknown"))); }
-                        if !reconnect(&mut socket, &target, &ssh_executable, &credentials, &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
-                    } else {
-                        pending.insert(request_id, Pending { message, response_type, retry_creation, reply });
+                    match send_message(&mut connection.socket, message).await {
+                        Ok(()) => {
+                            connection.pending.insert(request_id, request);
+                        }
+                        Err(error) => {
+                            if request.replay.is_some() {
+                                connection.pending.insert(request_id, request);
+                            } else {
+                                deliver(request.reply, Err(anyhow!("Paseo connection lost; request outcome unknown")));
+                            }
+                            if !connection.reconnect_after(&error).await { break; }
+                        }
                     }
                 }
                 Some(Command::ReleaseTerminal { terminal_id, subscription_id }) => {
                     terminal_slots.retain(|_, subscribed| *subscribed != terminal_id);
-                    if send_message(&mut socket, json!({"type":"subscription.release.request", "requestId":next_request_id(), "subscriptionId":subscription_id})).await.is_err() {
-                        if !reconnect(&mut socket, &target, &ssh_executable, &credentials, &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
-                    }
+                    if !connection.send_or_reconnect(json!({"type":"subscription.release.request", "requestId":next_request_id(), "subscriptionId":subscription_id})).await { break; }
                 }
                 Some(Command::Binary(frame)) => {
-                    if socket.send(Message::Binary(frame.into())).await.is_err() {
-                        if !reconnect(&mut socket, &target, &ssh_executable, &credentials, &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
-                    }
+                    if !connection.send_frame_or_reconnect(Message::Binary(frame.into())).await { break; }
                 }
                 Some(Command::Notify(message)) => {
                     if message["type"] == "unsubscribe_terminal_request" {
                         terminal_slots.retain(|_, terminal_id| message["terminalId"] != terminal_id.as_str());
                     }
-                    if send_message(&mut socket, message).await.is_err() {
-                        if !reconnect(&mut socket, &target, &ssh_executable, &credentials, &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
-                    }
+                    if !connection.send_or_reconnect(message).await { break; }
                 }
                 Some(Command::Close(reply)) => {
-                    let result = socket.close(None).await.context("Paseo close failed");
+                    let result = connection.socket.close(None).await.context("Paseo close failed");
                     deliver(reply, result);
                     break;
                 }
                 None => break,
             },
-            frame = socket.next() => {
-                let result = frame.and_then(Result::ok);
-                if let Some(Message::Text(text)) = result {
-                    if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                        if value["type"] == "session" {
-                            let message = &value["message"];
-                            let timeline_agent = message["payload"]["agentId"].as_str().filter(|agent_id| timeline.contains(agent_id)).map(str::to_owned);
-                            let timeline_response = message["type"] == "fetch_agent_timeline_response";
-                            let refresh = message["type"] == "agent.timeline.replacement" || (timeline_response && (message["payload"]["staleCursor"] == true || message["payload"]["reset"] == true));
-                            let directory_page = message["type"] == "fetch_agents_response"
-                                && message["payload"]["requestId"].as_str().is_some_and(|request_id| !pending.contains_key(request_id));
-                            let next_directory_cursor = if directory_page { next_agents_cursor(&message["payload"]).ok().flatten() } else { None };
-                            let previous_cursor = timeline_agent.as_ref().and_then(|agent_id| timeline.cursors.get(agent_id).cloned());
-                            let old_subscription = update_subscription(message, &mut subscriptions);
-                            if message["type"] == "subscribe_terminal_response"
-                                && let (Some(slot), Some(terminal_id)) = (
-                                    message["payload"]["slot"].as_u64().and_then(|slot| u8::try_from(slot).ok()),
-                                    message["payload"]["terminalId"].as_str(),
-                                )
-                            {
-                                terminal_slots.insert(slot, terminal_id.to_owned());
-                            }
-                            handle_message(message, &mut pending, &mut agents, &mut permissions, &events, &mut timeline);
-                            if let Some(page_cursor) = next_directory_cursor {
-                                if send_message(&mut socket, json!({"type":"fetch_agents_request", "requestId":next_request_id(), "scope":"active", "page":{"limit":200,"cursor":page_cursor}})).await.is_err() {
-                                    if !reconnect(&mut socket, &target, &ssh_executable, &credentials, &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
-                                }
-                            }
-                            if let Some(subscription_id) = old_subscription {
-                                if send_message(&mut socket, json!({"type":"subscription.release.request", "requestId":next_request_id(), "subscriptionId":subscription_id})).await.is_err() {
-                                    if !reconnect(&mut socket, &target, &ssh_executable, &credentials, &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
-                                }
-                            }
-                            let follow_up = timeline_agent.and_then(|agent_id| {
-                                if refresh {
-                                    timeline.cursors.remove(&agent_id);
-                                    Some(timeline_tail_request(&agent_id))
-                                } else if timeline_response
-                                    && message["payload"]["direction"] == "after"
-                                    && message["payload"]["hasNewer"] == true
-                                {
-                                    timeline.cursors.get(&agent_id)
-                                        .filter(|cursor| previous_cursor.as_ref() != Some(*cursor))
-                                        .map(|(epoch, sequence)| timeline_after_request(&agent_id, epoch, *sequence))
-                                } else {
-                                    None
-                                }
-                            });
-                            if let Some(request) = follow_up {
-                                if send_message(&mut socket, request).await.is_err() {
-                                    if !reconnect(&mut socket, &target, &ssh_executable, &credentials, &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
-                                }
-                            }
-                        } else if value["type"] == "pong" {
-                            ping_pending = false;
-                        } else if value["type"] == "ping" {
-                            if socket.send(Message::Text(json!({"type":"pong"}).to_string().into())).await.is_err() {
-                                if !reconnect(&mut socket, &target, &ssh_executable, &credentials, &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
-                            }
+            frame = connection.socket.next() => match frame {
+                Some(Ok(Message::Text(text))) => {
+                    let value = match serde_json::from_str::<Value>(&text) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            log::warn!("Paseo sent an unreadable message: {error}");
+                            continue;
                         }
+                    };
+                    if value["type"] == "session" {
+                        let message = &value["message"];
+                        let timeline_agent = message["payload"]["agentId"].as_str().filter(|agent_id| connection.timeline.contains(agent_id)).map(str::to_owned);
+                        let timeline_response = message["type"] == "fetch_agent_timeline_response";
+                        let refetch_tail = message["type"] == "agent.timeline.replacement" || (timeline_response && (message["payload"]["staleCursor"] == true || message["payload"]["reset"] == true));
+                        let directory_page = message["type"] == "fetch_agents_response"
+                            && message["payload"]["requestId"].as_str().is_some_and(|request_id| !connection.pending.contains_key(request_id));
+                        let next_directory_cursor = if directory_page { next_agents_cursor(&message["payload"]).ok().flatten() } else { None };
+                        let directory_page_failed = message["type"] == "rpc_error"
+                            && directory_page_request.as_deref().is_some_and(|request_id| message["payload"]["requestId"] == request_id);
+                        let previous_cursor = timeline_agent.as_ref().and_then(|agent_id| connection.timeline.cursors.get(agent_id).cloned());
+                        let old_subscription = update_subscription(message, &mut subscriptions);
+                        if message["type"] == "subscribe_terminal_response"
+                            && let (Some(slot), Some(terminal_id)) = (
+                                message["payload"]["slot"].as_u64().and_then(|slot| u8::try_from(slot).ok()),
+                                message["payload"]["terminalId"].as_str(),
+                            )
+                        {
+                            terminal_slots.insert(slot, terminal_id.to_owned());
+                        }
+                        handle_message(message, &mut connection.pending, &mut agents, &mut permissions, &connection.events, &mut connection.timeline);
+                        if directory_page_failed {
+                            directory_page_request = None;
+                            log::warn!(
+                                "Paseo could not load the rest of the agent directory: {}",
+                                message["payload"]["error"].as_str().unwrap_or("unknown error")
+                            );
+                            emit_event(&connection.events, PaseoEvent::AgentsChanged(agents.values().cloned().collect()));
+                        }
+                        if let Some(page_cursor) = next_directory_cursor {
+                            let request_id = next_request_id();
+                            directory_page_request = Some(request_id.clone());
+                            if !connection.send_or_reconnect(json!({"type":"fetch_agents_request", "requestId":request_id, "scope":"active", "page":{"limit":200,"cursor":page_cursor}})).await { break; }
+                        }
+                        if let Some(subscription_id) = old_subscription
+                            && !connection.send_or_reconnect(json!({"type":"subscription.release.request", "requestId":next_request_id(), "subscriptionId":subscription_id})).await
+                        {
+                            break;
+                        }
+                        let follow_up = timeline_agent.and_then(|agent_id| {
+                            if refetch_tail {
+                                connection.timeline.cursors.remove(&agent_id);
+                                Some(timeline_tail_request(&agent_id))
+                            } else if timeline_response
+                                && message["payload"]["direction"] == "after"
+                                && message["payload"]["hasNewer"] == true
+                            {
+                                connection.timeline.cursors.get(&agent_id)
+                                    .filter(|cursor| previous_cursor.as_ref() != Some(*cursor))
+                                    .map(|(epoch, sequence)| timeline_after_request(&agent_id, epoch, *sequence))
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(request) = follow_up
+                            && !connection.send_or_reconnect(request).await
+                        {
+                            break;
+                        }
+                    } else if value["type"] == "pong" {
+                        connection.ping_pending = false;
+                    } else if value["type"] == "ping"
+                        && !connection.send_frame_or_reconnect(Message::Text(json!({"type":"pong"}).to_string().into())).await
+                    {
+                        break;
                     }
-                } else if let Some(Message::Binary(data)) = result {
-                    emit_terminal_frame(&data, &terminal_slots, &events);
-                } else if result.is_none() {
-                    if !reconnect(&mut socket, &target, &ssh_executable, &credentials, &client_id, &events, &mut pending, &mut commands, &timeline, &mut ping_pending).await { break; }
+                }
+                Some(Ok(Message::Binary(data))) => emit_terminal_frame(&data, &terminal_slots, &connection.events),
+                Some(Ok(_)) => {}
+                Some(Err(error)) => {
+                    if !connection.reconnect_after(&error.into()).await { break; }
+                }
+                None => {
+                    if !connection.reconnect_after(&anyhow!("Paseo closed the connection")).await { break; }
                 }
             }
         }
     }
-    pending.into_values().for_each(|pending| {
+    connection.pending.into_values().for_each(|pending| {
         deliver(pending.reply, Err(anyhow!("Paseo connection closed")));
     });
 }
@@ -2275,8 +2485,10 @@ fn handle_message(
                     protocol::response_payload(message, request.response_type)
                 };
                 if let Ok(payload) = &result {
+                    // The caller applies the page it asked for, which lets the store reject a
+                    // stale one, so its entries are not sent as events as well.
                     if message_type == "fetch_agent_timeline_response" {
-                        emit_timeline(payload, events, timeline);
+                        advance_timeline_cursor(payload, timeline);
                     }
                     if message_type == "agent_permission_resolved" {
                         permissions.remove(request_id);
@@ -2309,28 +2521,30 @@ fn handle_message(
                 );
             }
         }
-        "agent_update" => {
-            match payload["kind"].as_str() {
-                Some("upsert") => {
-                    if let Ok(agent) = protocol::parse_agent_with_project(
-                        &payload["agent"],
-                        payload.get("project"),
-                    ) {
-                        agents.insert(agent.id.clone(), agent);
+        "agent_update" => match payload["kind"].as_str() {
+            Some("upsert") => {
+                match protocol::parse_agent_with_project(&payload["agent"], payload.get("project"))
+                {
+                    Ok(agent) => {
+                        agents.insert(agent.id.clone(), agent.clone());
+                        emit_event(events, PaseoEvent::AgentUpserted(agent));
                     }
+                    Err(error) => log::warn!("Paseo sent an unreadable agent update: {error:#}"),
                 }
-                Some("remove") => {
-                    if let Some(id) = payload["agentId"].as_str() {
-                        agents.remove(id);
-                    }
-                }
-                _ => return,
             }
-            emit_event(
-                events,
-                PaseoEvent::AgentsChanged(agents.values().cloned().collect()),
-            );
-        }
+            Some("remove") => {
+                if let Some(agent_id) = payload["agentId"].as_str() {
+                    agents.remove(agent_id);
+                    emit_event(
+                        events,
+                        PaseoEvent::AgentRemoved {
+                            agent_id: agent_id.to_owned(),
+                        },
+                    );
+                }
+            }
+            _ => {}
+        },
         "fetch_agent_timeline_response" => emit_timeline(payload, events, timeline),
         "agent.provider_subagents.update" => emit_subagent_update(payload, events),
         "fetch_workspaces_response" => match protocol::parse_workspace_page(payload) {
@@ -2351,34 +2565,34 @@ fn handle_message(
             Err(error) => log::warn!("invalid Paseo labels snapshot: {error:#}"),
         },
         "workspace.label.update" => emit_label_update(payload, events),
-        "script_status_update" => {
-            if let (Some(workspace_id), Ok(scripts)) = (
-                payload["workspaceId"].as_str(),
-                protocol::parse_workspace_scripts(payload),
-            ) {
-                emit_event(
-                    events,
-                    PaseoEvent::ScriptsChanged {
-                        workspace_id: workspace_id.to_owned(),
-                        scripts,
-                    },
-                );
-            }
-        }
-        "workspace_setup_progress" => {
-            if let (Some(workspace_id), Ok(snapshot)) = (
-                payload["workspaceId"].as_str(),
-                protocol::parse_setup_snapshot(payload),
-            ) {
-                emit_event(
-                    events,
-                    PaseoEvent::SetupProgress {
-                        workspace_id: workspace_id.to_owned(),
-                        snapshot,
-                    },
-                );
-            }
-        }
+        "script_status_update" => match (
+            payload["workspaceId"].as_str(),
+            protocol::parse_workspace_scripts(payload),
+        ) {
+            (Some(workspace_id), Ok(scripts)) => emit_event(
+                events,
+                PaseoEvent::ScriptsChanged {
+                    workspace_id: workspace_id.to_owned(),
+                    scripts,
+                },
+            ),
+            (None, _) => log::warn!("Paseo sent script statuses without a workspace"),
+            (_, Err(error)) => log::warn!("Paseo sent unreadable script statuses: {error:#}"),
+        },
+        "workspace_setup_progress" => match (
+            payload["workspaceId"].as_str(),
+            protocol::parse_setup_snapshot(payload),
+        ) {
+            (Some(workspace_id), Ok(snapshot)) => emit_event(
+                events,
+                PaseoEvent::SetupProgress {
+                    workspace_id: workspace_id.to_owned(),
+                    snapshot,
+                },
+            ),
+            (None, _) => log::warn!("Paseo sent setup progress without a workspace"),
+            (_, Err(error)) => log::warn!("Paseo sent unreadable setup progress: {error:#}"),
+        },
         "daemon.update.progress" => {
             if let Some(phase) = payload["phase"].as_str() {
                 emit_event(
@@ -2408,7 +2622,7 @@ fn handle_message(
                     sequence,
                     timestamp: timestamp.to_owned(),
                     payload: protocol::timeline_payload(Value::Object(item.clone())),
-                    extra: payload.clone(),
+                    extra: protocol::entry_extra(payload, "event"),
                 };
                 timeline.advance(agent_id, epoch, sequence);
                 emit_event(events, PaseoEvent::TimelineEntry(entry));
@@ -2424,24 +2638,25 @@ fn handle_message(
                 }
             }
         }
-        "agent_permission_request" => {
-            if let Ok(permission) = protocol::parse_permission(payload) {
+        "agent_permission_request" => match protocol::parse_permission(payload) {
+            Ok(permission) => {
                 permissions.insert(permission.request_id.clone(), permission.agent_id.clone());
                 emit_event(events, PaseoEvent::PermissionRequested(permission));
             }
-        }
+            Err(error) => log::warn!("Paseo sent an unreadable permission request: {error:#}"),
+        },
         "terminals_changed" => {
-            if let (Some(cwd), Ok(terminals)) =
-                (payload["cwd"].as_str(), protocol::parse_terminals(payload))
-            {
-                emit_event(
+            match (payload["cwd"].as_str(), protocol::parse_terminals(payload)) {
+                (Some(cwd), Ok(terminals)) => emit_event(
                     events,
                     PaseoEvent::TerminalsChanged {
                         cwd: cwd.to_owned(),
                         subscription_id: payload["subscriptionId"].as_str().map(str::to_owned),
                         terminals,
                     },
-                );
+                ),
+                (None, _) => log::warn!("Paseo sent a terminal list without a directory"),
+                (_, Err(error)) => log::warn!("Paseo sent an unreadable terminal list: {error:#}"),
             }
         }
         "terminal_stream_exit" => {
@@ -2494,20 +2709,24 @@ fn update_agents(
     permissions: &mut HashMap<String, String>,
     events: &Sender<PaseoEvent>,
 ) {
-    if let Ok(parsed) = protocol::parse_agents(payload) {
-        if payload["subscriptionId"].as_str().is_some() {
-            agents.clear();
-        }
-        for agent in parsed {
-            if let Some(pending) = agent.extra["pendingPermissions"].as_array() {
-                for request in pending {
-                    if let Some(id) = request["id"].as_str() {
-                        permissions.insert(id.to_owned(), agent.id.clone());
-                    }
-                }
+    match protocol::parse_agents(payload) {
+        Ok(parsed) => {
+            if payload["subscriptionId"].as_str().is_some() {
+                agents.clear();
+                permissions.clear();
             }
-            agents.insert(agent.id.clone(), agent);
+            for agent in parsed {
+                permissions.extend(
+                    protocol::pending_permissions(&agent)
+                        .map(|request| (request.request_id, request.agent_id)),
+                );
+                agents.insert(agent.id.clone(), agent);
+            }
         }
+        Err(error) => log::warn!("Paseo sent an unreadable agent directory page: {error:#}"),
+    }
+    // The run loop fetches the next page itself; receivers get the directory once it is whole.
+    if next_agents_cursor(payload).ok().flatten().is_none() {
         emit_event(
             events,
             PaseoEvent::AgentsChanged(agents.values().cloned().collect()),
@@ -2515,137 +2734,57 @@ fn update_agents(
     }
 }
 
+/// Moves an agent's reconnect cursor to the end of a timeline page. Older pages leave it alone,
+/// because they end before what was already seen.
+fn advance_timeline_cursor(payload: &Value, timeline: &mut TimelineSubscriptions) {
+    if payload["direction"] == "before" {
+        return;
+    }
+    let Some(agent_id) = payload["agentId"].as_str() else {
+        return;
+    };
+    let last_entry = payload["entries"]
+        .as_array()
+        .and_then(|entries| entries.last())
+        .and_then(|entry| {
+            entry["seqEnd"]
+                .as_u64()
+                .or_else(|| entry["seqStart"].as_u64())
+        });
+    if let (Some(epoch), Some(sequence)) = (payload["epoch"].as_str(), last_entry) {
+        timeline.advance(agent_id, epoch, sequence);
+    }
+    if let (Some(epoch), Some(sequence)) = (
+        payload["endCursor"]["epoch"].as_str(),
+        payload["endCursor"]["seq"].as_u64(),
+    ) {
+        timeline.advance(agent_id, epoch, sequence);
+    }
+}
+
+/// Delivers a timeline page nobody is waiting for, such as a reconnect catch-up, as events.
 fn emit_timeline(
     payload: &Value,
     events: &Sender<PaseoEvent>,
     timeline: &mut TimelineSubscriptions,
 ) {
-    if let Ok(entries) = protocol::parse_timeline(payload) {
-        let advance_cursor = payload["direction"] != "before";
-        for entry in entries {
-            if advance_cursor {
-                timeline.advance(
-                    &entry.agent_id,
-                    &entry.epoch,
-                    entry.extra["seqEnd"].as_u64().unwrap_or(entry.sequence),
-                );
-            }
-            emit_event(events, PaseoEvent::TimelineEntry(entry));
-        }
-        if advance_cursor
-            && let (Some(agent_id), Some(epoch), Some(sequence)) = (
-                payload["agentId"].as_str(),
-                payload["endCursor"]["epoch"].as_str(),
-                payload["endCursor"]["seq"].as_u64(),
-            )
-        {
-            timeline.advance(agent_id, epoch, sequence);
-        }
-    }
-}
-
-async fn reconnect(
-    socket: &mut Socket,
-    target: &ConnectionTarget,
-    ssh_executable: &Path,
-    credentials: &Credentials,
-    client_id: &str,
-    events: &Sender<PaseoEvent>,
-    pending: &mut HashMap<String, Pending>,
-    commands: &mut mpsc::Receiver<Command>,
-    timeline: &TimelineSubscriptions,
-    ping_pending: &mut bool,
-) -> bool {
-    emit_event(
-        events,
-        PaseoEvent::Disconnected {
-            reason: "Paseo connection lost; reconnecting".into(),
-        },
-    );
-    let mut retry = HashMap::new();
-    for (request_id, request) in pending.drain() {
-        if request.reply.is_closed() {
-            continue;
-        }
-        if request.retry_creation {
-            retry.insert(request_id, request);
-        } else {
-            let message = if request.message["type"] == "send_agent_message_request" {
-                "Paseo connection lost; message outcome unknown"
-            } else {
-                "Paseo connection lost; request outcome unknown"
-            };
-            deliver(request.reply, Err(anyhow!(message)));
-        }
-    }
-    *pending = retry;
-    loop {
-        if events.is_closed() {
-            return false;
-        }
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {},
-            command = commands.recv() => match command {
-                Some(Command::Request { reply, .. }) => {
-                    deliver(reply, Err(anyhow!("Paseo is reconnecting")));
-                    continue;
-                }
-                Some(Command::Notify(_) | Command::ReleaseTerminal { .. } | Command::Binary(_)) => continue,
-                Some(Command::Close(reply)) => {
-                    deliver(reply, Ok(()));
-                    return false;
-                }
-                None => return false,
+    match protocol::parse_timeline(payload) {
+        Ok(entries) => {
+            advance_timeline_cursor(payload, timeline);
+            for entry in entries {
+                emit_event(events, PaseoEvent::TimelineEntry(entry));
             }
         }
-        let attempt = open_socket(target, credentials, client_id, ssh_executable).await;
-        if let Err(error) = &attempt
-            && let Some(rejection) = error.downcast_ref::<AuthRejection>()
-        {
-            // Retrying the same credentials cannot succeed, so the user has to enter new ones.
-            for (_, request) in pending.drain() {
-                deliver(request.reply, Err(anyhow!("{rejection}")));
-            }
-            emit_event(
-                events,
-                PaseoEvent::ConnectionFailed {
-                    reason: rejection.to_string(),
-                },
-            );
-            return false;
-        }
-        if let Ok((mut replacement, server_info)) = attempt {
-            if subscribe(&mut replacement, timeline).await.is_err() {
-                continue;
-            }
-            let mut replay_failed = false;
-            for request in pending.values() {
-                if send_message(&mut replacement, request.message.clone())
-                    .await
-                    .is_err()
-                {
-                    replay_failed = true;
-                    break;
-                }
-            }
-            if replay_failed {
-                continue;
-            }
-            *socket = replacement;
-            *ping_pending = false;
-            emit_event(events, PaseoEvent::ServerInfo(server_info));
-            emit_event(events, PaseoEvent::Connected);
-            return true;
-        }
+        Err(error) => log::warn!("Paseo sent an unreadable timeline page: {error:#}"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
     use async_tungstenite::{WebSocketStream, tokio::accept_async};
     use futures::StreamExt;
+    use std::collections::BTreeMap;
     use tokio::net::{TcpListener, TcpStream};
 
     async fn server_socket(
@@ -2752,7 +2891,11 @@ mod tests {
         assert_eq!(second.expect("second response")[0].id, "second");
         let history = session.select_agent_page("agent-1").await.expect("history");
         assert_eq!(history.entries[0].sequence, 1);
-        assert_eq!(history.entries[0].extra["item"]["future"], 7);
+        assert!(matches!(
+            &history.entries[0].payload,
+            TimelinePayload::Message(item) if item["future"] == 7
+        ));
+        assert!(history.entries[0].extra.get("item").is_none());
         assert!(history.has_older);
         let older = session
             .timeline_before(
@@ -3374,7 +3517,10 @@ while True:
             assert_eq!(creation["config"]["model"], "gpt-5.5");
             assert_eq!(creation["config"]["modeId"], "plan");
             assert_eq!(creation["config"]["thinkingOptionId"], "high");
-            assert_eq!(creation["config"]["featureValues"], json!({"fast_mode": true}));
+            assert_eq!(
+                creation["config"]["featureValues"],
+                json!({"fast_mode": true})
+            );
             assert!(creation["config"].get("title").is_none());
             assert!(creation.get("initialPrompt").is_none());
             drop(first);
@@ -3432,9 +3578,9 @@ while True:
         let mut pending = HashMap::from([(
             "before-page".to_string(),
             Pending {
-                message: json!({"type":"fetch_agent_timeline_request", "requestId":"before-page"}),
+                replay: None,
+                sends_message: false,
                 response_type: "fetch_agent_timeline_response",
-                retry_creation: false,
                 reply,
             },
         )]);
@@ -3473,10 +3619,161 @@ while True:
             timeline.cursors.get("agent-1"),
             Some(&("epoch-1".to_string(), 100))
         );
+        assert!(
+            event_receiver.try_recv().is_err(),
+            "the caller applies the page it asked for"
+        );
+    }
+
+    fn tail_page(request_id: &str) -> Value {
+        json!({
+            "type":"fetch_agent_timeline_response",
+            "payload":{
+                "requestId":request_id,
+                "agentId":"agent-1",
+                "epoch":"epoch-1",
+                "direction":"tail",
+                "entries":[{
+                    "seqStart":4,
+                    "seqEnd":6,
+                    "timestamp":"now",
+                    "item":{"type":"assistant_message","text":"hello"}
+                }],
+                "endCursor":{"epoch":"epoch-1","seq":6}
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn requested_timeline_page_reaches_only_its_caller() {
+        let (reply, response) = oneshot::channel();
+        let mut pending = HashMap::from([(
+            "tail".to_string(),
+            Pending {
+                replay: None,
+                sends_message: false,
+                response_type: "fetch_agent_timeline_response",
+                reply,
+            },
+        )]);
+        let (events, event_receiver) = async_channel::unbounded();
+        let mut timeline = subscriptions(&["agent-1"]);
+        handle_message(
+            &tail_page("tail"),
+            &mut pending,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &events,
+            &mut timeline,
+        );
+        let page = response.await.expect("reply").expect("tail payload");
+        assert_eq!(page["entries"][0]["seqStart"], 4);
+        assert!(event_receiver.try_recv().is_err());
+        assert_eq!(
+            timeline.cursors.get("agent-1"),
+            Some(&("epoch-1".to_string(), 6)),
+            "a reconnect still catches up from the requested page"
+        );
+
+        handle_message(
+            &tail_page("catch-up"),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &events,
+            &mut timeline,
+        );
+        let Ok(PaseoEvent::TimelineEntry(entry)) = event_receiver.try_recv() else {
+            panic!("a page nobody asked for arrives as events");
+        };
+        assert_eq!(entry.sequence, 4);
+        assert_eq!(entry.extra["seqEnd"], 6);
+        assert!(entry.extra.get("item").is_none());
+    }
+
+    #[test]
+    fn reconnect_waits_longer_after_each_failure() {
+        let delays = (0..7)
+            .map(|failed_attempts| reconnect_delay(failed_attempts).as_secs())
+            .collect::<Vec<_>>();
+        assert_eq!(delays, vec![1, 2, 4, 8, 16, 30, 30]);
+        assert_eq!(reconnect_delay(u32::MAX), RECONNECT_DELAY_LIMIT);
+    }
+
+    #[test]
+    fn agent_updates_are_sent_one_agent_at_a_time() {
+        let (events, receiver) = async_channel::unbounded();
+        let mut agents = HashMap::new();
+        let mut update = |message: Value| {
+            handle_message(
+                &message,
+                &mut HashMap::new(),
+                &mut agents,
+                &mut HashMap::new(),
+                &events,
+                &mut TimelineSubscriptions::default(),
+            )
+        };
+        update(json!({"type":"agent_update", "payload":{"kind":"upsert", "agent":agent()}}));
+        update(
+            json!({"type":"agent_update", "payload":{"kind":"upsert", "agent":{"title":"no ID"}}}),
+        );
+        update(json!({"type":"agent_update", "payload":{"kind":"remove", "agentId":"agent-1"}}));
         assert!(matches!(
-            event_receiver.try_recv(),
-            Ok(PaseoEvent::TimelineEntry(_))
+            receiver.try_recv(),
+            Ok(PaseoEvent::AgentUpserted(agent)) if agent.id == "agent-1"
         ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(PaseoEvent::AgentRemoved { agent_id }) if agent_id == "agent-1"
+        ));
+        assert!(
+            receiver.try_recv().is_err(),
+            "an unreadable upsert sends nothing"
+        );
+        assert!(agents.is_empty());
+    }
+
+    #[test]
+    fn directory_arrives_once_its_last_page_does() {
+        let (events, receiver) = async_channel::unbounded();
+        let mut agents = HashMap::new();
+        let mut permissions = HashMap::from([("resolved-offline".to_string(), "gone".to_string())]);
+        handle_message(
+            &json!({"type":"fetch_agents_response", "payload":{
+                "requestId":"subscription", "subscriptionId":"owned",
+                "entries":[{"agent":{"id":"agent-1", "status":"idle", "cwd":"/tmp/project",
+                    "pendingPermissions":[{"id":"permission-1"}]}}],
+                "pageInfo":{"hasMore":true,"nextCursor":"next"}
+            }}),
+            &mut HashMap::new(),
+            &mut agents,
+            &mut permissions,
+            &events,
+            &mut TimelineSubscriptions::default(),
+        );
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            permissions.keys().collect::<Vec<_>>(),
+            vec!["permission-1"],
+            "a snapshot forgets permissions resolved while disconnected"
+        );
+        handle_message(
+            &json!({"type":"fetch_agents_response", "payload":{
+                "requestId":"next-page", "entries":[{"agent":{
+                    "id":"agent-2", "status":"idle", "cwd":"/tmp/project"
+                }}], "pageInfo":{"hasMore":false,"nextCursor":null}
+            }}),
+            &mut HashMap::new(),
+            &mut agents,
+            &mut permissions,
+            &events,
+            &mut TimelineSubscriptions::default(),
+        );
+        let Ok(PaseoEvent::AgentsChanged(directory)) = receiver.try_recv() else {
+            panic!("the whole directory follows its last page");
+        };
+        assert_eq!(directory.len(), 2);
     }
 
     #[tokio::test]
@@ -3485,9 +3782,9 @@ while True:
         let mut pending = HashMap::from([(
             "request-1".to_string(),
             Pending {
-                message: json!({"type":"fetch_agents_request", "requestId":"request-1"}),
+                replay: None,
+                sends_message: false,
                 response_type: "fetch_agents_response",
-                retry_creation: false,
                 reply,
             },
         )]);
@@ -3941,7 +4238,7 @@ while True:
     }
 
     fn project_value() -> Value {
-        json!({"projectId":"prj_f1eff855e1aa39ba","projectKey":"remote:github.com/saanuregh/dotfiles","projectDisplayName":"dotfiles","projectCustomName":null,"projectCustomIconRevision":null,"projectIconRevision":"automatic:none:v1","projectRootPath":"/home/sr/projects/personal/dotfiles","projectKind":"git"})
+        json!({"projectId":"prj_f1eff855e1aa39cd","projectKey":"remote:github.com/saanuregh/dotfiles","projectDisplayName":"dotfiles","projectCustomName":null,"projectCustomIconRevision":null,"projectIconRevision":"automatic:none:v1","projectRootPath":"/home/sr/projects/personal/dotfiles","projectKind":"git"})
     }
 
     #[test]
@@ -3983,7 +4280,7 @@ while True:
         );
 
         let project = protocol::parse_project(&project_value()).expect("project");
-        assert_eq!(project.id, "prj_f1eff855e1aa39ba");
+        assert_eq!(project.id, "prj_f1eff855e1aa39cd");
         assert_eq!(project.display_name, "dotfiles");
         assert_eq!(project.icon_revision.as_deref(), Some("automatic:none:v1"));
     }
@@ -4027,7 +4324,7 @@ while True:
         let (workspaces, empty_projects, next_cursor) =
             session.workspaces_page(None).await.expect("workspaces");
         assert_eq!(workspaces[0].id, "wks_1");
-        assert_eq!(empty_projects[0].id, "prj_f1eff855e1aa39ba");
+        assert_eq!(empty_projects[0].id, "prj_f1eff855e1aa39cd");
         assert_eq!(next_cursor.as_deref(), Some("next"));
         session
             .set_workspace_title("wks_1", Some("New name"))
@@ -4821,9 +5118,9 @@ while True:
         let mut pending = HashMap::from([(
             "refresh-1".to_string(),
             Pending {
-                message: json!({"type":"refresh_agent_request", "requestId":"refresh-1"}),
+                replay: None,
+                sends_message: false,
                 response_type: "status",
-                retry_creation: false,
                 reply,
             },
         )]);
@@ -4868,7 +5165,7 @@ while True:
         assert_eq!(agents["agent-1"].project, None);
         assert!(matches!(
             receiver.try_recv(),
-            Ok(PaseoEvent::AgentsChanged(_))
+            Ok(PaseoEvent::AgentUpserted(_))
         ));
     }
 

@@ -98,7 +98,7 @@ pub struct DaemonStatusView {
 
 impl DaemonStatusView {
     fn new(cx: &mut Context<Self>) -> Self {
-        let store = crate::store(cx);
+        let store = crate::hosts::current_store(cx);
         let store_subscription = cx.observe(&store, |view: &mut Self, store, cx| {
             let connection = store.read(cx).connection_count;
             if view.connected(cx) && view.loaded_for_connection != Some(connection) {
@@ -326,20 +326,6 @@ impl DaemonStatusView {
         cx.notify();
     }
 
-    fn render_message(message: impl Into<SharedString>) -> AnyElement {
-        v_flex()
-            .py_4()
-            .child(Label::new(message.into()).color(Color::Muted))
-            .into_any_element()
-    }
-
-    fn render_error(message: String) -> AnyElement {
-        Label::new(message)
-            .size(LabelSize::Small)
-            .color(Color::Error)
-            .into_any_element()
-    }
-
     fn render_card(id: &'static str, cx: &App) -> gpui::Stateful<Div> {
         let colors = cx.theme().colors();
         v_flex()
@@ -347,7 +333,7 @@ impl DaemonStatusView {
             .w_full()
             .p_4()
             .gap_3()
-            .rounded(px(12.))
+            .rounded_md()
             .border_1()
             .border_color(colors.border_variant)
             .bg(colors.editor_background)
@@ -369,11 +355,13 @@ impl DaemonStatusView {
         let loading = matches!(self.status, Loadable::Loading);
         let body =
             if !self.status_supported(cx) {
-                Self::render_message("Update the host to read daemon status.")
+                crate::render_message("Update the host to read daemon status.", None, None)
             } else {
                 match &self.status {
                     Loadable::Idle | Loadable::Loading => crate::render_loading("Loading status…"),
-                    Loadable::Failed(error) => Self::render_error(error.clone()),
+                    Loadable::Failed(error) => {
+                        crate::render_error("Unable to load daemon status", error.clone(), None, cx)
+                    }
                     Loadable::Loaded(status) => v_flex()
                         .gap_1()
                         .children(daemon_status_rows(status, now).into_iter().map(
@@ -422,12 +410,20 @@ impl DaemonStatusView {
         let diagnostic = self.diagnostics.get(&provider.provider);
         let running = matches!(diagnostic, Some(DiagnosticState::Running));
         let provider_id = provider.provider.clone();
+        let label = self
+            .store
+            .read(cx)
+            .providers
+            .iter()
+            .find(|known| known.id == provider.provider)
+            .and_then(|known| known.label.clone());
+        let name = provider_display_name(&provider.provider, label.as_deref());
         v_flex()
             .gap_2()
             .child(
                 h_flex()
                     .gap_2()
-                    .child(Label::new(provider.provider.clone()))
+                    .child(Label::new(name))
                     .child(
                         h_flex()
                             .gap_1()
@@ -463,7 +459,7 @@ impl DaemonStatusView {
                     ),
             )
             .when_some(provider.error.clone(), |this, error| {
-                this.child(Self::render_error(error))
+                this.child(crate::render_inline_error(error))
             })
             .map(|this| match diagnostic {
                 Some(DiagnosticState::Finished(text)) => this.child(
@@ -490,7 +486,7 @@ impl DaemonStatusView {
                         )),
                 ),
                 Some(DiagnosticState::Failed(error)) => {
-                    this.child(Self::render_error(error.clone()))
+                    this.child(crate::render_inline_error(error.clone()))
                 }
                 Some(DiagnosticState::Running) | None => this,
             })
@@ -501,9 +497,11 @@ impl DaemonStatusView {
         let refreshing = self.refreshing_providers;
         let body = match &self.providers {
             Loadable::Idle | Loadable::Loading => crate::render_loading("Loading providers…"),
-            Loadable::Failed(error) => Self::render_error(error.clone()),
+            Loadable::Failed(error) => {
+                crate::render_error("Unable to load providers", error.clone(), None, cx)
+            }
             Loadable::Loaded(providers) if providers.is_empty() => {
-                Self::render_message("No providers reported")
+                crate::render_message("No providers reported", None, None)
             }
             Loadable::Loaded(providers) => v_flex()
                 .gap_3()
@@ -535,7 +533,7 @@ impl DaemonStatusView {
                 ),
             ))
             .when_some(self.providers_error.clone(), |this, error| {
-                this.child(Self::render_error(error))
+                this.child(crate::render_inline_error(error))
             })
             .child(body)
             .into_any_element()
@@ -567,7 +565,7 @@ impl DaemonStatusView {
                 .color(Color::Success)
                 .into_any_element(),
             ),
-            UpdateState::Failed(error) => Some(Self::render_error(error.clone())),
+            UpdateState::Failed(error) => Some(crate::render_inline_error(error.clone())),
         };
         Self::render_card("paseo-daemon-actions", cx)
             .child(Self::render_section_header("Actions", None))
@@ -600,6 +598,17 @@ impl DaemonStatusView {
                         )
                         .style(ButtonStyle::Filled)
                         .disabled(updating || self.restarting || desktop_managed)
+                        // The label already says "Updating…", and the note below says what to
+                        // do about Paseo Desktop.
+                        .when(!updating, |button| {
+                            button.tooltip(Tooltip::text(if self.restarting {
+                                "Restarting…"
+                            } else if desktop_managed {
+                                "Paseo Desktop manages this daemon"
+                            } else {
+                                "Update the Paseo daemon on this host to the latest version"
+                            }))
+                        })
                         .on_click(
                             cx.listener(|view, _, window, cx| view.confirm_update(window, cx)),
                         ),
@@ -613,7 +622,7 @@ impl DaemonStatusView {
                 )
             })
             .when_some(self.restart_error.clone(), |this, error| {
-                this.child(Self::render_error(error))
+                this.child(crate::render_inline_error(error))
             })
             .children(update_status)
             .into_any_element()
@@ -639,7 +648,7 @@ impl Render for DaemonStatusView {
             .map(|profile| profile.name.clone())
             .unwrap_or_default();
         let body = if !self.connected(cx) {
-            Self::render_message("Connect to this host to see the daemon")
+            crate::render_message("Connect to this host to see the daemon", None, None)
         } else {
             v_flex()
                 .gap_4()
@@ -650,7 +659,7 @@ impl Render for DaemonStatusView {
         };
         div()
             .id("paseo-daemon")
-            .key_context("PaseoDaemon")
+            .key_context("PaseoDaemon PaseoView")
             .track_focus(&self.focus_handle)
             .size_full()
             .overflow_y_scroll()
@@ -663,7 +672,7 @@ impl Render for DaemonStatusView {
                         .gap_4()
                         .child(
                             v_flex()
-                                .child(Headline::new("Daemon").size(HeadlineSize::Small))
+                                .child(Headline::new("Daemon Status").size(HeadlineSize::Small))
                                 .child(
                                     Label::new(format!("The Paseo daemon on {host}"))
                                         .size(LabelSize::Small)
@@ -684,7 +693,7 @@ impl Item for DaemonStatusView {
     }
 
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        "Daemon".into()
+        "Daemon Status".into()
     }
 
     fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
@@ -708,10 +717,29 @@ pub(crate) fn open_daemon_status(
     workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
 }
 
+/// The daemon's label for a provider, or its id with a capital first letter.
+pub(crate) fn provider_display_name(id: &str, label: Option<&str>) -> String {
+    if let Some(label) = label.map(str::trim).filter(|label| !label.is_empty()) {
+        return label.to_owned();
+    }
+    crate::capitalize_first(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use paseo_client::RelayStatus;
+
+    #[test]
+    fn provider_names_prefer_the_daemon_label() {
+        assert_eq!(
+            provider_display_name("claude", Some("Claude Code")),
+            "Claude Code"
+        );
+        assert_eq!(provider_display_name("codex", Some("  ")), "Codex");
+        assert_eq!(provider_display_name("pi", None), "Pi");
+        assert_eq!(provider_display_name("", None), "");
+    }
 
     fn status(relay: Option<RelayStatus>) -> DaemonStatus {
         DaemonStatus {

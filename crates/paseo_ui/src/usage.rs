@@ -1,17 +1,18 @@
 use chrono::{DateTime, Utc};
 use gpui::{
-    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    FontWeight, IntoElement, SharedString, Subscription, Task, TaskExt, Window, prelude::*, px,
-    relative,
+    AnyElement, App, AppContext as _, Context, Entity, EntityId, EventEmitter, FocusHandle,
+    Focusable, FontWeight, Global, IntoElement, SharedString, Subscription, Task, TaskExt, Window,
+    prelude::*, px, relative,
 };
 use paseo_client::{ProviderUsage, UsageBalance, UsageWindow};
-use std::collections::HashSet;
+use std::collections::{HashMap, hash_map::Entry};
 use std::time::{Duration, Instant};
 use ui::{Indicator, Tooltip, prelude::*};
 use workspace::{HideStatusItem, Item, ItemHandle, StatusItemView, Workspace, item::ItemEvent};
 
+use crate::attention::HostActivity;
 use crate::composer::format_tokens;
-use crate::store::{ConnectionStatus, PaseoStore, agent_is_running, agent_provider};
+use crate::store::{ConnectionStatus, PaseoStore, agent_provider};
 use crate::timeline::parse_timestamp;
 
 /// Paseo treats usage as fresh for five minutes before refetching on open.
@@ -104,7 +105,7 @@ enum UsageState {
     Failed(String),
 }
 
-/// Paseo's "Plan usage" page: each provider's plan limits for the connected host.
+/// Paseo's "Provider Usage" page: each provider's plan limits for the connected host.
 pub struct ProviderUsageView {
     store: Entity<PaseoStore>,
     state: UsageState,
@@ -117,7 +118,7 @@ pub struct ProviderUsageView {
 
 impl ProviderUsageView {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let store = crate::store(cx);
+        let store = crate::hosts::current_store(cx);
         let subscription = cx.observe(&store, |view, store, cx| {
             let (generation, status) = {
                 let store = store.read(cx);
@@ -272,23 +273,34 @@ impl ProviderUsageView {
             .w_full()
             .p_4()
             .gap_3()
-            .rounded(px(12.))
+            .rounded_md()
             .border_1()
             .border_color(colors.border_variant)
             .bg(colors.editor_background)
             .child(
                 h_flex()
                     .gap_2()
-                    .child(Label::new(provider.display_name.clone()).weight(FontWeight::SEMIBOLD))
-                    .when_some(provider.plan_label.clone(), |this, plan| {
-                        this.child(
-                            div()
-                                .px_1p5()
-                                .rounded_sm()
-                                .bg(colors.element_background)
-                                .child(Label::new(plan).size(LabelSize::Small).color(Color::Muted)),
-                        )
-                    })
+                    .child(
+                        Label::new(crate::daemon::provider_display_name(
+                            &provider.provider_id,
+                            Some(&provider.display_name),
+                        ))
+                        .weight(FontWeight::SEMIBOLD),
+                    )
+                    .when_some(
+                        provider.plan_label.as_deref().map(readable_plan_name),
+                        |this, plan| {
+                            this.child(
+                                div()
+                                    .px_1p5()
+                                    .rounded_md()
+                                    .bg(colors.element_background)
+                                    .child(
+                                        Label::new(plan).size(LabelSize::Small).color(Color::Muted),
+                                    ),
+                            )
+                        },
+                    )
                     .child(div().flex_1())
                     .when_some(status, |this, (label, color)| {
                         this.child(
@@ -342,14 +354,6 @@ impl ProviderUsageView {
             })
             .into_any_element()
     }
-
-    fn render_message(message: &'static str) -> AnyElement {
-        v_flex()
-            .py_8()
-            .items_center()
-            .child(Label::new(message).color(Color::Muted))
-            .into_any_element()
-    }
 }
 
 impl EventEmitter<ItemEvent> for ProviderUsageView {}
@@ -366,38 +370,58 @@ impl Render for ProviderUsageView {
         let connected = self.store.read(cx).status == ConnectionStatus::Connected;
         let loading = matches!(self.state, UsageState::Loading);
         let body = if !connected {
-            Self::render_message("Connect to this host to see provider usage")
+            crate::render_message("Connect to this host to see provider usage", None, None)
         } else if !self.supported(cx) {
-            Self::render_message("Update the host to see provider usage")
+            crate::render_message("Update the host to see provider usage", None, None)
         } else {
             match &self.state {
                 UsageState::Idle | UsageState::Loading => crate::render_loading("Loading usage…"),
-                UsageState::Failed(error) => v_flex()
-                    .p_4()
-                    .gap_2()
-                    .rounded(px(12.))
-                    .border_1()
-                    .border_color(cx.theme().status().error_border)
-                    .bg(cx.theme().status().error_background)
-                    .child(Label::new("Unable to load usage").weight(FontWeight::SEMIBOLD))
-                    .child(Label::new(error.clone()).size(LabelSize::Small))
-                    .child(
-                        h_flex().child(
-                            Button::new("paseo-usage-retry", "Try again")
-                                .style(ButtonStyle::Filled)
-                                .on_click(cx.listener(|view, _, _, cx| view.refresh(cx))),
-                        ),
-                    )
-                    .into_any_element(),
+                UsageState::Failed(error) => crate::render_error(
+                    "Unable to load usage",
+                    error.clone(),
+                    Some(
+                        h_flex()
+                            .child(
+                                Button::new("paseo-usage-retry", "Try again")
+                                    .style(ButtonStyle::Filled)
+                                    .on_click(cx.listener(|view, _, _, cx| view.refresh(cx))),
+                            )
+                            .into_any_element(),
+                    ),
+                    cx,
+                ),
                 UsageState::Loaded(providers) if providers.is_empty() => {
-                    Self::render_message("No usage data")
+                    crate::render_message("No usage data", None, None)
                 }
                 UsageState::Loaded(providers) => {
+                    let unavailable = providers
+                        .iter()
+                        .filter(|provider| provider.status == "unavailable")
+                        .map(|provider| {
+                            crate::daemon::provider_display_name(
+                                &provider.provider_id,
+                                Some(&provider.display_name),
+                            )
+                        })
+                        .collect::<Vec<_>>();
                     v_flex()
                         .gap_3()
-                        .children(providers.iter().enumerate().map(|(index, provider)| {
-                            self.render_provider(index, provider, now, cx)
-                        }))
+                        .children(
+                            providers
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, provider)| provider.status != "unavailable")
+                                .map(|(index, provider)| {
+                                    self.render_provider(index, provider, now, cx)
+                                }),
+                        )
+                        .when(!unavailable.is_empty(), |this| {
+                            this.child(
+                                Label::new(format!("Unavailable: {}", unavailable.join(", ")))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        })
                         .into_any_element()
                 }
             }
@@ -411,7 +435,7 @@ impl Render for ProviderUsageView {
             .unwrap_or_default();
         div()
             .id("paseo-usage")
-            .key_context("PaseoUsage")
+            .key_context("PaseoUsage PaseoView")
             .track_focus(&self.focus_handle)
             .size_full()
             .overflow_y_scroll()
@@ -429,7 +453,8 @@ impl Render for ProviderUsageView {
                                     v_flex()
                                         .flex_1()
                                         .child(
-                                            Headline::new("Plan usage").size(HeadlineSize::Small),
+                                            Headline::new("Provider Usage")
+                                                .size(HeadlineSize::Small),
                                         )
                                         .child(
                                             Label::new(format!(
@@ -500,91 +525,159 @@ pub(crate) fn compact_timing(window: &UsageWindow, now: DateTime<Utc>) -> Option
     })
 }
 
-/// The current agent's provider limits in the status bar, like Paseo's usage chip.
-pub struct UsageStatusItem {
+/// Provider usage per host, shared by every workspace's status item, so several workspaces
+/// showing one host poll it once rather than once each.
+struct SharedUsage {
+    hosts: HashMap<EntityId, HostUsage>,
+    /// The host each status item shows, so a host no item shows stops polling.
+    shown_by: HashMap<EntityId, EntityId>,
+    _refresh_timer: Task<()>,
+}
+
+struct HostUsage {
     store: Entity<PaseoStore>,
-    active_agent_id: Option<String>,
     usage: Vec<ProviderUsage>,
     loaded_at: Option<Instant>,
     loading: bool,
-    running_agents: HashSet<String>,
     connected: bool,
-    _refresh_timer: Task<()>,
+    /// How many agents ran at the last store change, as the title bar counts them; fewer now
+    /// means a turn finished, which can change usage.
+    running: usize,
     _store_subscription: Subscription,
 }
 
-impl UsageStatusItem {
-    pub fn new(cx: &mut Context<Self>) -> Self {
-        let store = crate::store(cx);
-        let store_subscription = cx.observe(&store, |item, _, cx| item.store_changed(cx));
-        let refresh_timer = cx.spawn(async move |item, cx| {
+struct GlobalSharedUsage(Entity<SharedUsage>);
+
+impl Global for GlobalSharedUsage {}
+
+fn shared_usage(cx: &mut App) -> Entity<SharedUsage> {
+    if let Some(shared) = cx.try_global::<GlobalSharedUsage>() {
+        return shared.0.clone();
+    }
+    let shared = cx.new(|cx| SharedUsage {
+        hosts: HashMap::default(),
+        shown_by: HashMap::default(),
+        _refresh_timer: cx.spawn(async move |shared, cx| {
             loop {
                 cx.background_executor().timer(STALE_AFTER).await;
-                if item.update(cx, |item, cx| item.refresh(cx)).is_err() {
+                if shared
+                    .update(cx, |shared: &mut SharedUsage, cx| shared.refresh_all(cx))
+                    .is_err()
+                {
                     break;
                 }
             }
-        });
-        let mut item = Self {
-            store,
-            active_agent_id: None,
-            usage: Vec::new(),
-            loaded_at: None,
-            loading: false,
-            running_agents: HashSet::new(),
-            connected: false,
-            _refresh_timer: refresh_timer,
-            _store_subscription: store_subscription,
-        };
-        item.store_changed(cx);
-        item
+        }),
+    });
+    cx.set_global(GlobalSharedUsage(shared.clone()));
+    shared
+}
+
+impl SharedUsage {
+    /// Records that `item` shows `store`'s usage, starting to follow that host if no item did.
+    fn show(&mut self, item: EntityId, store: &Entity<PaseoStore>, cx: &mut Context<Self>) {
+        self.shown_by.insert(item, store.entity_id());
+        if let Entry::Vacant(entry) = self.hosts.entry(store.entity_id()) {
+            let subscription = cx.observe(store, |shared, store, cx| {
+                shared.store_changed(store.entity_id(), cx)
+            });
+            entry.insert(HostUsage {
+                store: store.clone(),
+                usage: Vec::new(),
+                loaded_at: None,
+                loading: false,
+                connected: false,
+                running: 0,
+                _store_subscription: subscription,
+            });
+            self.store_changed(store.entity_id(), cx);
+        }
+        self.forget_unshown_hosts();
     }
 
-    fn store_changed(&mut self, cx: &mut Context<Self>) {
-        let store = self.store.read(cx);
+    fn forget(&mut self, item: EntityId) {
+        self.shown_by.remove(&item);
+        self.forget_unshown_hosts();
+    }
+
+    fn forget_unshown_hosts(&mut self) {
+        let shown_by = &self.shown_by;
+        self.hosts
+            .retain(|host, _| shown_by.values().any(|shown| shown == host));
+    }
+
+    fn usage(&self, store: &Entity<PaseoStore>) -> &[ProviderUsage] {
+        self.hosts
+            .get(&store.entity_id())
+            .map_or(&[], |host| host.usage.as_slice())
+    }
+
+    fn store_changed(&mut self, host: EntityId, cx: &mut Context<Self>) {
+        let Some(host_usage) = self.hosts.get_mut(&host) else {
+            return;
+        };
+        let store = host_usage.store.read(cx);
         let connected = store.status == ConnectionStatus::Connected;
-        let running_agents: HashSet<String> = store
-            .state
-            .agents
-            .iter()
-            .filter(|agent| agent_is_running(agent))
-            .map(|agent| agent.id.clone())
-            .collect();
-        let reconnected = connected && !self.connected;
-        let turn_finished = !self.running_agents.is_subset(&running_agents);
-        self.connected = connected;
-        self.running_agents = running_agents;
+        let running = HostActivity::of_stores([store]).running;
+        let reconnected = connected && !host_usage.connected;
+        let turn_finished = running < host_usage.running;
+        host_usage.connected = connected;
+        host_usage.running = running;
         if !connected {
-            if !self.usage.is_empty() {
-                self.usage.clear();
-                self.loaded_at = None;
+            if !host_usage.usage.is_empty() {
+                host_usage.usage.clear();
+                host_usage.loaded_at = None;
                 cx.notify();
             }
         } else if reconnected || turn_finished {
-            self.refresh(cx);
+            self.refresh(host, cx);
         }
     }
 
-    fn refresh(&mut self, cx: &mut Context<Self>) {
-        let store = self.store.read(cx);
-        if self.loading
+    fn refresh_if_stale(&mut self, host: EntityId, cx: &mut Context<Self>) {
+        let stale = self.hosts.get(&host).is_some_and(|host_usage| {
+            host_usage
+                .loaded_at
+                .is_none_or(|loaded_at| loaded_at.elapsed() > STALE_AFTER)
+        });
+        if stale {
+            self.refresh(host, cx);
+        }
+    }
+
+    fn refresh_all(&mut self, cx: &mut Context<Self>) {
+        for host in self.hosts.keys().copied().collect::<Vec<_>>() {
+            self.refresh(host, cx);
+        }
+    }
+
+    fn refresh(&mut self, host: EntityId, cx: &mut Context<Self>) {
+        let Some(host_usage) = self.hosts.get_mut(&host) else {
+            return;
+        };
+        let store = host_usage.store.read(cx);
+        if host_usage.loading
             || store.status != ConnectionStatus::Connected
             || !store.server_info.has_feature("providerUsageList")
         {
             return;
         }
-        self.loading = true;
-        let task = self.store.update(cx, |store, cx| {
+        host_usage.loading = true;
+        let task = host_usage.store.update(cx, |store, cx| {
             store.session_request(cx, |session| async move { session.provider_usage().await })
         });
-        cx.spawn(async move |item, cx| {
+        cx.spawn(async move |shared, cx| {
             let result = task.await;
-            item.update(cx, |item, cx| {
-                item.loading = false;
+            shared.update(cx, |shared, cx| {
+                // No item shows this host any more.
+                let Some(host_usage) = shared.hosts.get_mut(&host) else {
+                    return;
+                };
+                host_usage.loading = false;
                 match result {
                     Ok(usage) => {
-                        item.usage = usage;
-                        item.loaded_at = Some(Instant::now());
+                        host_usage.usage = usage;
+                        host_usage.loaded_at = Some(Instant::now());
                     }
                     Err(error) => log::warn!("Paseo provider usage failed: {error:#}"),
                 }
@@ -593,15 +686,81 @@ impl UsageStatusItem {
         })
         .detach_and_log_err(cx);
     }
+}
 
-    fn provider_usage(&self, cx: &App) -> Option<&ProviderUsage> {
+/// The current agent's provider limits in the status bar, like Paseo's usage chip.
+pub struct UsageStatusItem {
+    store: Entity<PaseoStore>,
+    active_agent_id: Option<String>,
+    shared: Entity<SharedUsage>,
+    /// The registry relays every host's changes and focus moves, so the item can follow the
+    /// agent in view to its host once that loads.
+    _subscriptions: [Subscription; 3],
+}
+
+impl UsageStatusItem {
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        let store = crate::hosts::default_store(cx);
+        let registry = crate::hosts::registry(cx);
+        let shared = shared_usage(cx);
+        let subscriptions = [
+            cx.observe(&registry, |item, _, cx| item.hosts_changed(cx)),
+            cx.subscribe(&registry, |item, _, event, cx| {
+                if matches!(event, crate::hosts::HostsEvent::FocusChanged) {
+                    item.hosts_changed(cx);
+                }
+            }),
+            cx.observe(&shared, |_, _, cx| cx.notify()),
+        ];
+        let item_id = cx.entity_id();
+        cx.on_release(move |item, cx| item.shared.update(cx, |shared, _| shared.forget(item_id)))
+            .detach();
+        shared.update(cx, |shared, cx| shared.show(item_id, &store, cx));
+        let mut item = Self {
+            store,
+            active_agent_id: None,
+            shared,
+            _subscriptions: subscriptions,
+        };
+        item.hosts_changed(cx);
+        item
+    }
+
+    /// Moves to the host of the agent in view, since usage is per host and an agent on another
+    /// host would otherwise show nothing.
+    fn hosts_changed(&mut self, cx: &mut Context<Self>) {
+        let agent_host = match self.active_agent_id.clone() {
+            // Every change on any host lands here, so only look across hosts once the agent in
+            // view isn't on the current one.
+            Some(agent_id) if self.store.read(cx).agent(&agent_id).is_none() => {
+                crate::hosts::store_for_agent(&agent_id, cx)
+            }
+            Some(_) => None,
+            None => crate::hosts::focused_store(cx),
+        };
+        if let Some(store) = agent_host
+            && store != self.store
+        {
+            self.store = store;
+            let item_id = cx.entity_id();
+            let store = self.store.clone();
+            self.shared
+                .update(cx, |shared, cx| shared.show(item_id, &store, cx));
+            cx.notify();
+        }
+    }
+
+    fn provider_usage<'a>(&self, cx: &'a App) -> Option<&'a ProviderUsage> {
         let store = self.store.read(cx);
+        let focused_agent = crate::hosts::focused_agent(cx);
         let agent_id = self
             .active_agent_id
             .as_deref()
-            .or(store.focused_agent.as_deref())?;
+            .or(focused_agent.as_deref())?;
         let provider = agent_provider(store.agent(agent_id)?);
-        self.usage
+        self.shared
+            .read(cx)
+            .usage(&self.store)
             .iter()
             .find(|usage| usage.provider_id == provider && usage.status == "available")
     }
@@ -690,14 +849,16 @@ impl Render for UsageStatusItem {
             .id("paseo-usage-status")
             .px_1()
             .gap_1()
-            .rounded_sm()
+            .rounded_md()
             .cursor_pointer()
             .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
             .child(
                 Label::new(usage.display_name.clone())
                     .size(LabelSize::Small)
+                    .weight(gpui::FontWeight::SEMIBOLD)
                     .color(Color::Default),
             )
+            .child(separator())
             .children(segments)
             .tooltip(move |_, cx| {
                 Tooltip::with_meta(title.clone(), None, tooltip_lines.clone(), cx)
@@ -722,12 +883,10 @@ impl StatusItemView for UsageStatusItem {
         // Other tabs, such as files, keep showing the agent that was last in view.
         if agent_id.is_some() && agent_id != self.active_agent_id {
             self.active_agent_id = agent_id;
-            if self
-                .loaded_at
-                .is_none_or(|loaded_at| loaded_at.elapsed() > STALE_AFTER)
-            {
-                self.refresh(cx);
-            }
+            self.hosts_changed(cx);
+            let host = self.store.entity_id();
+            self.shared
+                .update(cx, |shared, cx| shared.refresh_if_stale(host, cx));
             cx.notify();
         }
     }
@@ -737,9 +896,84 @@ impl StatusItemView for UsageStatusItem {
     }
 }
 
+/// Turns a plan id such as `self_serve_business_prolite` into text; values that already read as
+/// text (with a space or a capital letter) are kept.
+fn readable_plan_name(plan: &str) -> String {
+    if plan.contains(' ') || plan.chars().any(char::is_uppercase) {
+        return plan.to_owned();
+    }
+    crate::capitalize_first(&plan.replace(['_', '-'], " "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn status_item_follows_the_focused_agents_host(cx: &mut gpui::TestAppContext) {
+        use settings::Settings as _;
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            crate::PaseoSettings::register(cx);
+            crate::hosts::init(cx);
+        });
+        cx.update(|cx| {
+            cx.update_global::<settings::SettingsStore, _>(|settings, cx| {
+                settings.update_user_settings(cx, |settings| {
+                    settings.paseo = Some(settings::PaseoSettingsContent {
+                        profiles: Some(
+                            ["Test", "Local"]
+                                .map(|name| settings::PaseoConnectionProfile {
+                                    name: name.into(),
+                                    target_uri: format!("ws://localhost:{}/ws", 6000 + name.len()),
+                                    editor_ssh_uri: None,
+                                    client_id: format!("client-{name}"),
+                                })
+                                .to_vec(),
+                        ),
+                        active_profile: Some("Test".into()),
+                        ..Default::default()
+                    });
+                });
+            });
+        });
+        cx.run_until_parked();
+        let item = cx.new(UsageStatusItem::new);
+        let local = cx.update(|cx| crate::hosts::store_named("Local", cx));
+        assert!(
+            cx.read(|cx| item.read(cx).store != local),
+            "starts on the default host"
+        );
+        local.update(cx, |store, cx| {
+            store.handle_event(
+                paseo_client::PaseoEvent::AgentsChanged(vec![crate::store::test_agent(
+                    "on-local",
+                    "idle",
+                    serde_json::json!({}),
+                )]),
+                cx,
+            )
+        });
+        cx.update(|cx| crate::hosts::set_focused_agent("on-local".into(), cx));
+        cx.run_until_parked();
+        assert!(
+            cx.read(|cx| item.read(cx).store == local),
+            "follows the host of the agent in view"
+        );
+    }
+
+    #[test]
+    fn plan_ids_read_as_text() {
+        assert_eq!(
+            readable_plan_name("self_serve_business_prolite"),
+            "Self serve business prolite"
+        );
+        assert_eq!(readable_plan_name("pro-max"), "Pro max");
+        assert_eq!(readable_plan_name("Team 5x"), "Team 5x");
+        assert_eq!(readable_plan_name("Pro"), "Pro");
+        assert_eq!(readable_plan_name(""), "");
+    }
 
     fn window(used_percent: Option<f64>) -> UsageWindow {
         UsageWindow {

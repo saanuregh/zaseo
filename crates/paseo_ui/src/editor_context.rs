@@ -296,7 +296,7 @@ fn target(workspace: &Workspace, cx: &App) -> Target {
             }
             _ => return Target::Tab(tab),
         },
-        None => match crate::store(cx).read(cx).focused_agent.clone() {
+        None => match crate::hosts::focused_agent(cx) {
             Some(agent_id) if crate::workspace_owns_agent(workspace, &agent_id, cx) => agent_id,
             _ => return Target::Draft,
         },
@@ -305,7 +305,7 @@ fn target(workspace: &Workspace, cx: &App) -> Target {
         Some((parent_agent_id, _)) => parent_agent_id.to_owned(),
         None => agent_id,
     };
-    if crate::store(cx).read(cx).agent(&agent_id).is_some() {
+    if crate::hosts::store_for_agent(&agent_id, cx).is_some() {
         Target::Agent(agent_id)
     } else {
         Target::Draft

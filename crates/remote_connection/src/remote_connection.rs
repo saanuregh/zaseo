@@ -1,4 +1,7 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::Result;
 use askpass::EncryptedPassword;
@@ -8,6 +11,7 @@ use gpui::{
     AnyWindowHandle, App, AsyncApp, DismissEvent, Entity, EventEmitter, Focusable, FontFeatures,
     ParentElement as _, Render, SharedString, Task, TextStyleRefinement, WeakEntity,
 };
+use http_client::{AsyncBody, HttpClient};
 use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use release_channel::ReleaseChannel;
 use remote::{ConnectionIdentifier, RemoteClient, RemoteConnectionOptions, RemotePlatform};
@@ -492,6 +496,15 @@ impl remote::RemoteClientDelegate for RemoteClientDelegate {
         version: Option<Version>,
         cx: &mut AsyncApp,
     ) -> Task<anyhow::Result<PathBuf>> {
+        if release_channel == ReleaseChannel::Dev {
+            self.set_status(Some("Downloading remote server"), cx);
+            let http_client = cx.update(|cx| cx.http_client());
+            return cx.background_spawn(download_upstream_remote_server(
+                paths::remote_servers_dir().clone(),
+                platform,
+                http_client,
+            ));
+        }
         let this = self.clone();
         cx.spawn(async move |cx| {
             AutoUpdater::download_remote_server_release(
@@ -659,6 +672,14 @@ impl remote::RemoteClientDelegate for BackgroundRemoteClientDelegate {
         version: Option<Version>,
         cx: &mut AsyncApp,
     ) -> Task<anyhow::Result<PathBuf>> {
+        if release_channel == ReleaseChannel::Dev {
+            let http_client = cx.update(|cx| cx.http_client());
+            return cx.background_spawn(download_upstream_remote_server(
+                paths::remote_servers_dir().clone(),
+                platform,
+                http_client,
+            ));
+        }
         cx.spawn(async move |cx| {
             AutoUpdater::download_remote_server_release(
                 release_channel,
@@ -701,6 +722,79 @@ impl remote::RemoteClientDelegate for BackgroundRemoteClientDelegate {
             .await
         })
     }
+}
+
+fn upstream_remote_server_cache_path(root: &Path, platform: RemotePlatform) -> PathBuf {
+    let extension = if platform.os.is_windows() {
+        "zip"
+    } else {
+        "gz"
+    };
+    root.join("upstream")
+        .join(remote::UPSTREAM_REMOTE_SERVER_TAG)
+        .join(format!(
+            "{}-{}.{extension}",
+            platform.os.as_str(),
+            platform.arch.as_str()
+        ))
+}
+
+/// Downloads the pinned upstream server into the cache under `root`, reusing a finished download.
+async fn download_upstream_remote_server(
+    root: PathBuf,
+    platform: RemotePlatform,
+    http_client: Arc<dyn HttpClient>,
+) -> Result<PathBuf> {
+    let path = upstream_remote_server_cache_path(&root, platform);
+    if smol::fs::metadata(&path).await.is_ok() {
+        return Ok(path);
+    }
+
+    let url = remote::upstream_remote_server_url(platform);
+    let directory = path
+        .parent()
+        .context("remote server cache path has no parent directory")?;
+    smol::fs::create_dir_all(directory)
+        .await
+        .with_context(|| format!("creating {}", directory.display()))?;
+
+    let mut response = http_client
+        .get(&url, AsyncBody::default(), true)
+        .await
+        .with_context(|| format!("downloading {url}"))?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "failed to download {url}: {}",
+        response.status()
+    );
+
+    // Download beside the final path so the rename is atomic and a partial file is never reused.
+    // Two hosts can fetch the same platform at once, so each download gets its own file.
+    static DOWNLOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let download = DOWNLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp_path = path.with_extension(format!("download-{}-{download}", std::process::id()));
+    let result = async {
+        let mut file = smol::fs::File::create(&temp_path)
+            .await
+            .with_context(|| format!("creating {}", temp_path.display()))?;
+        smol::io::copy(response.body_mut(), &mut file)
+            .await
+            .with_context(|| format!("downloading {url}"))?;
+        smol::fs::rename(&temp_path, &path)
+            .await
+            .with_context(|| format!("moving {} into place", temp_path.display()))
+    }
+    .await;
+    if let Err(error) = result {
+        if let Err(remove_error) = smol::fs::remove_file(&temp_path).await {
+            log::debug!(
+                "Could not remove the partial download {}: {remove_error}",
+                temp_path.display()
+            );
+        }
+        return Err(error);
+    }
+    Ok(path)
 }
 
 pub fn connect(
@@ -748,6 +842,109 @@ mod tests {
     use settings::SettingsStore;
 
     use super::*;
+
+    #[test]
+    fn upstream_remote_server_cache_path_layout() {
+        let root = Path::new("/cache");
+        let path = upstream_remote_server_cache_path(
+            root,
+            RemotePlatform {
+                os: remote::RemoteOs::Linux,
+                arch: remote::RemoteArch::Aarch64,
+            },
+        );
+        assert_eq!(
+            path,
+            root.join("upstream")
+                .join(remote::UPSTREAM_REMOTE_SERVER_TAG)
+                .join("linux-aarch64.gz"),
+        );
+
+        let path = upstream_remote_server_cache_path(
+            root,
+            RemotePlatform {
+                os: remote::RemoteOs::Windows,
+                arch: remote::RemoteArch::X86_64,
+            },
+        );
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("windows-x86_64.zip"),
+        );
+    }
+
+    #[test]
+    fn upstream_remote_server_downloads_once_into_the_cache() {
+        let platform = RemotePlatform {
+            os: remote::RemoteOs::Linux,
+            arch: remote::RemoteArch::X86_64,
+        };
+        let expected_url = remote::upstream_remote_server_url(platform);
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client = http_client::FakeHttpClient::create({
+            let requests = requests.clone();
+            move |request| {
+                let requests = requests.clone();
+                let expected_url = expected_url.clone();
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let status = if request.uri().to_string() == expected_url {
+                        200
+                    } else {
+                        404
+                    };
+                    Ok(http_client::Response::builder()
+                        .status(status)
+                        .body(AsyncBody::from("server bytes".to_owned()))?)
+                }
+            }
+        });
+        let root = tempfile::tempdir().unwrap();
+
+        let path = smol::block_on(download_upstream_remote_server(
+            root.path().to_path_buf(),
+            platform,
+            client.clone(),
+        ))
+        .unwrap();
+        assert_eq!(
+            path,
+            upstream_remote_server_cache_path(root.path(), platform)
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "server bytes");
+
+        // A finished download is reused without asking GitHub again.
+        let again = smol::block_on(download_upstream_remote_server(
+            root.path().to_path_buf(),
+            platform,
+            client,
+        ))
+        .unwrap();
+        assert_eq!(again, path);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn upstream_remote_server_download_failure_names_the_url() {
+        let platform = RemotePlatform {
+            os: remote::RemoteOs::MacOs,
+            arch: remote::RemoteArch::Aarch64,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let error = smol::block_on(download_upstream_remote_server(
+            root.path().to_path_buf(),
+            platform,
+            http_client::FakeHttpClient::with_404_response(),
+        ))
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&remote::upstream_remote_server_url(platform)),
+            "{error}"
+        );
+        assert!(!upstream_remote_server_cache_path(root.path(), platform).exists());
+    }
 
     #[gpui::test]
     fn clears_prompt_when_password_request_is_cancelled(cx: &mut TestAppContext) {

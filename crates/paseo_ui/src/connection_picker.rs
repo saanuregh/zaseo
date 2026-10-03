@@ -13,7 +13,7 @@ use ui_input::InputField;
 use url::Url;
 use workspace::{ModalView, Workspace};
 
-use crate::{PaseoSettings, client_id_for, store};
+use crate::{PaseoSettings, hosts, store::ConnectionStatus};
 
 pub(super) fn parse_target(profile: &PaseoConnectionProfile) -> Result<ConnectionTarget> {
     if profile.client_id.trim().is_empty() {
@@ -21,7 +21,7 @@ pub(super) fn parse_target(profile: &PaseoConnectionProfile) -> Result<Connectio
     }
     if profile.target_uri.starts_with("ssh://") {
         if profile.editor_ssh_uri.is_some() {
-            bail!("SSH Paseo profiles use their target for the editor connection");
+            bail!("SSH hosts use their target address for the editor connection");
         }
         return paseo_client::parse_ssh_uri(&profile.target_uri);
     }
@@ -80,40 +80,12 @@ pub(crate) fn open_hosts(
     workspace.toggle_modal(window, cx, |window, cx| HostsModal::new(fs, window, cx));
 }
 
-/// Renames the title an agent shows: its workspace's name when it is alone in one, otherwise its
-/// own title.
-pub(crate) fn open_rename(
-    workspace: &mut Workspace,
-    agent_id: String,
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-) {
-    let (lone_workspace, current) = {
-        let store = store(cx).read(cx);
-        let Some(agent) = store.agent(&agent_id) else {
-            return;
-        };
-        (
-            store.lone_agent_workspace(agent).cloned(),
-            crate::store::agent_title(agent),
-        )
-    };
-    if let Some(descriptor) = lone_workspace {
-        crate::workspace_tools::open_workspace_rename(workspace, &descriptor, window, cx);
-        return;
-    }
-    crate::workspace_tools::open_text_prompt(
-        workspace,
-        "Rename agent",
-        "Agent name",
-        &current,
-        move |name, _, cx| {
-            let agent_id = agent_id.clone();
-            store(cx).update(cx, |store, cx| store.rename(&agent_id, name, cx));
-        },
-        window,
-        cx,
-    );
+/// Makes `name` the host new agents start on.
+pub(crate) fn set_default_host(name: String, cx: &mut App) {
+    let fs = <dyn Fs>::global(cx);
+    settings::update_settings_file(fs, cx, move |settings, _| {
+        settings.paseo.get_or_insert_default().active_profile = Some(name);
+    });
 }
 
 pub struct HostsModal {
@@ -229,6 +201,10 @@ impl HostsModal {
             let profiles = paseo.profiles.get_or_insert_default();
             if let Some(replaced) = replaced.filter(|replaced| *replaced != profile.name) {
                 profiles.retain(|existing| existing.name != replaced);
+                // A renamed default host stays the default.
+                if paseo.active_profile.as_deref() == Some(replaced.as_str()) {
+                    paseo.active_profile = Some(profile.name.clone());
+                }
             }
             if let Some(existing) = profiles
                 .iter_mut()
@@ -238,7 +214,10 @@ impl HostsModal {
             } else {
                 profiles.push(profile.clone());
             }
-            paseo.active_profile = Some(profile.name);
+            // The first host saved becomes the default for new agents; later ones keep it.
+            if paseo.active_profile.is_none() {
+                paseo.active_profile = Some(profile.name);
+            }
         })
     }
 
@@ -254,15 +233,16 @@ impl HostsModal {
         let password = self.password.read(cx).text(cx);
         self.password
             .update(cx, |input, cx| input.clear(window, cx));
+        if let Some(old_name) = self
+            .editing
+            .as_deref()
+            .filter(|old_name| *old_name != profile.name)
+        {
+            hosts::rename_host(old_name, &profile.name, cx);
+        }
         let completion = self.persist(profile.clone(), self.editing.clone(), cx);
         if connect {
-            let store = store(cx);
-            let mut connection_profile = profile.clone();
-            connection_profile.client_id = client_id_for(&connection_profile, cx);
-            store.update(cx, |store, cx| {
-                let generation = store.begin_connection(connection_profile.clone());
-                store.connect(connection_profile, Some(password), generation, cx);
-            });
+            hosts::connect_host(profile.clone(), password, cx);
         }
         self.editing = Some(profile.name);
         cx.spawn(async move |this, cx| {
@@ -322,20 +302,22 @@ impl Render for HostsModal {
         let colors = cx.theme().colors();
         let settings = PaseoSettings::get_global(cx);
         let profiles = settings.profiles.clone();
-        let active = store(cx)
+        let connected_hosts = hosts::registry(cx)
             .read(cx)
-            .active_profile
-            .as_ref()
-            .map(|profile| profile.name.clone());
+            .hosts()
+            .iter()
+            .filter(|host| host.store.read(cx).status == ConnectionStatus::Connected)
+            .map(|host| host.name().to_owned())
+            .collect::<Vec<_>>();
         let warning = is_unencrypted_remote(&self.target.read(cx).text(cx));
         v_flex()
-            .key_context("PaseoHosts")
+            .key_context("PaseoHosts PaseoView")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))
             .w(px(560.))
             .elevation_3(cx)
-            .rounded_lg()
+            .rounded_md()
             .overflow_hidden()
             .child(
                 h_flex()
@@ -364,23 +346,18 @@ impl Render for HostsModal {
                             .border_color(colors.border_variant)
                             .children(profiles.into_iter().enumerate().map(|(index, profile)| {
                                 let selected = self.editing.as_deref() == Some(profile.name.as_str());
-                                let connected = active.as_deref() == Some(profile.name.as_str());
+                                let connected = connected_hosts.contains(&profile.name);
                                 let target = profile.target_uri.clone();
                                 let name = profile.name.clone();
-                                h_flex()
-                                    .id(("paseo-host", index))
-                                    .px_2()
-                                    .py_1()
-                                    .gap_2()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .when(selected, |this| this.bg(colors.element_selected))
-                                    .hover(|style| style.bg(colors.ghost_element_hover))
+                                ui::ListItem::new(("paseo-host", index))
+                                    .height(rems_from_px(28_f32))
+                                    .rounded()
+                                    .toggle_state(selected)
                                     .tooltip(Tooltip::text(target))
                                     .on_click(cx.listener(move |modal, _, window, cx| {
                                         modal.load(&profile, window, cx)
                                     }))
-                                    .child(
+                                    .start_slot(
                                         Icon::new(IconName::Server)
                                             .size(IconSize::Small)
                                             .color(if connected { Color::Success } else { Color::Muted }),
@@ -394,11 +371,23 @@ impl Render for HostsModal {
                     .child(
                         v_flex()
                             .flex_1()
+                            .min_w_0()
                             .p_4()
                             .gap_3()
                             .child(self.name.clone())
                             .child(self.target.clone())
-                            .child(self.editor_ssh.clone())
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .child(self.editor_ssh.clone())
+                                    .child(
+                                        Label::new(
+                                            "Optional. The ssh:// address Zaseo uses to open this host's folders in the editor.",
+                                        )
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                    ),
+                            )
                             .child(self.password.clone())
                             .when(warning, |this| {
                                 this.child(
@@ -435,11 +424,36 @@ impl Render for HostsModal {
                     .gap_2()
                     .justify_between()
                     .child(
-                        ui::Button::new("paseo-delete-host", "Delete")
+                        ui::Button::new("paseo-delete-host", "Delete…")
                             .label_size(LabelSize::Small)
                             .color(Color::Error)
                             .disabled(self.editing.is_none())
-                            .on_click(cx.listener(|modal, _, window, cx| modal.delete(window, cx))),
+                            .on_click(cx.listener(|modal, _, window, cx| {
+                                let Some(name) = modal.editing.clone() else {
+                                    return;
+                                };
+                                let modal = cx.entity().downgrade();
+                                let window_handle = window.window_handle();
+                                crate::workspace_tools::confirm_then(
+                                    "Delete this host?",
+                                    &format!(
+                                        "The saved connection for \"{name}\" is removed from settings."
+                                    ),
+                                    "Delete",
+                                    move |cx| {
+                                        if let Err(error) = window_handle
+                                            .update(cx, |_, window, cx| {
+                                                modal.update(cx, |modal, cx| modal.delete(window, cx))
+                                            })
+                                            .and_then(|result| result)
+                                        {
+                                            log::debug!("Paseo Manage Hosts closed: {error}");
+                                        }
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            })),
                     )
                     .child(
                         h_flex()

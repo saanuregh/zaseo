@@ -1236,6 +1236,15 @@ impl App {
             .insert(window_handle.id, tracked_entities);
     }
 
+    /// Whether some open window's last frame used `entity_id`: its view was drawn, or a view
+    /// read it while drawing. A view in a hidden dock or a background tab isn't, so it can tell
+    /// whether a change it gets now is on screen.
+    pub fn in_last_frame(&self, entity_id: EntityId) -> bool {
+        self.tracked_entities
+            .values()
+            .any(|entities| entities.contains(&entity_id))
+    }
+
     pub(crate) fn new_observer(&mut self, key: EntityId, value: Handler) -> Subscription {
         let (subscription, activate) = self.observers.insert(key, value);
         self.defer(move |_| activate());
@@ -3311,6 +3320,23 @@ mod test {
             self.0.set(self.0.get() + 1);
             Empty
         }
+    }
+
+    #[gpui::test]
+    fn in_last_frame_follows_what_the_window_drew(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| RenderCounter(Rc::new(Cell::new(0))));
+        let unshown = cx.new(|_| RenderCounter(Rc::new(Cell::new(0))));
+        cx.run_until_parked();
+        let shown = window.entity(cx).expect("the window's root view");
+        cx.update(|cx| {
+            assert!(cx.in_last_frame(shown.entity_id()));
+            assert!(!cx.in_last_frame(unshown.entity_id()));
+        });
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .expect("the window is open");
+        cx.run_until_parked();
+        cx.update(|cx| assert!(!cx.in_last_frame(shown.entity_id()), "the window closed"));
     }
 
     #[gpui::test]

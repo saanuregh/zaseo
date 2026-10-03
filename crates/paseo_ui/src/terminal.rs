@@ -68,13 +68,13 @@ pub struct PaseoTerminal {
 
 impl PaseoTerminal {
     fn new(
+        store: Entity<PaseoStore>,
         info: TerminalInfo,
         directory: String,
         workspace: &Workspace,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let store = crate::store(cx);
         let settings = TerminalSettings::get_global(cx).clone();
         let builder = TerminalBuilder::new_display_only(
             settings.cursor_shape,
@@ -343,12 +343,34 @@ impl Render for PaseoTerminal {
                     })
                     .when(!self.exited, |this| {
                         this.child(
-                            Button::new("paseo-terminal-kill", "Kill")
+                            Button::new("paseo-terminal-kill", "Kill…")
                                 .label_size(LabelSize::Small)
                                 .tooltip(Tooltip::text(
                                     "Stop the terminal's process on the Paseo host",
                                 ))
-                                .on_click(cx.listener(|this, _, window, cx| this.kill(window, cx))),
+                                .on_click(cx.listener(|_, _, window, cx| {
+                                    let terminal = cx.entity().downgrade();
+                                    let window_handle = window.window_handle();
+                                    crate::workspace_tools::confirm_then(
+                                        "Stop this terminal's process?",
+                                        "It stops on the Paseo host and can't be resumed.",
+                                        "Kill",
+                                        move |cx| {
+                                            if let Err(error) = window_handle
+                                                .update(cx, |_, window, cx| {
+                                                    terminal.update(cx, |terminal, cx| {
+                                                        terminal.kill(window, cx)
+                                                    })
+                                                })
+                                                .and_then(|result| result)
+                                            {
+                                                log::debug!("Paseo terminal closed: {error}");
+                                            }
+                                        },
+                                        window,
+                                        cx,
+                                    );
+                                })),
                         )
                     }),
             )
@@ -379,6 +401,7 @@ impl Item for PaseoTerminal {
 /// Opens a daemon terminal's tab, reusing one already open.
 pub fn open_terminal(
     workspace: &mut Workspace,
+    store: Entity<PaseoStore>,
     info: TerminalInfo,
     directory: String,
     window: &mut Window,
@@ -391,13 +414,18 @@ pub fn open_terminal(
         workspace.activate_item(&existing, true, true, window, cx);
         return;
     }
-    let tab = cx.new(|cx| PaseoTerminal::new(info, directory, workspace, window, cx));
+    let tab = cx.new(|cx| PaseoTerminal::new(store, info, directory, workspace, window, cx));
     workspace.add_item_to_active_pane(Box::new(tab), None, true, window, cx);
 }
 
-/// Starts a shell in `directory` on the Paseo host and opens it.
-pub fn new_terminal(directory: String, window: &mut Window, cx: &mut Context<Workspace>) {
-    let store = crate::store(cx);
+/// Starts a shell in `directory` on `store`'s host and opens it.
+pub fn new_terminal(
+    store: Entity<PaseoStore>,
+    directory: String,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let host = store.clone();
     let task: Task<Result<TerminalInfo>> = store.update(cx, |store, cx| {
         let directory = directory.clone();
         store.session_request(cx, move |session| async move {
@@ -407,26 +435,33 @@ pub fn new_terminal(directory: String, window: &mut Window, cx: &mut Context<Wor
     cx.spawn_in(window, async move |workspace, cx| {
         let result = task.await;
         workspace.update_in(cx, |workspace, window, cx| match result {
-            Ok(info) => open_terminal(workspace, info, directory, window, cx),
+            Ok(info) => open_terminal(workspace, host, info, directory, window, cx),
             Err(error) => workspace.show_error(error, cx),
         })
     })
     .detach_and_log_err(cx);
 }
 
-/// The agent's directory, where its new terminals start.
-pub(crate) fn agent_directory(agent_id: Option<String>, cx: &App) -> Option<String> {
-    Some(
-        crate::store(cx)
-            .read(cx)
-            .timeline_directory(&agent_id?)?
-            .to_str()?
-            .to_owned(),
-    )
+/// The agent's host and directory, where its new terminals start.
+pub(crate) fn agent_directory(
+    agent: Option<(Entity<PaseoStore>, String)>,
+    cx: &App,
+) -> Option<(Entity<PaseoStore>, String)> {
+    let (store, agent_id) = agent?;
+    let directory = store
+        .read(cx)
+        .timeline_directory(&agent_id)?
+        .to_str()?
+        .to_owned();
+    Some((store, directory))
 }
 
-pub(crate) fn terminals_for(directory: &str, cx: &App) -> Vec<TerminalInfo> {
-    crate::store(cx)
+pub(crate) fn terminals_for(
+    store: &Entity<PaseoStore>,
+    directory: &str,
+    cx: &App,
+) -> Vec<TerminalInfo> {
+    store
         .read(cx)
         .terminals
         .get(directory)
