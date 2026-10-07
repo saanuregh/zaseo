@@ -501,6 +501,8 @@ pub struct CreateAgent {
     pub directory: PathBuf,
     pub title: Option<String>,
     pub initial_prompt: Option<String>,
+    /// The initial prompt's message ID, which its timeline item echoes back.
+    pub client_message_id: Option<String>,
     pub mode_id: Option<String>,
     pub thinking_option_id: Option<String>,
     pub images: Vec<ImageAttachment>,

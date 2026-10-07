@@ -215,6 +215,9 @@ impl PaseoSession {
         if let Some(initial_prompt) = request.initial_prompt {
             message["initialPrompt"] = json!(initial_prompt);
         }
+        if let Some(client_message_id) = request.client_message_id {
+            message["clientMessageId"] = json!(client_message_id);
+        }
         if let Some(workspace_id) = request.workspace_id {
             message["workspaceId"] = json!(workspace_id);
         }
@@ -3552,6 +3555,7 @@ while True:
                 directory: "C:\\Users\\agent\\project".into(),
                 title: None,
                 initial_prompt: None,
+                client_message_id: None,
                 mode_id: Some("plan".into()),
                 thinking_option_id: Some("high".into()),
                 images: Vec::new(),
@@ -4587,6 +4591,7 @@ while True:
                 directory: "/tmp/project".into(),
                 title: None,
                 initial_prompt: Some("continue".into()),
+                client_message_id: None,
                 mode_id: None,
                 thinking_option_id: None,
                 images: vec![ImageAttachment {
@@ -5339,6 +5344,7 @@ while True:
                 directory: "/tmp/project".into(),
                 title: None,
                 initial_prompt: Some("go".into()),
+                client_message_id: None,
                 mode_id: None,
                 thinking_option_id: None,
                 images: Vec::new(),
@@ -5367,6 +5373,7 @@ while True:
                 directory: "/tmp/project".into(),
                 title: None,
                 initial_prompt: Some("go".into()),
+                client_message_id: None,
                 mode_id: None,
                 thinking_option_id: None,
                 images: Vec::new(),

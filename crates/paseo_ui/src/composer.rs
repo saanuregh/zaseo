@@ -1452,7 +1452,9 @@ impl Composer {
         let feature_values = offered_values(&self.features(cx), &self.draft_feature_values);
         let mut creation_attachments = self.context_attachments.clone();
         creation_attachments.extend(files.iter().map(UploadedFile::attachment));
+        let message_id = uuid::Uuid::new_v4().to_string();
         let task = self.store.update(cx, |store, cx| {
+            remember_sent_images(store, &message_id, &pasted);
             store.create_agent(
                 CreateAgent {
                     provider,
@@ -1460,6 +1462,7 @@ impl Composer {
                     directory,
                     title: None,
                     initial_prompt: Some(text),
+                    client_message_id: Some(message_id),
                     idempotency_key: uuid::Uuid::new_v4().to_string(),
                     mode_id: choices.mode,
                     thinking_option_id: choices.thinking,
