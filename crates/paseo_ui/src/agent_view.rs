@@ -78,7 +78,23 @@ pub(crate) fn folded_work<Item: std::borrow::Borrow<StreamItem>>(
             matches!(&item.content, StreamContent::Assistant { text } if !text.trim().is_empty())
         })
     });
-    let work = work_start..final_answer.unwrap_or(turn.end);
+    // A queued prompt the chat doesn't show can start a second reply in the same turn, so the
+    // answer is every message after the last step, not just the last message.
+    let is_answer_part = |index: usize| {
+        item_at(index).is_some_and(|item| match &item.content {
+            StreamContent::Assistant { .. } => true,
+            StreamContent::Reasoning { text } => text.trim().is_empty(),
+            _ => false,
+        })
+    };
+    let answer_start = final_answer.map(|answer| {
+        (work_start..answer)
+            .rev()
+            .take_while(|index| is_answer_part(*index))
+            .last()
+            .unwrap_or(answer)
+    });
+    let work = work_start..answer_start.unwrap_or(turn.end);
     (!work.is_empty()).then_some(work)
 }
 
@@ -4587,6 +4603,26 @@ mod tests {
             folded_work(&items, 0..2),
             None,
             "only an answer: nothing to fold"
+        );
+
+        let blank_reasoning = |key| item_row(key, StreamContent::Reasoning { text: " ".into() });
+        let items = [
+            user(0),
+            reasoning(1),
+            text(2),
+            blank_reasoning(3),
+            text(4),
+        ]
+        .into_iter()
+        .filter_map(|row| match row {
+            Row::Item { item, .. } => Some(item),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(
+            folded_work(&items, 0..5),
+            Some(1..2),
+            "back-to-back replies all stay in the answer"
         );
     }
 
