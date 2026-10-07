@@ -2844,7 +2844,6 @@ impl Focusable for AgentView {
 
 impl Render for AgentView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
         let is_draft = self.agent_id.is_none();
         let empty = self.projection.items().is_empty();
         self.markdown_style = Some(Self::build_markdown_style(window, cx));
@@ -2917,8 +2916,10 @@ impl Render for AgentView {
                     )
                     .size_full(),
                 )
+                .vertical_scrollbar_for(&self.list_state, window, cx)
                 .into_any_element()
         };
+        let colors = cx.theme().colors();
         let error = self.store.read(cx).state.error.clone();
         let font_size = crate::chat_font_size(cx);
         if font_size != self.font_size {
