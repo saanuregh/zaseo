@@ -1,0 +1,68 @@
+name: zaseo_release
+
+on:
+  push:
+    tags:
+      - v*
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Trade a little runtime speed for much shorter builds on small hosted runners.
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+
+jobs:
+  create_release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create draft release
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" ||
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --generate-notes \
+              --notes "$MAC_INSTALL_NOTE"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAC_INSTALL_NOTE: "macOS builds are not notarized. After installing, run: `xattr -dr com.apple.quarantine /Applications/Zaseo.app`"
+
+  bundle_linux_x86_64:
+    needs: create_release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v7
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+      - name: Use the stable channel
+        run: echo stable > crates/zed/RELEASE_CHANNEL
+      - name: Install build dependencies
+        run: ./script/linux
+      - name: Download WASI SDK
+        run: ./script/download-wasi-sdk
+      - name: Bundle
+        run: ./script/bundle-linux
+      - name: Upload to release
+        run: gh release upload "$GITHUB_REF_NAME" target/release/zaseo-linux-x86_64.tar.gz --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  bundle_mac_aarch64:
+    needs: create_release
+    runs-on: macos-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v7
+      - name: Use the stable channel
+        run: echo stable > crates/zed/RELEASE_CHANNEL
+      - name: Download WASI SDK
+        run: ./script/download-wasi-sdk
+      - name: Bundle
+        run: ./script/bundle-mac aarch64-apple-darwin
+      - name: Upload to release
+        run: gh release upload "$GITHUB_REF_NAME" target/aarch64-apple-darwin/release/Zaseo-aarch64.dmg --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}

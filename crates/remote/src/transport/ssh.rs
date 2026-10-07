@@ -893,76 +893,11 @@ impl SshRemoteConnection {
             return Ok(dst_path.into());
         }
 
-        if release_channel == ReleaseChannel::Dev {
-            return self.install_upstream_server(delegate, cx).await;
-        }
-
-        let wanted_version = cx.update(|cx| match release_channel {
-            ReleaseChannel::Nightly => None,
-            _ => Some(AppVersion::global(cx)),
-        });
-
-        let tmp_path_compressed = remote_server_dir_relative().join(
-            RelPath::from_unix_str(&format!(
-                "{}-download-{}.{}",
-                binary_name,
-                std::process::id(),
-                if self.ssh_platform.os.is_windows() {
-                    "zip"
-                } else {
-                    "gz"
-                }
-            ))
-            .unwrap(),
-        );
-        if !self.socket.connection_options.upload_binary_over_ssh
-            && let Some(url) = delegate
-                .get_download_url(
-                    self.ssh_platform,
-                    release_channel,
-                    wanted_version.clone(),
-                    cx,
-                )
-                .await?
-        {
-            match self
-                .download_binary_on_server(&url, &tmp_path_compressed, delegate, cx)
-                .await
-            {
-                Ok(_) => {
-                    self.extract_server_binary(&dst_path, &tmp_path_compressed, delegate, cx)
-                        .await
-                        .context("extracting server binary")?;
-                    return Ok(dst_path.into());
-                }
-                Err(e) => {
-                    log::error!(
-                        "Failed to download binary on server, attempting to download locally and then upload it the server: {e:#}",
-                    )
-                }
-            }
-        }
-
-        let src_path = delegate
-            .download_server_binary_locally(
-                self.ssh_platform,
-                release_channel,
-                wanted_version.clone(),
-                cx,
-            )
-            .await
-            .context("downloading server binary locally")?;
-        self.upload_local_server_binary(&src_path, &tmp_path_compressed, delegate, cx)
-            .await
-            .context("uploading server binary")?;
-        self.extract_server_binary(&dst_path, &tmp_path_compressed, delegate, cx)
-            .await
-            .context("extracting server binary")?;
-        Ok(dst_path.into())
+        self.install_upstream_server(delegate, cx).await
     }
 
-    /// Zaseo release builds use the dev channel, which has no published server of its own, so
-    /// they install the pinned upstream Zed release whose protocol Zaseo speaks.
+    /// Zaseo publishes no remote server of its own on any channel, so it installs the pinned
+    /// upstream Zed release whose protocol Zaseo speaks.
     async fn install_upstream_server(
         &self,
         delegate: &Arc<dyn RemoteClientDelegate>,

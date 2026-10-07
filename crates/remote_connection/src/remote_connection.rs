@@ -492,42 +492,17 @@ impl remote::RemoteClientDelegate for RemoteClientDelegate {
     fn download_server_binary_locally(
         &self,
         platform: RemotePlatform,
-        release_channel: ReleaseChannel,
-        version: Option<Version>,
+        _release_channel: ReleaseChannel,
+        _version: Option<Version>,
         cx: &mut AsyncApp,
     ) -> Task<anyhow::Result<PathBuf>> {
-        if release_channel == ReleaseChannel::Dev {
-            self.set_status(Some("Downloading remote server"), cx);
-            let http_client = cx.update(|cx| cx.http_client());
-            return cx.background_spawn(download_upstream_remote_server(
-                paths::remote_servers_dir().clone(),
-                platform,
-                http_client,
-            ));
-        }
-        let this = self.clone();
-        cx.spawn(async move |cx| {
-            AutoUpdater::download_remote_server_release(
-                release_channel,
-                version.clone(),
-                platform.os.as_str(),
-                platform.arch.as_str(),
-                move |status, cx| this.set_status(Some(status), cx),
-                cx,
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "Downloading remote server binary (version: {}, os: {}, arch: {})",
-                    version
-                        .as_ref()
-                        .map(|v| format!("{}", v))
-                        .unwrap_or("unknown".to_string()),
-                    platform.os,
-                    platform.arch,
-                )
-            })
-        })
+        self.set_status(Some("Downloading remote server"), cx);
+        let http_client = cx.update(|cx| cx.http_client());
+        cx.background_spawn(download_upstream_remote_server(
+            paths::remote_servers_dir().clone(),
+            platform,
+            http_client,
+        ))
     }
 
     fn get_download_url(
@@ -668,40 +643,16 @@ impl remote::RemoteClientDelegate for BackgroundRemoteClientDelegate {
     fn download_server_binary_locally(
         &self,
         platform: RemotePlatform,
-        release_channel: ReleaseChannel,
-        version: Option<Version>,
+        _release_channel: ReleaseChannel,
+        _version: Option<Version>,
         cx: &mut AsyncApp,
     ) -> Task<anyhow::Result<PathBuf>> {
-        if release_channel == ReleaseChannel::Dev {
-            let http_client = cx.update(|cx| cx.http_client());
-            return cx.background_spawn(download_upstream_remote_server(
-                paths::remote_servers_dir().clone(),
-                platform,
-                http_client,
-            ));
-        }
-        cx.spawn(async move |cx| {
-            AutoUpdater::download_remote_server_release(
-                release_channel,
-                version.clone(),
-                platform.os.as_str(),
-                platform.arch.as_str(),
-                |_status, _cx| {},
-                cx,
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "Downloading remote server binary (version: {}, os: {}, arch: {})",
-                    version
-                        .as_ref()
-                        .map(|v| format!("{v}"))
-                        .unwrap_or("unknown".to_string()),
-                    platform.os,
-                    platform.arch,
-                )
-            })
-        })
+        let http_client = cx.update(|cx| cx.http_client());
+        cx.background_spawn(download_upstream_remote_server(
+            paths::remote_servers_dir().clone(),
+            platform,
+            http_client,
+        ))
     }
 
     fn get_download_url(
