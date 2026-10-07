@@ -45,7 +45,7 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
         MenuItem::action("New Paseo Workspace", paseo_ui::NewAgentWorkspace),
         MenuItem::action("Paseo History", paseo_ui::OpenHistory),
         MenuItem::action("Paseo Last Turn", paseo_ui::ReviewLastTurn),
-        MenuItem::action("Paseo Provider Usage", paseo_ui::OpenProviderUsage),
+        MenuItem::action("Paseo Usage", paseo_ui::OpenProviderUsage),
         MenuItem::action("Outline Panel", outline_panel::ToggleFocus),
         MenuItem::action("Terminal Panel", terminal_panel::Toggle),
         MenuItem::action("Debugger Panel", debug_panel::ToggleFocus),

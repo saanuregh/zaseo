@@ -6,7 +6,7 @@ This is the full guide to Zaseo's Paseo features. For install and first run, see
 ## Connections
 
 Zaseo connects to a Paseo daemon you install and start yourself. It does not bundle or
-start Paseo. It targets Paseo v0.10.1 and shows an incompatibility error when a daemon
+start Paseo. It targets Paseo v0.11.0 and shows an incompatibility error when a daemon
 lacks the features it needs.
 
 At startup Zaseo connects to every profile at once and lists all their agents in one
@@ -106,10 +106,18 @@ composer.
 - Provider, model, thinking, and mode pickers. Each opens a list with descriptions.
   Long lists (some hosts offer hundreds of models) can be searched by name or
   description.
-- After the pickers come the provider's own features, as in Paseo: Codex's **Fast** (a
-  bolt, yellow while on, offered on the models that support it) and **Plan** toggles,
-  and any option list a provider defines. A draft's choices apply when its agent is
-  created.
+- After the pickers come the provider's own features, as in Paseo: Codex's **Speed**
+  menu (a bolt, yellow while Fast or Ultrafast is picked), Claude's **Fast** toggle, the
+  **Plan** toggle, and any option list a provider defines. A draft's choices apply when
+  its agent is created.
+- The context ring shows how full the agent's context window is. Hover it for token
+  counts, session cost, and the usage of the account the agent runs under.
+- A message sent while the agent works steers its turn. Set
+  `paseo.chat.send_behavior` to `"interrupt"` to stop the turn and start a new one
+  instead. A queued message sent automatically when the turn ends always steers, so a
+  turn the agent starts by itself at that moment is not cut short.
+- When a provider accepts a change with a note, such as a mode change that applies after
+  the current turn, the note shows as a toast.
 - `/` lists the agent's commands, and `@` completes file paths.
 - Pasted images are sent with the message.
 - The paperclip button attaches files. PNG, JPEG, GIF and WebP files attach as images;
@@ -186,9 +194,16 @@ in Paseo.
 
 Use the composer's microphone button when the daemon has speech-to-text enabled.
 
-### Provider usage
+### Usage
 
-**View → Paseo Provider Usage**, or the host menu, shows each provider's plan limits.
+**View → Paseo Usage**, the host menu's **Usage**, or a click on the status-bar usage chip
+opens Usage. It shows one card per account: each limit window with its reset time,
+balances, and why an account can't be read, such as an expired login and the command
+that refreshes it. Refresh one card or all of them. Pick **Used** or **Remaining** for
+the percentages. With several hosts connected, pick which host to show.
+
+The status-bar chip shows the account the focused agent runs under. Older daemons,
+which report usage per provider, show that provider's usage instead.
 
 ### Send code to an agent
 
@@ -294,7 +309,7 @@ kept or rejected, like Zed's own agent.
 ## Settings
 
 The settings window's **Paseo** page, or the `paseo` key in `settings.json`, controls
-how chats, the sidebar and alerts behave. The defaults and their meaning are in
+how chats, the sidebar, alerts and usage behave. The defaults and their meaning are in
 `assets/settings/default.json` under `paseo`:
 
 - `chat`: prose `font_family`, `font_size` (unset follows the UI font size; editor
@@ -307,6 +322,10 @@ how chats, the sidebar and alerts behave. The defaults and their meaning are in
 - `alerts`: whether agents raise `toasts`, whether the bell shows its count
   (`bell_count`), and whether agents raise `system_notifications` while no Zaseo window
   has focus (clicking one opens the agent).
+- `chat.send_behavior`: `"steer"` adds a message sent mid-turn to the running turn;
+  `"interrupt"` stops the turn and starts a new one.
+- `usage.display_as`: whether usage percentages show the share `"used"` or
+  `"remaining"`.
 
 Zed's own agent is off in Zaseo, so its panel, inline assistant and settings pages are
 gone. Edit predictions keep their own settings page.

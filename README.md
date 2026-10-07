@@ -85,10 +85,11 @@ See [Keyboard shortcuts](./docs/zaseo.md#keyboard-shortcuts) for the full list.
 | --- | --- |
 | Zed | Between releases: `main` at [`e52ab15`](https://github.com/zed-industries/zed/commit/e52ab15), after [`v1.22.0-pre`](https://github.com/zed-industries/zed/releases/tag/v1.22.0-pre) |
 | Zed remote server | [`v1.22.0`](https://github.com/zed-industries/zed/releases/tag/v1.22.0), installed on SSH hosts; its protocol matches the Zed base |
-| Paseo | [`v0.10.1`](https://github.com/getpaseo/paseo/releases/tag/v0.10.1), protocol v1 |
+| Paseo | [`v0.11.0`](https://github.com/getpaseo/paseo/releases/tag/v0.11.0), protocol v1 |
 
-Zaseo's UI and protocol follow Paseo v0.10.1, and it was tested against a v0.10.1
-daemon. Future resyncs move both projects to stable release tags only. When Zed
+Zaseo's UI and protocol follow Paseo v0.11.0. It was tested against a v0.10.3 daemon,
+which exercises the usage list older daemons send. The per-account usage stream that
+v0.11 daemons send is covered by tests against a simulated daemon. Future resyncs move both projects to stable release tags only. When Zed
 `v1.23.0` stable ships, the Zed base and the remote server pin
 (`UPSTREAM_REMOTE_SERVER_TAG` in `crates/remote/src/transport.rs`) move to it together,
 so Zaseo and its SSH remote server stay on one Zed release.

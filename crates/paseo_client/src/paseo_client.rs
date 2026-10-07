@@ -31,6 +31,8 @@ const WORKSPACE_PAGE_SIZE: usize = 200;
 const PROVIDER_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(180);
 const DAEMON_UPDATE_TIMEOUT: Duration = Duration::from_secs(300);
 const PROVIDER_REFRESH_TIMEOUT: Duration = Duration::from_secs(120);
+/// The daemon gives each login 20 seconds before reporting it timed out.
+const USAGE_REPORTS_TIMEOUT: Duration = Duration::from_secs(30);
 const TERMINAL_RESTORE_SCROLLBACK: usize = 200;
 const DICTATION_FORMAT: &str = "audio/pcm;rate=16000;bits=16";
 /// Paseo's own client uploads in chunks this size.
@@ -46,6 +48,7 @@ enum Command {
         response_type: &'static str,
         retry_creation: bool,
         reply: oneshot::Sender<Result<Value>>,
+        updates: Option<RequestUpdates>,
     },
     /// A message the daemon never answers, such as terminal input or dictation audio.
     Notify(Value),
@@ -66,8 +69,12 @@ struct Pending {
     /// Whether the request sends a chat message, whose outcome is unknown once the connection drops.
     sends_message: bool,
     response_type: &'static str,
+    updates: Option<RequestUpdates>,
     reply: oneshot::Sender<Result<Value>>,
 }
+
+/// Where a request's progress frames go before its response, by frame type.
+type RequestUpdates = (&'static str, mpsc::UnboundedSender<Value>);
 
 pub struct PaseoSession {
     commands: mpsc::Sender<Command>,
@@ -99,6 +106,7 @@ impl PaseoSession {
                 response_type,
                 retry_creation,
                 reply,
+                updates: None,
             })
             .await
             .context("Paseo connection closed")?;
@@ -424,7 +432,7 @@ impl PaseoSession {
         require_accepted(&payload, "the rename")
     }
 
-    pub async fn set_mode(&self, agent_id: &str, mode_id: &str) -> Result<()> {
+    pub async fn set_mode(&self, agent_id: &str, mode_id: &str) -> Result<Option<ProviderNotice>> {
         let payload = self
             .request(
                 json!({"type":"set_agent_mode_request", "requestId":next_request_id(), "agentId":agent_id, "modeId":mode_id}),
@@ -432,10 +440,15 @@ impl PaseoSession {
                 false,
             )
             .await?;
-        require_accepted(&payload, "the mode change")
+        require_accepted(&payload, "the mode change")?;
+        Ok(protocol::parse_notice(&payload))
     }
 
-    pub async fn set_model(&self, agent_id: &str, model_id: Option<&str>) -> Result<()> {
+    pub async fn set_model(
+        &self,
+        agent_id: &str,
+        model_id: Option<&str>,
+    ) -> Result<Option<ProviderNotice>> {
         let payload = self
             .request(
                 json!({"type":"set_agent_model_request", "requestId":next_request_id(), "agentId":agent_id, "modelId":model_id}),
@@ -443,10 +456,15 @@ impl PaseoSession {
                 false,
             )
             .await?;
-        require_accepted(&payload, "the model change")
+        require_accepted(&payload, "the model change")?;
+        Ok(protocol::parse_notice(&payload))
     }
 
-    pub async fn set_thinking(&self, agent_id: &str, option_id: Option<&str>) -> Result<()> {
+    pub async fn set_thinking(
+        &self,
+        agent_id: &str,
+        option_id: Option<&str>,
+    ) -> Result<Option<ProviderNotice>> {
         let payload = self
             .request(
                 json!({"type":"set_agent_thinking_request", "requestId":next_request_id(), "agentId":agent_id, "thinkingOptionId":option_id}),
@@ -454,11 +472,17 @@ impl PaseoSession {
                 false,
             )
             .await?;
-        require_accepted(&payload, "the thinking change")
+        require_accepted(&payload, "the thinking change")?;
+        Ok(protocol::parse_notice(&payload))
     }
 
     /// Sets one of the agent's provider features, such as Codex's `fast_mode`.
-    pub async fn set_feature(&self, agent_id: &str, feature_id: &str, value: Value) -> Result<()> {
+    pub async fn set_feature(
+        &self,
+        agent_id: &str,
+        feature_id: &str,
+        value: Value,
+    ) -> Result<Option<ProviderNotice>> {
         let payload = self
             .request(
                 json!({"type":"set_agent_feature_request", "requestId":next_request_id(), "agentId":agent_id, "featureId":feature_id, "value":value}),
@@ -466,7 +490,8 @@ impl PaseoSession {
                 false,
             )
             .await?;
-        require_accepted(&payload, "the feature change")
+        require_accepted(&payload, "the feature change")?;
+        Ok(protocol::parse_notice(&payload))
     }
 
     /// The features an agent with the draft's settings would have, for the composer before it
@@ -631,7 +656,7 @@ impl PaseoSession {
         protocol::parse_subagent_timeline_page(&payload)
     }
 
-    pub async fn provider_usage(&self) -> Result<Vec<ProviderUsage>> {
+    async fn provider_usage(&self) -> Result<Vec<ProviderUsage>> {
         let payload = self
             .request(
                 json!({"type":"provider.usage.list.request", "requestId":next_request_id()}),
@@ -640,6 +665,97 @@ impl PaseoSession {
             )
             .await?;
         protocol::parse_provider_usage(&payload)
+    }
+
+    /// Reads usage reports, calling `on_report` as each one arrives. Hosts without usage sources
+    /// answer from their per-provider list, which has no per-agent accounts.
+    pub async fn usage_reports(
+        &self,
+        server_info: &ServerInfo,
+        request: UsageReportsRequest,
+        mut on_report: impl FnMut(&UsageReportEntry) + Send,
+    ) -> Result<Vec<UsageReportEntry>> {
+        if !server_info.has_feature("usageSources") && !server_info.has_feature("providerUsageList")
+        {
+            bail!("Update the host to see usage.");
+        }
+        if request.agent_id.is_some() && request.report_ids.is_some() {
+            bail!("agentId and reportIds cannot be combined");
+        }
+        if !server_info.has_feature("usageSources") {
+            if request.agent_id.is_some() && request.provider.is_none() {
+                return Ok(Vec::new());
+            }
+            let mut reports = protocol::legacy_usage_reports(self.provider_usage().await?);
+            if let Some(ids) = &request.report_ids {
+                reports.retain(|report| ids.contains(&report.id));
+            }
+            if let Some(provider) = request.agent_id.and(request.provider) {
+                reports.retain(|report| report.source_id == provider);
+            }
+            reports.iter().for_each(&mut on_report);
+            return Ok(reports);
+        }
+        let mut message =
+            json!({"type":"usage.list_reports.request", "requestId":next_request_id()});
+        if let Some(agent_id) = &request.agent_id {
+            message["agentId"] = json!(agent_id);
+        }
+        if let Some(report_ids) = &request.report_ids {
+            message["reportIds"] = json!(report_ids);
+        }
+        if request.force_refresh {
+            message["forceRefresh"] = json!(true);
+        }
+        let (reply, mut response) = oneshot::channel();
+        let (update_sender, mut updates) = mpsc::unbounded_channel();
+        self.commands
+            .send(Command::Request {
+                message,
+                response_type: "usage.list_reports.response",
+                retry_creation: false,
+                reply,
+                updates: Some(("usage.list_reports.update", update_sender)),
+            })
+            .await
+            .context("Paseo connection closed")?;
+        let mut reports = Vec::new();
+        // One report a newer host shapes differently must not hide the others.
+        let mut accept = |payload: Value| {
+            let parsed = payload
+                .get("report")
+                .context("usage update without a report")
+                .and_then(protocol::parse_usage_report_entry);
+            match parsed {
+                Ok(report) => {
+                    on_report(&report);
+                    reports.push(report);
+                }
+                Err(error) => log::warn!("Skipping an unreadable Paseo usage report: {error:#}"),
+            }
+        };
+        let finished = tokio::time::timeout(USAGE_REPORTS_TIMEOUT, async {
+            loop {
+                tokio::select! {
+                    biased;
+                    Some(update) = updates.recv() => accept(update),
+                    result = &mut response => {
+                        // Updates are queued before the response is delivered, so any left are
+                        // already in the channel.
+                        while let Ok(update) = updates.try_recv() {
+                            accept(update);
+                        }
+                        break result.context("Paseo connection closed")?;
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("Paseo request timed out"))??;
+        if let Some(error) = finished.get("error").and_then(Value::as_str) {
+            bail!("{error}");
+        }
+        Ok(reports)
     }
 
     pub async fn terminals(&self, cwd: &str) -> Result<Vec<TerminalInfo>> {
@@ -1453,6 +1569,7 @@ impl PaseoSession {
                 response_type: "file.upload.response",
                 retry_creation: false,
                 reply,
+                updates: None,
             })
             .await
             .context("Paseo connection closed")?;
@@ -2275,7 +2392,7 @@ async fn run(
                 }
             },
             command = connection.commands.recv() => match command {
-                Some(Command::Request { message, response_type, retry_creation, reply }) => {
+                Some(Command::Request { message, response_type, retry_creation, reply, updates }) => {
                     let Some(request_id) = message.get("requestId").and_then(Value::as_str).map(str::to_owned) else {
                         deliver(reply, Err(anyhow!("request ID missing")));
                         continue;
@@ -2301,6 +2418,7 @@ async fn run(
                         replay: retry_creation.then(|| message.clone()),
                         sends_message: message["type"] == "send_agent_message_request",
                         response_type,
+                        updates,
                         reply,
                     };
                     if message["type"] == "agent_permission_response" {
@@ -2475,6 +2593,16 @@ fn handle_message(
     let message_type = message["type"].as_str().unwrap_or("");
     let payload = &message["payload"];
     if let Some(request_id) = payload.get("requestId").and_then(Value::as_str) {
+        if let Some((update_type, updates)) = pending
+            .get(request_id)
+            .and_then(|request| request.updates.as_ref())
+            && *update_type == message_type
+        {
+            if updates.send(payload.clone()).is_err() {
+                log::debug!("Paseo {message_type} arrived after its request gave up");
+            }
+            return;
+        }
         if pending.get(request_id).is_some_and(|request| {
             request.response_type == message_type || message_type == "rpc_error"
         }) {
@@ -3585,6 +3713,7 @@ while True:
                 replay: None,
                 sends_message: false,
                 response_type: "fetch_agent_timeline_response",
+                updates: None,
                 reply,
             },
         )]);
@@ -3657,6 +3786,7 @@ while True:
                 replay: None,
                 sends_message: false,
                 response_type: "fetch_agent_timeline_response",
+                updates: None,
                 reply,
             },
         )]);
@@ -3789,6 +3919,7 @@ while True:
                 replay: None,
                 sends_message: false,
                 response_type: "fetch_agents_response",
+                updates: None,
                 reply,
             },
         )]);
@@ -4766,9 +4897,18 @@ while True:
         let features = protocol::parse_features(&json!([
             {"type":"toggle","id":"fast_mode","label":"Fast","description":"Priority inference","tooltip":"Toggle fast mode","icon":"zap","value":true},
             {"type":"select","id":"verbosity","label":"Verbosity","value":null,"options":[{"id":"low","label":"Low"},{"id":"high","label":"High","description":"More words"}]},
+            {"type":"select","id":"service_tier","label":"Speed","icon":"zap","desktopTrigger":"icon","value":"fast","options":[{"id":"default","label":"Normal","isDefault":true},{"id":"fast","label":"Fast"}]},
             {"type":"unknown","id":"future"},
             {"type":"toggle","label":"No id"}
         ]));
+        let option = |id: &str, label: &str, description: Option<&str>, is_default: bool| {
+            AgentFeatureOption {
+                id: id.into(),
+                label: label.into(),
+                description: description.map(Into::into),
+                is_default,
+            }
+        };
         assert_eq!(
             features,
             vec![
@@ -4778,6 +4918,7 @@ while True:
                     description: Some("Priority inference".into()),
                     tooltip: Some("Toggle fast mode".into()),
                     icon: Some("zap".into()),
+                    icon_only: false,
                     kind: AgentFeatureKind::Toggle(true),
                 },
                 AgentFeature {
@@ -4786,24 +4927,84 @@ while True:
                     description: None,
                     tooltip: None,
                     icon: None,
+                    icon_only: false,
                     kind: AgentFeatureKind::Select {
                         value: None,
                         options: vec![
-                            AgentFeatureOption {
-                                id: "low".into(),
-                                label: "Low".into(),
-                                description: None,
-                            },
-                            AgentFeatureOption {
-                                id: "high".into(),
-                                label: "High".into(),
-                                description: Some("More words".into()),
-                            },
+                            option("low", "Low", None, false),
+                            option("high", "High", Some("More words"), false),
+                        ],
+                    },
+                },
+                AgentFeature {
+                    id: "service_tier".into(),
+                    label: "Speed".into(),
+                    description: None,
+                    tooltip: None,
+                    icon: Some("zap".into()),
+                    icon_only: true,
+                    kind: AgentFeatureKind::Select {
+                        value: Some("fast".into()),
+                        options: vec![
+                            option("default", "Normal", None, true),
+                            option("fast", "Fast", None, false),
                         ],
                     },
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn agent_changes_return_provider_notices() {
+        let (session, daemon) = mock_daemon(vec![
+            (
+                "set_agent_mode_response",
+                json!({"agentId":"agent-1","accepted":true,"error":null,"notice":{"type":"warning","message":"Mode changes apply after this turn"}}),
+            ),
+            (
+                "set_agent_feature_response",
+                json!({"agentId":"agent-1","accepted":true,"error":null,"notice":null}),
+            ),
+            (
+                "set_agent_model_response",
+                json!({"agentId":"agent-1","accepted":true,"error":null,"notice":{"type":"info","message":"Applies next turn"}}),
+            ),
+            (
+                "set_agent_thinking_response",
+                json!({"agentId":"agent-1","accepted":true,"error":null}),
+            ),
+        ]);
+        assert_eq!(
+            session.set_mode("agent-1", "plan").await.expect("mode"),
+            Some(ProviderNotice {
+                kind: NoticeKind::Warning,
+                message: "Mode changes apply after this turn".into(),
+            })
+        );
+        assert_eq!(
+            session
+                .set_feature("agent-1", "service_tier", json!("fast"))
+                .await
+                .expect("feature"),
+            None
+        );
+        assert_eq!(
+            session
+                .set_model("agent-1", Some("gpt-6-luna"))
+                .await
+                .expect("model")
+                .map(|notice| notice.kind),
+            Some(NoticeKind::Info)
+        );
+        assert_eq!(
+            session
+                .set_thinking("agent-1", Some("high"))
+                .await
+                .expect("thinking"),
+            None
+        );
+        daemon.await.expect("daemon task");
     }
 
     #[tokio::test]
@@ -5126,6 +5327,7 @@ while True:
                 replay: None,
                 sends_message: false,
                 response_type: "status",
+                updates: None,
                 reply,
             },
         )]);
@@ -5263,6 +5465,347 @@ while True:
             }
         }
         server.await.expect("mock daemon task");
+    }
+
+    fn usage_server_info(features: Value) -> ServerInfo {
+        ServerInfo {
+            features,
+            ..ServerInfo::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_reports_stream_updates_until_response() {
+        let (commands, mut receiver) = mpsc::channel(4);
+        let session = PaseoSession { commands };
+        let daemon = tokio::spawn(async move {
+            let Some(Command::Request {
+                message,
+                response_type,
+                reply,
+                updates: Some((update_type, updates)),
+                ..
+            }) = receiver.recv().await
+            else {
+                panic!("expected a streaming usage request")
+            };
+            assert_eq!(response_type, "usage.list_reports.response");
+            assert_eq!(update_type, "usage.list_reports.update");
+            let request_id = message["requestId"]
+                .as_str()
+                .expect("request ID")
+                .to_owned();
+            updates
+                .send(json!({"requestId":request_id,"report":{"id":"future:a","sourceId":"future","sourceLabel":"Future","fetchedAt":"t","report":{"status":"someday"}}}))
+                .expect("update channel open");
+            for (id, label) in [("claude:work", "Claude"), ("codex:me", "Codex")] {
+                updates
+                    .send(json!({"requestId":request_id,"report":{"id":id,"account":{"label":"work@example.com"},"fetchedAt":"2026-10-07T10:00:00Z","sourceId":id.split(':').next(),"sourceLabel":label,"report":{"status":"available","planLabel":"Max","windows":[{"id":"session","label":"Session","shortLabel":"5h","usedPct":31}]}}}))
+                    .expect("update channel open");
+            }
+            deliver(reply, Ok(json!({"requestId":request_id,"error":null})));
+            message
+        });
+        let mut streamed = Vec::new();
+        let reports = session
+            .usage_reports(
+                &usage_server_info(json!({"usageSources":true,"providerUsageList":true})),
+                UsageReportsRequest {
+                    agent_id: Some("agent-1".into()),
+                    provider: None,
+                    report_ids: None,
+                    force_refresh: true,
+                },
+                |report| streamed.push(report.id.clone()),
+            )
+            .await
+            .expect("usage reports");
+        let message = daemon.await.expect("daemon task");
+        assert_eq!(message["type"], "usage.list_reports.request");
+        assert_eq!(message["agentId"], "agent-1");
+        assert_eq!(message["forceRefresh"], true);
+        assert!(message.get("reportIds").is_none());
+        assert_eq!(streamed, ["claude:work", "codex:me"]);
+        assert_eq!(reports.len(), 2);
+        assert_eq!(
+            reports[0].account_label.as_deref(),
+            Some("work@example.com")
+        );
+        let UsageReport::Available {
+            windows,
+            plan_label,
+            ..
+        } = &reports[0].report
+        else {
+            panic!("expected an available report")
+        };
+        assert_eq!(plan_label.as_deref(), Some("Max"));
+        assert_eq!(windows[0].id, "session");
+        assert_eq!(windows[0].short_label.as_deref(), Some("5h"));
+        assert_eq!(windows[0].used_percent, Some(31.0));
+    }
+
+    #[tokio::test]
+    async fn usage_reports_error_response_fails() {
+        let (session, daemon) = mock_daemon(vec![(
+            "usage.list_reports.response",
+            json!({"requestId":"ignored","error":"Unknown agent: agent-9"}),
+        )]);
+        let error = session
+            .usage_reports(
+                &usage_server_info(json!({"usageSources":true})),
+                UsageReportsRequest::default(),
+                |_| {},
+            )
+            .await
+            .expect_err("daemon error");
+        assert!(error.to_string().contains("Unknown agent: agent-9"));
+        daemon.await.expect("daemon task");
+    }
+
+    #[tokio::test]
+    async fn usage_reports_fall_back_to_provider_usage_list() {
+        let (session, daemon) = mock_daemon(vec![(
+            "provider.usage.list.response",
+            json!({"fetchedAt":"2026-10-07T10:00:00Z","providers":[
+                {"providerId":"claude","displayName":"Claude","status":"available","planLabel":"Max","windows":[{"id":"5h","label":"5-hour","usedPct":42}]},
+                {"providerId":"codex","displayName":"Codex","status":"unavailable","error":"Not signed in"},
+                {"providerId":"zai","displayName":"Z.ai","status":"error","fetchedAt":"2026-10-07T09:00:00Z"}
+            ]}),
+        )]);
+        let mut streamed = 0;
+        let reports = session
+            .usage_reports(
+                &usage_server_info(json!({"providerUsageList":true})),
+                UsageReportsRequest::default(),
+                |_| streamed += 1,
+            )
+            .await
+            .expect("legacy usage");
+        daemon.await.expect("daemon task");
+        assert_eq!(streamed, 3);
+        assert_eq!(
+            reports
+                .iter()
+                .map(|report| (
+                    report.id.as_str(),
+                    report.source_id.as_str(),
+                    report.source_label.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("claude", "claude", "Claude"),
+                ("codex", "codex", "Codex"),
+                ("zai", "zai", "Z.ai")
+            ]
+        );
+        assert_eq!(reports[0].fetched_at, "2026-10-07T10:00:00Z");
+        assert_eq!(reports[2].fetched_at, "2026-10-07T09:00:00Z");
+        assert!(reports[0].account_label.is_none());
+        assert!(
+            matches!(&reports[0].report, UsageReport::Available { windows, .. } if windows[0].id == "5h")
+        );
+        assert_eq!(
+            reports[1].report,
+            UsageReport::Unavailable(UsageProblem::NoQuota {
+                detail: "Not signed in".into()
+            })
+        );
+        assert_eq!(reports[2].report, UsageReport::Error(String::new()));
+    }
+
+    #[tokio::test]
+    async fn usage_reports_legacy_filters_ids_and_providers() {
+        let providers = json!({"providers":[
+            {"providerId":"claude","displayName":"Claude","status":"available"},
+            {"providerId":"codex","displayName":"Codex","status":"available"}
+        ]});
+        let (session, daemon) = mock_daemon(vec![
+            ("provider.usage.list.response", providers.clone()),
+            ("provider.usage.list.response", providers),
+        ]);
+        let legacy = usage_server_info(json!({"providerUsageList":true}));
+        let filtered = session
+            .usage_reports(
+                &legacy,
+                UsageReportsRequest {
+                    report_ids: Some(vec!["codex".into()]),
+                    ..UsageReportsRequest::default()
+                },
+                |_| {},
+            )
+            .await
+            .expect("filtered");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "codex");
+        let by_provider = session
+            .usage_reports(
+                &legacy,
+                UsageReportsRequest {
+                    agent_id: Some("agent-1".into()),
+                    provider: Some("claude".into()),
+                    ..UsageReportsRequest::default()
+                },
+                |_| {},
+            )
+            .await
+            .expect("agent usage by provider on a legacy host");
+        daemon.await.expect("daemon task");
+        assert_eq!(by_provider.len(), 1);
+        assert_eq!(by_provider[0].source_id, "claude");
+        let unnamed = session
+            .usage_reports(
+                &legacy,
+                UsageReportsRequest {
+                    agent_id: Some("agent-1".into()),
+                    ..UsageReportsRequest::default()
+                },
+                |_| {},
+            )
+            .await
+            .expect("agent usage without a provider on a legacy host");
+        assert!(
+            unnamed.is_empty(),
+            "a legacy host can't name the agent's account"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_reports_need_a_supporting_host() {
+        let (commands, _receiver) = mpsc::channel(1);
+        let session = PaseoSession { commands };
+        let unsupported = session
+            .usage_reports(
+                &ServerInfo::default(),
+                UsageReportsRequest::default(),
+                |_| {},
+            )
+            .await
+            .expect_err("unsupported host");
+        assert_eq!(unsupported.to_string(), "Update the host to see usage.");
+        let combined = session
+            .usage_reports(
+                &usage_server_info(json!({"usageSources":true})),
+                UsageReportsRequest {
+                    agent_id: Some("agent-1".into()),
+                    provider: None,
+                    report_ids: Some(vec!["claude:work".into()]),
+                    force_refresh: false,
+                },
+                |_| {},
+            )
+            .await
+            .expect_err("agent and ids together");
+        assert_eq!(
+            combined.to_string(),
+            "agentId and reportIds cannot be combined"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_update_frames_reach_the_pending_request() {
+        let (reply, mut response) = oneshot::channel();
+        let (updates, mut received) = mpsc::unbounded_channel();
+        let mut pending = HashMap::from([(
+            "usage-1".to_string(),
+            Pending {
+                replay: None,
+                sends_message: false,
+                response_type: "usage.list_reports.response",
+                updates: Some(("usage.list_reports.update", updates)),
+                reply,
+            },
+        )]);
+        let (events, event_receiver) = async_channel::unbounded();
+        let mut handle = |message: Value| {
+            handle_message(
+                &message,
+                &mut pending,
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &events,
+                &mut TimelineSubscriptions::default(),
+            )
+        };
+        handle(
+            json!({"type":"usage.list_reports.update","payload":{"requestId":"usage-1","report":{"id":"claude:work"}}}),
+        );
+        handle(
+            json!({"type":"usage.list_reports.update","payload":{"requestId":"other","report":{"id":"x"}}}),
+        );
+        assert_eq!(
+            received.try_recv().expect("forwarded update")["report"]["id"],
+            "claude:work"
+        );
+        assert!(
+            received.try_recv().is_err(),
+            "other requests' updates are not forwarded"
+        );
+        assert!(
+            response.try_recv().is_err(),
+            "an update does not complete the request"
+        );
+        handle(
+            json!({"type":"usage.list_reports.response","payload":{"requestId":"usage-1","error":null}}),
+        );
+        assert!(response.try_recv().expect("completed").is_ok());
+        assert!(event_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn usage_report_entry_parses_problems_and_login_errors() {
+        let entry = protocol::parse_usage_report_entry(&json!({
+            "id":"claude:work","account":{},"fetchedAt":"2026-10-07T10:00:00Z","sourceId":"claude",
+            "sourceLabel":"Claude","icon":"<svg/>",
+            "report":{"status":"unavailable","problem":{"kind":"expired","expiresAt":"2026-10-05T10:00:00Z","refreshedBy":"claude login"}},
+            "loginErrors":[
+                {"harness":"Claude Code","report":{"status":"unavailable","problem":{"kind":"rejected","status":401}}},
+                {"harness":"Pi","report":{"status":"error","error":"Usage fetch timed out"}}
+            ]
+        }))
+        .expect("entry");
+        assert_eq!(entry.icon.as_deref(), Some("<svg/>"));
+        assert!(entry.account_label.is_none());
+        assert_eq!(
+            entry.report,
+            UsageReport::Unavailable(UsageProblem::Expired {
+                expires_at: "2026-10-05T10:00:00Z".into(),
+                refreshed_by: Some("claude login".into()),
+            })
+        );
+        assert_eq!(
+            entry.login_errors,
+            [
+                UsageLoginError {
+                    harness: "Claude Code".into(),
+                    report: UsageReport::Unavailable(UsageProblem::Rejected {
+                        status: 401,
+                        refreshed_by: None
+                    }),
+                },
+                UsageLoginError {
+                    harness: "Pi".into(),
+                    report: UsageReport::Error("Usage fetch timed out".into()),
+                },
+            ]
+        );
+        let quota = protocol::parse_usage_report_entry(&json!({
+            "id":"zai:a","account":{"label":"a"},"fetchedAt":"t","sourceId":"zai","sourceLabel":"Z.ai",
+            "report":{"status":"unavailable","problem":{"kind":"no_quota","detail":"No plan"}}
+        }))
+        .expect("quota entry");
+        assert_eq!(
+            quota.report,
+            UsageReport::Unavailable(UsageProblem::NoQuota {
+                detail: "No plan".into()
+            })
+        );
+        assert!(
+            protocol::parse_usage_report_entry(
+                &json!({"id":"x","sourceId":"x","sourceLabel":"X","fetchedAt":"t","report":{}})
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

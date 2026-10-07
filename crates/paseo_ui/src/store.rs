@@ -48,6 +48,9 @@ pub enum StoreEvent {
     Stream(PaseoEvent),
     /// The agent the user is looking at changed.
     FocusChanged,
+    /// The provider accepted a change and said something about it, such as that it applies after
+    /// the current turn.
+    ProviderNotice(paseo_client::ProviderNotice),
     /// An entry arrived on this agent's or subagent's timeline. Sent instead of a notify,
     /// because streamed chunks are the most frequent event and only the views showing
     /// that timeline read it.
@@ -917,18 +920,36 @@ impl PaseoStore {
         F: FnOnce(Arc<PaseoSession>) -> Fut,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
+        self.request_reporting_notices(cx, move |session| {
+            let request = request(session);
+            async move { request.await.map(|()| None) }
+        });
+    }
+
+    /// Runs an agent change whose reply may carry a provider notice, shown as a toast; a failure
+    /// shows in the error banner.
+    fn request_reporting_notices<F, Fut>(&self, cx: &mut Context<Self>, request: F)
+    where
+        F: FnOnce(Arc<PaseoSession>) -> Fut,
+        Fut: Future<Output = Result<Option<paseo_client::ProviderNotice>>> + Send + 'static,
+    {
         let generation = self.connection_generation;
         let task = self.session_request(cx, request);
         cx.spawn(async move |this, cx| {
-            if let Err(error) = task.await {
-                this.update(cx, |store, cx| {
-                    if store.is_current_connection(generation) {
+            let result = task.await;
+            this.update(cx, |store, cx| {
+                if !store.is_current_connection(generation) {
+                    return;
+                }
+                match result {
+                    Ok(Some(notice)) => cx.emit(StoreEvent::ProviderNotice(notice)),
+                    Ok(None) => {}
+                    Err(error) => {
                         store.state.error = Some(error.to_string());
                         cx.notify();
                     }
-                })?;
-            }
-            anyhow::Ok(())
+                }
+            })
         })
         .detach_and_log_err(cx);
     }
@@ -1367,7 +1388,7 @@ impl PaseoStore {
             .patch_agent(agent_id, "currentModeId", Value::String(mode_id.clone()));
         cx.notify();
         let agent_id = agent_id.to_owned();
-        self.request_reporting_errors(cx, move |session| async move {
+        self.request_reporting_notices(cx, move |session| async move {
             session.set_mode(&agent_id, &mode_id).await
         });
     }
@@ -1377,7 +1398,7 @@ impl PaseoStore {
             .patch_agent(agent_id, "model", Value::String(model_id.clone()));
         cx.notify();
         let agent_id = agent_id.to_owned();
-        self.request_reporting_errors(cx, move |session| async move {
+        self.request_reporting_notices(cx, move |session| async move {
             session.set_model(&agent_id, Some(&model_id)).await
         });
     }
@@ -1395,7 +1416,7 @@ impl PaseoStore {
         );
         cx.notify();
         let agent_id = agent_id.to_owned();
-        self.request_reporting_errors(cx, move |session| async move {
+        self.request_reporting_notices(cx, move |session| async move {
             session.set_thinking(&agent_id, Some(&option_id)).await
         });
     }
@@ -1411,7 +1432,7 @@ impl PaseoStore {
             .patch_feature(agent_id, &feature_id, value.clone());
         cx.notify();
         let agent_id = agent_id.to_owned();
-        self.request_reporting_errors(cx, move |session| async move {
+        self.request_reporting_notices(cx, move |session| async move {
             session.set_feature(&agent_id, &feature_id, value).await
         });
     }

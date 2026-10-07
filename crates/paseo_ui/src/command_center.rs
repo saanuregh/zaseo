@@ -167,7 +167,7 @@ fn palette_entries(
         ),
         action("New terminal", Box::new(crate::NewTerminal)),
         action("Dictate", Box::new(crate::ToggleDictation)),
-        action("Provider usage", Box::new(crate::OpenProviderUsage)),
+        action("Usage", Box::new(crate::OpenProviderUsage)),
         action("Manage hosts", Box::new(ManageHosts)),
         action("Reconnect to host", Box::new(Reconnect)),
     ];

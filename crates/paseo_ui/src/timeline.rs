@@ -103,6 +103,80 @@ fn tool_status(value: &Value) -> ToolStatus {
     }
 }
 
+fn is_unknown_detail(detail: &Value) -> bool {
+    match detail.get("type").and_then(Value::as_str) {
+        Some(kind) => kind == "unknown",
+        None => true,
+    }
+}
+
+fn is_non_empty_object(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| !object.is_empty())
+}
+
+fn merge_unknown_value(existing: Option<&Value>, incoming: Option<&Value>) -> Value {
+    let existing = existing.cloned().unwrap_or(Value::Null);
+    match incoming {
+        None | Some(Value::Null) => existing,
+        Some(incoming) if !is_non_empty_object(incoming) && is_non_empty_object(&existing) => {
+            existing
+        }
+        Some(incoming) => incoming.clone(),
+    }
+}
+
+/// Mirrors Paseo's `mergeToolCallDetail`, so a later generic update does not erase a labelled card.
+fn merge_tool_detail(existing: &Value, incoming: Value) -> Value {
+    match (is_unknown_detail(existing), is_unknown_detail(&incoming)) {
+        (true, false) => incoming,
+        (false, true) => existing.clone(),
+        (true, true) => serde_json::json!({
+            "type": "unknown",
+            "input": merge_unknown_value(existing.get("input"), incoming.get("input")),
+            "output": merge_unknown_value(existing.get("output"), incoming.get("output")),
+        }),
+        (false, false) => match (existing, incoming) {
+            (Value::Object(existing_fields), Value::Object(incoming_fields))
+                if existing_fields.get("type") == incoming_fields.get("type") =>
+            {
+                let mut merged = existing_fields.clone();
+                merged.extend(incoming_fields);
+                Value::Object(merged)
+            }
+            (_, incoming) => incoming,
+        },
+    }
+}
+
+/// Mirrors Paseo's `mergeAgentToolCallStatus`: terminal states are not reverted by later updates.
+fn merge_tool_status(existing: &ToolStatus, incoming: &ToolStatus) -> ToolStatus {
+    use ToolStatus::*;
+    match (existing, incoming) {
+        (Failed, _) | (_, Failed) => Failed,
+        (Canceled, _) => Canceled,
+        (Completed, Canceled) => Completed,
+        (_, Canceled) => Canceled,
+        (Completed, _) | (_, Completed) => Completed,
+        (Running, Running) => Running,
+    }
+}
+
+fn merge_tool_call(existing: &ToolCall, incoming: ToolCall) -> ToolCall {
+    let status = merge_tool_status(&existing.status, &incoming.status);
+    let error = if status == ToolStatus::Failed {
+        incoming.error.or_else(|| existing.error.clone())
+    } else {
+        None
+    };
+    ToolCall {
+        call_id: incoming.call_id,
+        name: incoming.name,
+        detail: merge_tool_detail(&existing.detail, incoming.detail),
+        status,
+        error,
+    }
+}
+
 fn error_text(error: &Value) -> Option<String> {
     match error {
         Value::Null => None,
@@ -373,6 +447,12 @@ impl TimelineProjection {
             && let Some(&index) = self.tool_indices.get(&call.call_id)
             && let Some(existing) = self.items.get_mut(index)
         {
+            let content = match (&existing.content, content) {
+                (StreamContent::Tool(existing_call), StreamContent::Tool(incoming_call)) => {
+                    StreamContent::Tool(merge_tool_call(existing_call, incoming_call))
+                }
+                (_, content) => content,
+            };
             *existing = Rc::new(StreamItem {
                 key: existing.key,
                 timestamp: existing.timestamp,
@@ -1851,5 +1931,117 @@ mod tests {
         let (base, new) = snippet_texts(&[string_edit("one", "two"), string_edit("three\n", "")]);
         assert_eq!(base, "one\n⋯\nthree\n");
         assert_eq!(new, "two\n⋯\n");
+    }
+
+    #[test]
+    fn unknown_detail_does_not_replace_known() {
+        let known = json!({"type":"sub_agent","subAgentType":"sr-reviewer"});
+        assert_eq!(
+            merge_tool_detail(&known, json!({"type":"unknown","input":null,"output":null})),
+            known
+        );
+        assert_eq!(merge_tool_detail(&known, Value::Null), known);
+        assert_eq!(
+            merge_tool_detail(&json!({"type":"unknown","input":null}), known.clone()),
+            known
+        );
+        assert_eq!(
+            merge_tool_detail(
+                &json!({"type":"unknown","input":{"a":1},"output":"x"}),
+                json!({"type":"unknown","input":null,"output":{"b":2}})
+            ),
+            json!({"type":"unknown","input":{"a":1},"output":{"b":2}})
+        );
+
+        let entries = vec![
+            entry(
+                1,
+                json!({"type":"tool_call","callId":"c1","name":"Task","status":"running","detail":{"type":"sub_agent","subAgentType":"sr-reviewer","description":"Review"},"error":null}),
+            ),
+            entry(
+                2,
+                json!({"type":"tool_call","callId":"c1","name":"Agent","status":"running","detail":{"type":"unknown","input":null,"output":null},"error":null}),
+            ),
+        ];
+        let items = project_items(&entries);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].key, 1);
+        match &items[0].content {
+            StreamContent::Tool(call) => {
+                assert_eq!(call.name, "Agent");
+                assert_eq!(call.detail["subAgentType"], "sr-reviewer");
+            }
+            other => panic!("expected tool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn completed_status_sticks() {
+        assert_eq!(
+            merge_tool_status(&ToolStatus::Completed, &ToolStatus::Running),
+            ToolStatus::Completed
+        );
+        assert_eq!(
+            merge_tool_status(&ToolStatus::Completed, &ToolStatus::Canceled),
+            ToolStatus::Completed
+        );
+        assert_eq!(
+            merge_tool_status(&ToolStatus::Running, &ToolStatus::Canceled),
+            ToolStatus::Canceled
+        );
+        assert_eq!(
+            merge_tool_status(&ToolStatus::Canceled, &ToolStatus::Completed),
+            ToolStatus::Canceled
+        );
+        assert_eq!(
+            merge_tool_status(&ToolStatus::Running, &ToolStatus::Running),
+            ToolStatus::Running
+        );
+    }
+
+    #[test]
+    fn failed_status_sticks_and_keeps_error() {
+        let failed = ToolCall {
+            call_id: "c1".into(),
+            name: "shell".into(),
+            detail: json!({"type":"shell","command":"ls"}),
+            status: ToolStatus::Failed,
+            error: Some("boom".into()),
+        };
+        let running = ToolCall {
+            status: ToolStatus::Running,
+            error: None,
+            ..failed.clone()
+        };
+        let merged = merge_tool_call(&failed, running.clone());
+        assert_eq!(merged.status, ToolStatus::Failed);
+        assert_eq!(merged.error.as_deref(), Some("boom"));
+
+        let completed = ToolCall {
+            status: ToolStatus::Completed,
+            error: Some("stale".into()),
+            ..failed
+        };
+        let merged = merge_tool_call(&completed, running);
+        assert_eq!(merged.status, ToolStatus::Completed);
+        assert_eq!(merged.error, None);
+    }
+
+    #[test]
+    fn same_type_details_merge_fields() {
+        assert_eq!(
+            merge_tool_detail(
+                &json!({"type":"sub_agent","subAgentType":"sr-reviewer","description":"Review"}),
+                json!({"type":"sub_agent","description":"Review the diff"})
+            ),
+            json!({"type":"sub_agent","subAgentType":"sr-reviewer","description":"Review the diff"})
+        );
+        assert_eq!(
+            merge_tool_detail(
+                &json!({"type":"shell","command":"ls"}),
+                json!({"type":"read","path":"a"})
+            ),
+            json!({"type":"read","path":"a"})
+        );
     }
 }

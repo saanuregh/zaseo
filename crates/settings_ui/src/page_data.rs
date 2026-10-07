@@ -7877,7 +7877,7 @@ fn ai_page() -> SettingsPage {
 }
 
 fn paseo_page() -> SettingsPage {
-    fn chat_section() -> [SettingsPageItem; 7] {
+    fn chat_section() -> [SettingsPageItem; 8] {
         [
             SettingsPageItem::SectionHeader("Chat"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -8035,6 +8035,33 @@ fn paseo_page() -> SettingsPage {
                             .chat
                             .get_or_insert_default()
                             .show_thinking = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Send Behavior",
+                description: "What a message sent while the agent works does: steer adds it to the running turn, interrupt stops the turn and starts a new one.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("paseo.chat.send_behavior"),
+                    pick: |settings_content| {
+                        settings_content
+                            .paseo
+                            .as_ref()?
+                            .chat
+                            .as_ref()?
+                            .send_behavior
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .paseo
+                            .get_or_insert_default()
+                            .chat
+                            .get_or_insert_default()
+                            .send_behavior = value;
                     },
                 }),
                 metadata: None,
@@ -8217,9 +8244,47 @@ fn paseo_page() -> SettingsPage {
         ]
     }
 
+    fn usage_section() -> [SettingsPageItem; 2] {
+        [
+            SettingsPageItem::SectionHeader("Usage"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Display As",
+                description: "Whether usage percentages show the share used or the share left.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("paseo.usage.display_as"),
+                    pick: |settings_content| {
+                        settings_content
+                            .paseo
+                            .as_ref()?
+                            .usage
+                            .as_ref()?
+                            .display_as
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .paseo
+                            .get_or_insert_default()
+                            .usage
+                            .get_or_insert_default()
+                            .display_as = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+        ]
+    }
+
     SettingsPage {
         title: "Paseo",
-        items: concat_sections!(chat_section(), sidebar_section(), alerts_section()),
+        items: concat_sections!(
+            chat_section(),
+            sidebar_section(),
+            alerts_section(),
+            usage_section()
+        ),
     }
 }
 

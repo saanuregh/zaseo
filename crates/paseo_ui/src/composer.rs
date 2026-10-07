@@ -33,9 +33,9 @@ use crate::dictation::{
 };
 use crate::store::{PaseoStore, StoreEvent, agent_is_running, agent_provider};
 use crate::{
-    CreatePreferences, CycleMode, FocusComposer, InterruptAgent, ProviderPreference, QueueMessage,
-    ReviewLastTurn, SendMessage as SendMessageAction, ToggleDictation, ToggleModePicker,
-    ToggleModelPicker, ToggleThinkingPicker,
+    CreatePreferences, CycleMode, FocusComposer, InterruptAgent, PaseoSettings, ProviderPreference,
+    QueueMessage, ReviewLastTurn, SendMessage as SendMessageAction, ToggleDictation,
+    ToggleModePicker, ToggleModelPicker, ToggleThinkingPicker,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -662,7 +662,9 @@ impl Composer {
             && self.agent(cx).is_some();
         if turn_finished && !self.queue.is_empty() {
             let queued = self.queue.remove(0);
-            self.send_queued(queued, None, cx);
+            // The agent may start a turn of its own the moment it goes idle, such as Claude after
+            // background work; steering folds the message into it instead of interrupting it.
+            self.send_queued(queued, Some(ActiveTurnBehavior::Steer), cx);
         }
         self.was_running = running;
         if self.agent_id.is_none() && self.draft.provider.is_none() {
@@ -697,17 +699,7 @@ impl Composer {
         let store = self.store.read(cx);
         if let Some(agent) = self.agent(cx) {
             let provider = agent_provider(agent).to_owned();
-            let runtime = agent.extra.get("runtimeInfo");
-            let model = agent
-                .extra
-                .get("model")
-                .and_then(Value::as_str)
-                .or_else(|| {
-                    runtime
-                        .and_then(|runtime| runtime.get("model"))
-                        .and_then(Value::as_str)
-                })
-                .map(str::to_owned);
+            let model = agent_model(&agent.extra, store.provider(&provider));
             let thinking = agent
                 .extra
                 .get("thinkingOptionId")
@@ -1144,7 +1136,7 @@ impl Composer {
             cx.notify();
             return;
         }
-        let behavior = running.then_some(ActiveTurnBehavior::Steer);
+        let behavior = turn_behavior(PaseoSettings::get_global(cx).chat.send_behavior, running);
         self.pending_text = Some(text.clone());
         let message_id = uuid::Uuid::new_v4().to_string();
         let task = self.store.update(cx, |store, cx| {
@@ -1516,7 +1508,10 @@ impl Composer {
     fn send_queued_now(&mut self, id: usize, cx: &mut Context<Self>) {
         if let Some(index) = self.queue.iter().position(|queued| queued.id == id) {
             let queued = self.queue.remove(index);
-            let behavior = self.is_running(cx).then_some(ActiveTurnBehavior::Steer);
+            let behavior = turn_behavior(
+                PaseoSettings::get_global(cx).chat.send_behavior,
+                self.is_running(cx),
+            );
             self.send_queued(queued, behavior, cx);
             cx.notify();
         }
@@ -2179,18 +2174,35 @@ impl Composer {
     }
 
     /// A provider feature as Paseo draws it: a toggle is an icon button coloured while on, a
-    /// select a labelled picker.
+    /// select a labelled picker, or an icon coloured while off its default when the provider
+    /// asks for an icon, as for Codex's Speed.
     fn render_feature(
         &self,
         index: usize,
         feature: paseo_client::AgentFeature,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let title: SharedString = feature
-            .tooltip
-            .clone()
-            .unwrap_or_else(|| feature.label.clone())
-            .into();
+        let selected_label = match &feature.kind {
+            paseo_client::AgentFeatureKind::Select { value, options } => options
+                .iter()
+                .find(|option| Some(&option.id) == value.as_ref())
+                .map(|option| option.label.clone()),
+            paseo_client::AgentFeatureKind::Toggle(_) => None,
+        };
+        // An icon alone doesn't say what is picked, so its tooltip does.
+        let title: SharedString = if feature.icon_only {
+            format!(
+                "{}: {}",
+                feature.label,
+                selected_label.as_deref().unwrap_or(&feature.label)
+            )
+        } else {
+            feature
+                .tooltip
+                .clone()
+                .unwrap_or_else(|| feature.label.clone())
+        }
+        .into();
         let description = feature.description.clone().map(SharedString::from);
         let tooltip = move |_window: &mut Window, cx: &mut App| {
             Tooltip::with_meta(
@@ -2200,19 +2212,16 @@ impl Composer {
                 cx,
             )
         };
+        let active = feature_active(&feature);
         match feature.kind {
             paseo_client::AgentFeatureKind::Toggle(enabled) => {
                 let feature_id = feature.id.clone();
-                IconButton::new(
+                feature_icon_button(
                     ("paseo-feature", index),
-                    feature_icon(feature.icon.as_deref(), enabled),
+                    feature.icon.as_deref(),
+                    &feature.id,
+                    active,
                 )
-                .icon_size(IconSize::Small)
-                .icon_color(if enabled {
-                    feature_color(&feature.id)
-                } else {
-                    Color::Muted
-                })
                 .toggle_state(enabled)
                 .tooltip(tooltip)
                 .on_click(cx.listener(move |composer, _, _, cx| {
@@ -2221,23 +2230,30 @@ impl Composer {
                 .into_any_element()
             }
             paseo_client::AgentFeatureKind::Select { value, options } => {
-                let label = options
-                    .iter()
-                    .find(|option| Some(&option.id) == value.as_ref())
-                    .map(|option| option.label.clone())
-                    .unwrap_or_else(|| feature.label.clone());
                 let this = cx.weak_entity();
                 let (feature_id, title) = (feature.id.clone(), feature.label.clone());
-                PopoverMenu::new(("paseo-feature-picker", index))
-                    .trigger_with_tooltip(
+                let menu = PopoverMenu::new(("paseo-feature-picker", index));
+                let menu = if feature.icon_only {
+                    menu.trigger_with_tooltip(
+                        feature_icon_button(
+                            ("paseo-feature-icon", index),
+                            feature.icon.as_deref(),
+                            &feature.id,
+                            active,
+                        ),
+                        tooltip,
+                    )
+                } else {
+                    menu.trigger_with_tooltip(
                         Self::picker_chip(
                             "paseo-feature-chip",
-                            label,
+                            selected_label.unwrap_or_else(|| feature.label.clone()),
                             Some(feature_icon(feature.icon.as_deref(), true)),
                         ),
                         tooltip,
                     )
-                    .anchor(gpui::Anchor::BottomLeft)
+                };
+                menu.anchor(gpui::Anchor::BottomLeft)
                     .menu(move |window, cx| {
                         let (this, feature_id) = (this.clone(), feature_id.clone());
                         let choices = options
@@ -2246,7 +2262,7 @@ impl Composer {
                                 id: option.id.clone(),
                                 label: option.label.clone(),
                                 description: option.description.clone(),
-                                is_default: false,
+                                is_default: option.is_default,
                                 color_tier: None,
                             })
                             .collect();
@@ -2273,20 +2289,23 @@ impl Composer {
 
     fn render_context_meter(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
         let agent = self.agent(cx)?;
-        let usage = agent.extra.get("lastUsage")?;
+        let usage = agent.extra.get("lastUsage");
         let used = usage
-            .get("contextWindowUsedTokens")
-            .and_then(Value::as_u64)?;
+            .and_then(|usage| usage.get("contextWindowUsedTokens"))
+            .and_then(Value::as_u64);
         let max = usage
-            .get("contextWindowMaxTokens")
+            .and_then(|usage| usage.get("contextWindowMaxTokens"))
             .and_then(Value::as_u64)
             .or_else(|| {
                 let choices = self.choices(cx);
                 let provider = self.current_provider(cx)?;
                 context_window_max(provider, choices.model.as_deref()?)
             })
-            .filter(|max| *max > 0)?;
-        let fraction = (used as f32 / max as f32).clamp(0., 1.);
+            .filter(|max| *max > 0);
+        let context = used.zip(max);
+        let fraction = context
+            .map(|(used, max)| (used as f32 / max as f32).clamp(0., 1.))
+            .unwrap_or(0.);
         let status = cx.theme().status();
         let color = if fraction > 0.9 {
             status.error
@@ -2295,26 +2314,29 @@ impl Composer {
         } else {
             cx.theme().colors().text_muted
         };
-        let cost = usage.get("totalCostUsd").and_then(Value::as_f64);
-        let tooltip = format!(
-            "Context {:.0}% · {} / {} tokens{}",
-            fraction * 100.,
-            format_tokens(used),
-            format_tokens(max),
-            cost.map(|cost| format!(" · {}", format_cost(cost)))
-                .unwrap_or_default()
-        );
+        // Like Paseo, a zero cost is left out rather than shown as $0.
+        let cost = usage
+            .and_then(|usage| usage.get("totalCostUsd"))
+            .and_then(Value::as_f64)
+            .filter(|cost| *cost > 0.);
+        let store = self.store.clone();
+        let agent_id = agent.id.clone();
         // CircularProgress takes pixels, so convert at the chat's rem size to scale with zoom.
         let rem_size = crate::chat_font_size(cx);
         Some(
             div()
                 .id("paseo-context-meter")
                 .px_1()
-                .tooltip(Tooltip::text(tooltip))
+                .hoverable_tooltip(move |_, cx| {
+                    let store = store.clone();
+                    let agent_id = agent_id.clone();
+                    cx.new(|cx| ContextHoverCard::new(store, agent_id, context, cost, cx))
+                        .into()
+                })
                 .child(
                     CircularProgress::new(
-                        used as f32,
-                        max as f32,
+                        context.map_or(0., |(used, _)| used as f32),
+                        context.map_or(1., |(_, max)| max as f32),
                         rems_from_px(14_f32).to_pixels(rem_size),
                         cx,
                     )
@@ -2469,6 +2491,61 @@ fn remember_sent_images(store: &mut PaseoStore, message_id: &str, images: &[Past
     }
 }
 
+/// The turn behavior for a message sent now. Steering an idle agent starts a normal turn, so the
+/// steer setting applies whether or not a turn runs.
+fn turn_behavior(
+    setting: settings::PaseoSendBehavior,
+    running: bool,
+) -> Option<ActiveTurnBehavior> {
+    match setting {
+        settings::PaseoSendBehavior::Steer => Some(ActiveTurnBehavior::Steer),
+        settings::PaseoSendBehavior::Interrupt => running.then_some(ActiveTurnBehavior::Interrupt),
+    }
+}
+
+/// The model to show for an agent: the catalog entry it runs on, since a provider can fall back
+/// from the configured one, else the configured one. A running alias resolves to its catalog ID
+/// so the picker can find it.
+fn agent_model(extra: &Value, provider: Option<&Provider>) -> Option<String> {
+    let runtime = extra
+        .get("runtimeInfo")
+        .and_then(|runtime| runtime.get("model"))
+        .and_then(Value::as_str);
+    let configured = extra.get("model").and_then(Value::as_str);
+    runtime
+        .and_then(|model| model_value(provider?, model)?.get("id")?.as_str())
+        .or(configured)
+        .or(runtime)
+        .map(str::to_owned)
+}
+
+/// Whether a feature is on: a toggle's value, or a select set to an option other than its
+/// default.
+fn feature_active(feature: &paseo_client::AgentFeature) -> bool {
+    match &feature.kind {
+        paseo_client::AgentFeatureKind::Toggle(enabled) => *enabled,
+        paseo_client::AgentFeatureKind::Select { value, options } => options
+            .iter()
+            .any(|option| Some(&option.id) == value.as_ref() && !option.is_default),
+    }
+}
+
+/// A feature as an icon button, coloured while the feature is on.
+fn feature_icon_button(
+    id: impl Into<gpui::ElementId>,
+    icon: Option<&str>,
+    feature_id: &str,
+    active: bool,
+) -> IconButton {
+    IconButton::new(id, feature_icon(icon, active))
+        .icon_size(IconSize::Small)
+        .icon_color(if active {
+            feature_color(feature_id)
+        } else {
+            Color::Muted
+        })
+}
+
 /// Paseo's icon for a feature, from its Lucide name. Fast's bolt fills while it is on.
 fn feature_icon(icon: Option<&str>, enabled: bool) -> IconName {
     match icon {
@@ -2484,7 +2561,7 @@ fn feature_icon(icon: Option<&str>, enabled: bool) -> IconName {
 /// Other features, muted in Paseo, use the accent so their state still shows.
 fn feature_color(feature_id: &str) -> Color {
     match feature_id {
-        "fast_mode" => Color::Warning,
+        "fast_mode" | "service_tier" => Color::Warning,
         "auto_accept" => Color::Success,
         _ => Color::Accent,
     }
@@ -2605,6 +2682,74 @@ pub fn format_cost(cost: f64) -> String {
         format!("${cost:.4}")
     } else {
         format!("${cost:.2}")
+    }
+}
+
+/// The context meter's hover card: the agent's context window, then the usage of the account it
+/// runs under on hosts that can say.
+struct ContextHoverCard {
+    /// Used and maximum tokens, when the agent has reported them.
+    context: Option<(u64, u64)>,
+    cost: Option<f64>,
+    agent_usage: Option<Entity<crate::usage::AgentUsage>>,
+}
+
+impl ContextHoverCard {
+    fn new(
+        store: Entity<PaseoStore>,
+        agent_id: String,
+        context: Option<(u64, u64)>,
+        cost: Option<f64>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let agent_usage = crate::usage::AgentUsage::supported(store.read(cx))
+            .then(|| cx.new(|cx| crate::usage::AgentUsage::new(store, agent_id, cx)));
+        Self {
+            context,
+            cost,
+            agent_usage,
+        }
+    }
+}
+
+impl Render for ContextHoverCard {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (context, cost, agent_usage) = (self.context, self.cost, self.agent_usage.clone());
+        ui::tooltip_container(cx, move |this, _| {
+            this.gap_1()
+                // Usage cards need the room; without them it keeps a plain tooltip's shape.
+                .when(agent_usage.is_some(), |this| this.w(px(300.)))
+                .child(Label::new("Context window").weight(gpui::FontWeight::SEMIBOLD))
+                .map(|this| match context {
+                    Some((used, max)) => this
+                        .child(Label::new(format!(
+                            "{:.0}% used",
+                            (used as f64 / max as f64 * 100.).round()
+                        )))
+                        .child(
+                            Label::new(format!(
+                                "{} / {} tokens",
+                                format_tokens(used),
+                                format_tokens(max)
+                            ))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                        ),
+                    None => this.child(
+                        Label::new("No context data")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+                })
+                .when_some(cost, |this, cost| {
+                    this.child(
+                        Label::new(format!("Session cost {}", format_cost(cost)))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                })
+                .when_some(agent_usage, |this, agent_usage| this.child(agent_usage))
+        })
     }
 }
 
@@ -3027,6 +3172,7 @@ mod tests {
             description: None,
             tooltip: None,
             icon: None,
+            icon_only: false,
             kind: paseo_client::AgentFeatureKind::Toggle(value),
         };
         let offered = vec![toggle("fast_mode", false), toggle("plan_mode", false)];
@@ -3159,6 +3305,85 @@ mod tests {
                 .take(skills)
                 .all(|entry| entry.starts_with("/sr-")),
             "the closest matches come first: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn send_uses_send_behavior_setting() {
+        use settings::PaseoSendBehavior::{Interrupt, Steer};
+        assert_eq!(turn_behavior(Steer, true), Some(ActiveTurnBehavior::Steer));
+        assert_eq!(
+            turn_behavior(Steer, false),
+            Some(ActiveTurnBehavior::Steer),
+            "an idle agent starts a normal turn, and steering covers one it starts itself"
+        );
+        assert_eq!(
+            turn_behavior(Interrupt, true),
+            Some(ActiveTurnBehavior::Interrupt)
+        );
+        assert_eq!(turn_behavior(Interrupt, false), None);
+    }
+
+    #[test]
+    fn icon_only_select_is_active_off_default() {
+        let option = |id: &str, is_default| paseo_client::AgentFeatureOption {
+            id: id.into(),
+            label: id.into(),
+            description: None,
+            is_default,
+        };
+        let speed = |value: Option<&str>| paseo_client::AgentFeature {
+            id: "service_tier".into(),
+            label: "Speed".into(),
+            description: None,
+            tooltip: None,
+            icon: Some("zap".into()),
+            icon_only: true,
+            kind: paseo_client::AgentFeatureKind::Select {
+                value: value.map(Into::into),
+                options: vec![option("default", true), option("fast", false)],
+            },
+        };
+        assert!(!feature_active(&speed(Some("default"))));
+        assert!(feature_active(&speed(Some("fast"))));
+        assert!(
+            !feature_active(&speed(Some("gone"))),
+            "an unoffered value is not active"
+        );
+        assert!(!feature_active(&speed(None)));
+        assert_eq!(feature_color("service_tier"), Color::Warning);
+    }
+
+    #[test]
+    fn running_model_wins_when_in_catalog() {
+        let provider = provider();
+        let agent = |extra: Value| agent_model(&extra, Some(&provider));
+        assert_eq!(
+            agent(json!({"model":"opus","runtimeInfo":{"model":"sonnet"}})).as_deref(),
+            Some("sonnet"),
+            "a provider fallback shows the model the agent runs on"
+        );
+        assert_eq!(
+            agent(json!({"model":"sonnet","runtimeInfo":{"model":"opus-latest"}})).as_deref(),
+            Some("opus"),
+            "a running alias shows as its catalog model"
+        );
+        assert_eq!(
+            agent(json!({"model":"opus","runtimeInfo":{"model":"unlisted"}})).as_deref(),
+            Some("opus")
+        );
+        assert_eq!(
+            agent(json!({"runtimeInfo":{"model":"unlisted"}})).as_deref(),
+            Some("unlisted")
+        );
+        assert_eq!(
+            agent_model(
+                &json!({"model":"opus","runtimeInfo":{"model":"sonnet"}}),
+                None
+            )
+            .as_deref(),
+            Some("opus"),
+            "without the catalog the configured model wins"
         );
     }
 

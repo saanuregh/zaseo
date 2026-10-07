@@ -74,15 +74,111 @@ pub(crate) enum SidebarEntry {
     },
 }
 
-pub(crate) fn provider_icon(provider: &str) -> IconName {
-    match provider {
+/// Redraws a view every minute so relative times such as "5m" keep advancing while nothing else
+/// changes.
+pub(crate) fn redraw_every_minute<T: 'static>(cx: &mut Context<T>) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        loop {
+            cx.background_executor()
+                .timer(Duration::from_secs(60))
+                .await;
+            if this.update(cx, |_, cx| cx.notify()).is_err() {
+                break;
+            }
+        }
+    })
+}
+
+fn builtin_provider_icon(provider: &str) -> Option<IconName> {
+    Some(match provider {
         "claude" | "claude-code" => IconName::AiClaude,
         "codex" | "openai" => IconName::AiOpenAi,
         "opencode" => IconName::AiOpenCode,
         "gemini" => IconName::AiGemini,
         "copilot" => IconName::Copilot,
-        _ => IconName::Sparkle,
+        _ => return None,
+    })
+}
+
+pub(crate) fn provider_icon(provider: &str) -> IconName {
+    builtin_provider_icon(provider).unwrap_or(IconName::Sparkle)
+}
+
+/// The SVG icon the daemon sends for a provider Zaseo has no icon of its own for, such as one a
+/// plugin adds. Known providers skip the lookup, since rows redraw every frame while a status
+/// pulses.
+pub(crate) fn provider_icon_svg<'a>(store: &'a PaseoStore, provider: &str) -> Option<&'a str> {
+    if builtin_provider_icon(provider).is_some() {
+        return None;
     }
+    store
+        .provider(provider)?
+        .extra
+        .get("iconSvg")
+        .and_then(serde_json::Value::as_str)
+}
+
+/// Daemon icons draw with `currentColor`, which has no meaning in an image, so it becomes the
+/// colour the other icons use.
+fn tinted_svg(svg: &str, color: gpui::Hsla) -> String {
+    let color = gpui::Rgba::from(color);
+    let channel = |value: f32| (value.clamp(0., 1.) * 255.).round() as u8;
+    svg.replace(
+        "currentColor",
+        &format!(
+            "#{:02x}{:02x}{:02x}",
+            channel(color.r),
+            channel(color.g),
+            channel(color.b)
+        ),
+    )
+}
+
+/// A provider's or usage source's icon: Zaseo's own for the ones it knows, else the daemon's SVG,
+/// else a sparkle.
+pub(crate) fn source_icon(id: &str, svg: Option<&str>, size: IconSize, cx: &App) -> AnyElement {
+    match (builtin_provider_icon(id), svg) {
+        (None, Some(svg)) => gpui::img(tinted_icon(id, svg, cx))
+            .size(size.rems())
+            .flex_none()
+            .into_any_element(),
+        (icon, _) => Icon::new(icon.unwrap_or(IconName::Sparkle))
+            .size(size)
+            .color(Color::Muted)
+            .into_any_element(),
+    }
+}
+
+/// Daemon icons tinted for the theme, by source ID. Rows redraw every frame while a status
+/// pulses, and rebuilding the image each time would copy and hash the SVG every frame.
+#[derive(Default)]
+pub(crate) struct TintedIcons(
+    std::cell::RefCell<HashMap<String, (String, gpui::Hsla, std::sync::Arc<gpui::Image>)>>,
+);
+
+impl Global for TintedIcons {}
+
+fn tinted_icon(id: &str, svg: &str, cx: &App) -> std::sync::Arc<gpui::Image> {
+    let color = cx.theme().colors().icon_muted;
+    let build = || {
+        std::sync::Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Svg,
+            tinted_svg(svg, color).into_bytes(),
+        ))
+    };
+    let Some(icons) = cx.try_global::<TintedIcons>() else {
+        return build();
+    };
+    let mut icons = icons.0.borrow_mut();
+    if let Some((cached_svg, cached_color, image)) = icons.get(id)
+        && cached_svg == svg
+        && *cached_color == color
+    {
+        return image.clone();
+    }
+    let image = build();
+    icons.insert(id.to_owned(), (svg.to_owned(), color, image.clone()));
+    image
 }
 
 /// How many agents each workspace has, so an agent's display title, its workspace's name when it
@@ -1279,6 +1375,7 @@ pub struct PaseoPanel {
     changed_while_shown: bool,
     motion: RowMotion,
     row_hosts: RowHosts,
+    _timestamp_ticker: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1644,6 +1741,7 @@ impl PaseoPanel {
             changed_while_shown: false,
             motion: RowMotion::default(),
             row_hosts: RowHosts::default(),
+            _timestamp_ticker: redraw_every_minute(cx),
             _subscriptions: subscriptions,
         };
         panel.observe_motion(false, cx);
@@ -2130,7 +2228,7 @@ impl PaseoPanel {
                     }
                     menu.separator()
                         .action("Manage Hosts…", ManageHosts.boxed_clone())
-                        .action("Provider Usage", crate::OpenProviderUsage.boxed_clone())
+                        .action("Usage", crate::OpenProviderUsage.boxed_clone())
                         .action("Daemon Status", crate::OpenDaemonStatus.boxed_clone())
                         .action("Reconnect All", Reconnect.boxed_clone())
                 }))
@@ -2725,14 +2823,22 @@ impl PaseoPanel {
         });
         let row = SidebarRow {
             id: ("paseo-sidebar-workspace", index).into(),
-            icon: Icon::new(match single_agent_row {
-                Some((_, agent)) => provider_icon(agent_provider(agent)),
-                None if is_worktree => IconName::GitBranch,
-                None => IconName::Folder,
-            })
-            .size(IconSize::XSmall)
-            .color(Color::Muted)
-            .into_any_element(),
+            icon: match single_agent_row {
+                Some((_, agent)) => source_icon(
+                    agent_provider(agent),
+                    provider_icon_svg(store, agent_provider(agent)),
+                    IconSize::XSmall,
+                    cx,
+                ),
+                None => Icon::new(if is_worktree {
+                    IconName::GitBranch
+                } else {
+                    IconName::Folder
+                })
+                .size(IconSize::XSmall)
+                .color(Color::Muted)
+                .into_any_element(),
+            },
             title: workspace.name.clone().into(),
             highlight_positions: highlight_positions.to_vec(),
             title_generating: false,
@@ -2848,10 +2954,12 @@ impl PaseoPanel {
                 .size(IconSize::XSmall)
                 .color(Color::Accent)
                 .into_any_element(),
-            _ => Icon::new(provider_icon(agent_provider(agent)))
-                .size(IconSize::XSmall)
-                .color(Color::Muted)
-                .into_any_element(),
+            _ => source_icon(
+                agent_provider(agent),
+                provider_icon_svg(host.read(cx), agent_provider(agent)),
+                IconSize::XSmall,
+                cx,
+            ),
         };
         let item = SidebarRow {
             id: ("paseo-agent", index).into(),
@@ -3430,6 +3538,23 @@ mod tests {
     use super::*;
     use crate::store::agent_display_title;
     use serde_json::json;
+
+    #[test]
+    fn svg_icon_replaces_current_color() {
+        let svg = r#"<svg fill="currentColor"><path stroke="currentColor"/></svg>"#;
+        assert_eq!(
+            tinted_svg(svg, gpui::rgb(0x12ab34).into()),
+            r##"<svg fill="#12ab34"><path stroke="#12ab34"/></svg>"##
+        );
+    }
+
+    #[test]
+    fn known_provider_uses_builtin_icon() {
+        assert_eq!(builtin_provider_icon("claude"), Some(IconName::AiClaude));
+        assert_eq!(builtin_provider_icon("codex"), Some(IconName::AiOpenAi));
+        assert_eq!(builtin_provider_icon("antigravity"), None);
+        assert_eq!(provider_icon("antigravity"), IconName::Sparkle);
+    }
 
     /// The bounds of the element tagged `selector` in the window's last frame.
     fn bounds_of(

@@ -347,6 +347,8 @@ pub struct PaseoSettingsContent {
     pub sidebar: Option<PaseoSidebarSettingsContent>,
     /// How Zaseo tells you an agent needs you.
     pub alerts: Option<PaseoAlertSettingsContent>,
+    /// How provider usage reads.
+    pub usage: Option<PaseoUsageSettingsContent>,
 }
 
 #[with_fallible_options]
@@ -378,6 +380,65 @@ pub struct PaseoChatSettingsContent {
     ///
     /// Default: true
     pub show_thinking: Option<bool>,
+    /// What a message sent while the agent works does to its turn.
+    ///
+    /// Default: steer
+    pub send_behavior: Option<PaseoSendBehavior>,
+}
+
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    PartialEq,
+    Eq,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PaseoSendBehavior {
+    /// Adds the message to the running turn.
+    #[default]
+    Steer,
+    /// Stops the running turn and starts a new one with the message.
+    Interrupt,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct PaseoUsageSettingsContent {
+    /// Whether usage percentages show the share used or the share left.
+    ///
+    /// Default: used
+    pub display_as: Option<PaseoUsageDisplay>,
+}
+
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    PartialEq,
+    Eq,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PaseoUsageDisplay {
+    /// The share of each window already used.
+    #[default]
+    Used,
+    /// The share of each window left.
+    Remaining,
 }
 
 #[with_fallible_options]

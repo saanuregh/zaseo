@@ -2946,7 +2946,11 @@
       // Whether a finished turn's steps before its answer start folded under "Worked for …".
       "fold_finished_turns": true,
       // Whether thinking shows as a line while an agent works.
-      "show_thinking": true
+      "show_thinking": true,
+      // What a message sent while the agent works does: "steer" adds it to the running turn,
+      // "interrupt" stops the turn and starts a new one. A queued message sent when the turn
+      // ends always steers.
+      "send_behavior": "steer"
     },
     "sidebar": {
       // How the sidebar groups agents: "project", "status" or "labels". Unset keeps the last
@@ -2966,6 +2970,10 @@
       // Whether an agent that finishes, fails or needs input while no Zaseo window has focus
       // raises a system notification.
       "system_notifications": true
+    },
+    "usage": {
+      // Whether usage percentages show the share "used" or the share "remaining".
+      "display_as": "used"
     }
   },
   // Whether to read ~/.ssh/config for ssh connection sources.

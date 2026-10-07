@@ -24,6 +24,7 @@ pub(crate) enum HostsEvent {
         workspace_id: String,
         worktree_directory: Option<PathBuf>,
     },
+    ProviderNotice(paseo_client::ProviderNotice),
 }
 
 pub(crate) struct PaseoHost {
@@ -589,6 +590,9 @@ impl PaseoHosts {
                     })
                 }
                 StoreEvent::FocusChanged => cx.emit(HostsEvent::FocusChanged),
+                StoreEvent::ProviderNotice(notice) => {
+                    cx.emit(HostsEvent::ProviderNotice(notice.clone()))
+                }
                 StoreEvent::WorkspaceRemoved {
                     workspace_id,
                     worktree_directory,

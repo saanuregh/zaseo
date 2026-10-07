@@ -1004,6 +1004,7 @@ impl NewWorkspaceModal {
             "paseo-new-workspace-host-button",
             "Choose the host",
             self.store(cx),
+            crate::hosts::configured_hosts(cx),
             move |store, window, cx| {
                 if let Err(error) =
                     modal.update(cx, |modal, cx| modal.switch_host(store, window, cx))
@@ -1011,7 +1012,6 @@ impl NewWorkspaceModal {
                     log::debug!("Paseo new workspace closed: {error}");
                 }
             },
-            cx,
         )
     }
 

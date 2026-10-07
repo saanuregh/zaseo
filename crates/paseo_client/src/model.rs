@@ -463,7 +463,11 @@ pub struct ProviderUsage {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct UsageWindow {
+    pub id: String,
     pub label: String,
+    /// A few characters naming the window where space is tight, such as `5h`. An empty string
+    /// means the percent alone; `None` means use `label`.
+    pub short_label: Option<String>,
     pub used_percent: Option<f64>,
     pub resets_at: Option<String>,
     pub runs_out_at: Option<String>,
@@ -484,6 +488,85 @@ pub struct UsageBalance {
 pub struct UsageDetail {
     pub label: String,
     pub value: String,
+}
+
+/// Why an account's usage can't be read.
+#[derive(Clone, Debug, PartialEq)]
+pub enum UsageProblem {
+    /// The login expired; `refreshed_by` is the command that refreshes it, such as `claude login`.
+    Expired {
+        expires_at: String,
+        refreshed_by: Option<String>,
+    },
+    /// The provider rejected the login with this HTTP status.
+    Rejected {
+        status: i64,
+        refreshed_by: Option<String>,
+    },
+    NoQuota {
+        detail: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum UsageReport {
+    Available {
+        plan_label: Option<String>,
+        windows: Vec<UsageWindow>,
+        balances: Vec<UsageBalance>,
+        details: Vec<UsageDetail>,
+    },
+    Unavailable(UsageProblem),
+    Error(String),
+}
+
+/// One login that failed while reading an account that has several.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageLoginError {
+    pub harness: String,
+    pub report: UsageReport,
+}
+
+/// The usage of one account of one usage source, such as a Claude login.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageReportEntry {
+    /// `<source_id>:<account key>` on hosts with usage sources, the provider ID on older hosts.
+    pub id: String,
+    pub account_label: Option<String>,
+    pub fetched_at: String,
+    pub source_id: String,
+    pub source_label: String,
+    /// SVG markup for the source's icon.
+    pub icon: Option<String>,
+    pub report: UsageReport,
+    pub login_errors: Vec<UsageLoginError>,
+}
+
+/// Which usage reports to read. `agent_id` asks for the account that agent runs under and can't
+/// be combined with `report_ids`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UsageReportsRequest {
+    pub agent_id: Option<String>,
+    /// The agent's provider. Hosts without usage sources can't name the agent's account, so an
+    /// agent request there answers with this provider's entry from their per-provider list.
+    pub provider: Option<String>,
+    pub report_ids: Option<Vec<String>>,
+    pub force_refresh: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeKind {
+    Info,
+    Warning,
+    Error,
+}
+
+/// A message from the provider about an accepted change, such as a mode change that applies only
+/// after the current turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderNotice {
+    pub kind: NoticeKind,
+    pub message: String,
 }
 
 /// Creates the agent in a new git worktree branched off `base`, or the repository's default
@@ -624,6 +707,8 @@ pub struct AgentFeature {
     pub tooltip: Option<String>,
     /// A Lucide icon name from the provider, such as `zap`.
     pub icon: Option<String>,
+    /// Whether the desktop toolbar shows only the icon, as for Codex's Speed menu.
+    pub icon_only: bool,
     pub kind: AgentFeatureKind,
 }
 
@@ -641,6 +726,7 @@ pub struct AgentFeatureOption {
     pub id: String,
     pub label: String,
     pub description: Option<String>,
+    pub is_default: bool,
 }
 
 /// A daemon-side git checkout, as shown in the changes panel.

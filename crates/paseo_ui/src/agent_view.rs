@@ -2522,6 +2522,7 @@ impl AgentView {
             "paseo-draft-host-button",
             "The host the new agent runs on",
             self.store.clone(),
+            hosts::configured_hosts(cx),
             move |store, window, cx| {
                 if let Err(error) =
                     view.update(cx, |view, cx| view.switch_draft_host(store, window, cx))
@@ -2529,7 +2530,6 @@ impl AgentView {
                     log::debug!("Paseo draft closed: {error}");
                 }
             },
-            cx,
         )
     }
 
@@ -3665,10 +3665,9 @@ pub(crate) fn render_host_picker(
     button_id: &'static str,
     tooltip: &'static str,
     own_store: Entity<PaseoStore>,
+    hosts: Vec<(String, Entity<PaseoStore>)>,
     on_pick: impl Fn(Entity<PaseoStore>, &mut Window, &mut App) + 'static,
-    cx: &App,
 ) -> Option<AnyElement> {
-    let hosts = hosts::configured_hosts(cx);
     if hosts.len() < 2 {
         return None;
     }

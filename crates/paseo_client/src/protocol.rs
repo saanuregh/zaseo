@@ -1,11 +1,12 @@
 use crate::{
     AgentCommand, AgentFeature, AgentFeatureKind, AgentFeatureOption, AgentSummary,
     BranchSuggestion, CheckoutDiff, CheckoutStatus, DaemonStatus, DaemonUpdate, DiffFile, DiffHunk,
-    DiffLine, DiffLineKind, DiffStat, DirectorySuggestion, FileContent, PaseoWorktree,
-    PermissionRequest, ProjectDescriptor, Provider, ProviderAvailability, ProviderSubagent,
-    ProviderUsage, RecoveryState, RelayStatus, SetupSnapshot, TerminalInfo, TimelineCursor,
-    TimelineEntry, TimelinePage, TimelinePayload, UploadedFile, UsageBalance, UsageDetail,
-    UsageWindow, WorkspaceDescriptor, WorkspaceLabel, WorkspaceScript, subagent_timeline_id,
+    DiffLine, DiffLineKind, DiffStat, DirectorySuggestion, FileContent, NoticeKind, PaseoWorktree,
+    PermissionRequest, ProjectDescriptor, Provider, ProviderAvailability, ProviderNotice,
+    ProviderSubagent, ProviderUsage, RecoveryState, RelayStatus, SetupSnapshot, TerminalInfo,
+    TimelineCursor, TimelineEntry, TimelinePage, TimelinePayload, UploadedFile, UsageBalance,
+    UsageDetail, UsageLoginError, UsageProblem, UsageReport, UsageReportEntry, UsageWindow,
+    WorkspaceDescriptor, WorkspaceLabel, WorkspaceScript, subagent_timeline_id,
 };
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;
@@ -113,6 +114,8 @@ pub fn parse_features(features: &Value) -> Vec<AgentFeature> {
                                 id: text(option, "id")?,
                                 label: text(option, "label")?,
                                 description: text(option, "description"),
+                                is_default: option.get("isDefault").and_then(Value::as_bool)
+                                    == Some(true),
                             })
                         })
                         .collect(),
@@ -125,6 +128,7 @@ pub fn parse_features(features: &Value) -> Vec<AgentFeature> {
                 description: text(feature, "description"),
                 tooltip: text(feature, "tooltip"),
                 icon: text(feature, "icon"),
+                icon_only: feature.get("desktopTrigger").and_then(Value::as_str) == Some("icon"),
                 kind,
             })
         })
@@ -775,6 +779,42 @@ fn objects<'a>(value: &'a Value, key: &str) -> impl Iterator<Item = &'a Value> {
         .filter(|item| item.is_object())
 }
 
+fn parse_usage_window(window: &Value) -> UsageWindow {
+    UsageWindow {
+        id: optional_string(window, "id").unwrap_or_default(),
+        label: optional_string(window, "label").unwrap_or_default(),
+        short_label: optional_string(window, "shortLabel"),
+        used_percent: window.get("usedPct").and_then(Value::as_f64).or_else(|| {
+            window
+                .get("remainingPct")
+                .and_then(Value::as_f64)
+                .map(|remaining| 100.0 - remaining)
+        }),
+        resets_at: optional_string(window, "resetsAt"),
+        runs_out_at: optional_string(window, "runsOutAt")
+            .filter(|_| window.get("shortfallPct").is_some_and(Value::is_number)),
+        tone: optional_string(window, "tone"),
+    }
+}
+
+fn parse_usage_balance(balance: &Value) -> UsageBalance {
+    UsageBalance {
+        label: optional_string(balance, "label").unwrap_or_default(),
+        used: balance.get("used").and_then(Value::as_f64),
+        remaining: balance.get("remaining").and_then(Value::as_f64),
+        limit: balance.get("limit").and_then(Value::as_f64),
+        unit: optional_string(balance, "unit").unwrap_or_default(),
+        tone: optional_string(balance, "tone"),
+    }
+}
+
+fn parse_usage_detail(detail: &Value) -> UsageDetail {
+    UsageDetail {
+        label: optional_string(detail, "label").unwrap_or_default(),
+        value: optional_string(detail, "value").unwrap_or_default(),
+    }
+}
+
 pub fn parse_provider_usage(payload: &Value) -> Result<Vec<ProviderUsage>> {
     required_array(payload, "providers")?
         .iter()
@@ -789,39 +829,138 @@ pub fn parse_provider_usage(payload: &Value) -> Result<Vec<ProviderUsage>> {
                     .or_else(|| optional_string(payload, "fetchedAt")),
                 error: optional_string(provider, "error"),
                 windows: objects(provider, "windows")
-                    .map(|window| UsageWindow {
-                        label: optional_string(window, "label").unwrap_or_default(),
-                        used_percent: window.get("usedPct").and_then(Value::as_f64).or_else(|| {
-                            window
-                                .get("remainingPct")
-                                .and_then(Value::as_f64)
-                                .map(|remaining| 100.0 - remaining)
-                        }),
-                        resets_at: optional_string(window, "resetsAt"),
-                        runs_out_at: optional_string(window, "runsOutAt")
-                            .filter(|_| window.get("shortfallPct").is_some_and(Value::is_number)),
-                        tone: optional_string(window, "tone"),
-                    })
+                    .map(parse_usage_window)
                     .collect(),
                 balances: objects(provider, "balances")
-                    .map(|balance| UsageBalance {
-                        label: optional_string(balance, "label").unwrap_or_default(),
-                        used: balance.get("used").and_then(Value::as_f64),
-                        remaining: balance.get("remaining").and_then(Value::as_f64),
-                        limit: balance.get("limit").and_then(Value::as_f64),
-                        unit: optional_string(balance, "unit").unwrap_or_default(),
-                        tone: optional_string(balance, "tone"),
-                    })
+                    .map(parse_usage_balance)
                     .collect(),
                 details: objects(provider, "details")
-                    .map(|detail| UsageDetail {
-                        label: optional_string(detail, "label").unwrap_or_default(),
-                        value: optional_string(detail, "value").unwrap_or_default(),
-                    })
+                    .map(parse_usage_detail)
                     .collect(),
             })
         })
         .collect()
+}
+
+/// Older hosts' per-provider usage as report entries, the way Paseo's own client converts it.
+pub fn legacy_usage_reports(providers: Vec<ProviderUsage>) -> Vec<UsageReportEntry> {
+    providers
+        .into_iter()
+        .map(|provider| {
+            let error = provider.error.unwrap_or_default();
+            let report = match provider.status.as_str() {
+                "available" => UsageReport::Available {
+                    plan_label: provider.plan_label,
+                    windows: provider.windows,
+                    balances: provider.balances,
+                    details: provider.details,
+                },
+                "error" => UsageReport::Error(error),
+                _ => UsageReport::Unavailable(UsageProblem::NoQuota { detail: error }),
+            };
+            UsageReportEntry {
+                id: provider.provider_id.clone(),
+                account_label: None,
+                fetched_at: provider.fetched_at.unwrap_or_default(),
+                source_label: provider.display_name,
+                source_id: provider.provider_id,
+                icon: None,
+                report,
+                login_errors: Vec::new(),
+            }
+        })
+        .collect()
+}
+
+fn parse_usage_problem(problem: &Value) -> Result<UsageProblem> {
+    let refreshed_by = optional_string(problem, "refreshedBy");
+    Ok(match required_string(problem, "kind")? {
+        "expired" => UsageProblem::Expired {
+            expires_at: required_string(problem, "expiresAt")?.to_owned(),
+            refreshed_by,
+        },
+        "rejected" => UsageProblem::Rejected {
+            status: problem
+                .get("status")
+                .and_then(Value::as_i64)
+                .context("missing or invalid status")?,
+            refreshed_by,
+        },
+        "no_quota" => UsageProblem::NoQuota {
+            detail: optional_string(problem, "detail").unwrap_or_default(),
+        },
+        kind => bail!("unknown usage problem {kind}"),
+    })
+}
+
+fn parse_usage_report(report: &Value) -> Result<UsageReport> {
+    Ok(match required_string(report, "status")? {
+        "available" => UsageReport::Available {
+            plan_label: optional_string(report, "planLabel"),
+            windows: objects(report, "windows").map(parse_usage_window).collect(),
+            balances: objects(report, "balances")
+                .map(parse_usage_balance)
+                .collect(),
+            details: objects(report, "details").map(parse_usage_detail).collect(),
+        },
+        // A problem kind added by a newer host still explains itself through its detail.
+        "unavailable" => match report.get("problem") {
+            Some(problem) => {
+                parse_usage_problem(problem).unwrap_or_else(|error| UsageProblem::NoQuota {
+                    detail: optional_string(problem, "detail").unwrap_or_else(|| error.to_string()),
+                })
+            }
+            None => UsageProblem::NoQuota {
+                detail: String::new(),
+            },
+        }
+        .into(),
+        "error" => UsageReport::Error(optional_string(report, "error").unwrap_or_default()),
+        status => bail!("unknown usage report status {status}"),
+    })
+}
+
+impl From<UsageProblem> for UsageReport {
+    fn from(problem: UsageProblem) -> Self {
+        Self::Unavailable(problem)
+    }
+}
+
+pub fn parse_usage_report_entry(entry: &Value) -> Result<UsageReportEntry> {
+    Ok(UsageReportEntry {
+        id: required_string(entry, "id")?.to_owned(),
+        account_label: entry
+            .get("account")
+            .and_then(|account| optional_string(account, "label")),
+        fetched_at: required_string(entry, "fetchedAt")?.to_owned(),
+        source_id: required_string(entry, "sourceId")?.to_owned(),
+        source_label: required_string(entry, "sourceLabel")?.to_owned(),
+        icon: optional_string(entry, "icon"),
+        report: parse_usage_report(entry.get("report").context("missing usage report")?)?,
+        login_errors: objects(entry, "loginErrors")
+            .filter_map(|login| {
+                Some(UsageLoginError {
+                    harness: optional_string(login, "harness")?,
+                    report: parse_usage_report(login.get("report")?).ok()?,
+                })
+            })
+            .collect(),
+    })
+}
+
+/// The provider's notice on an accepted agent change, if the response carries one.
+pub fn parse_notice(payload: &Value) -> Option<ProviderNotice> {
+    let notice = payload.get("notice")?;
+    let kind = match notice.get("type").and_then(Value::as_str)? {
+        "info" => NoticeKind::Info,
+        "warning" => NoticeKind::Warning,
+        "error" => NoticeKind::Error,
+        _ => return None,
+    };
+    Some(ProviderNotice {
+        kind,
+        message: optional_string(notice, "message")?,
+    })
 }
 
 pub fn parse_terminal(terminal: &Value) -> Result<TerminalInfo> {

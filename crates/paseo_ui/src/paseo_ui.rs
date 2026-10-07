@@ -160,6 +160,7 @@ pub(crate) struct PaseoSettings {
     pub chat: ChatSettings,
     pub sidebar: SidebarSettings,
     pub alerts: AlertSettings,
+    pub usage: UsageSettings,
 }
 
 /// How agent chats read.
@@ -172,6 +173,13 @@ pub struct ChatSettings {
     pub line_length: u32,
     pub fold_finished_turns: bool,
     pub show_thinking: bool,
+    pub send_behavior: settings::PaseoSendBehavior,
+}
+
+/// How provider usage reads.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageSettings {
+    pub display_as: settings::PaseoUsageDisplay,
 }
 
 /// How the sidebar lists workspaces and agents.
@@ -197,6 +205,7 @@ impl Settings for PaseoSettings {
         let chat = paseo.and_then(|paseo| paseo.chat.as_ref());
         let sidebar = paseo.and_then(|paseo| paseo.sidebar.as_ref());
         let alerts = paseo.and_then(|paseo| paseo.alerts.as_ref());
+        let usage = paseo.and_then(|paseo| paseo.usage.as_ref());
         Self {
             profiles: paseo
                 .and_then(|paseo| paseo.profiles.clone())
@@ -224,6 +233,7 @@ impl Settings for PaseoSettings {
                     .and_then(|chat| chat.fold_finished_turns)
                     .unwrap_or(true),
                 show_thinking: chat.and_then(|chat| chat.show_thinking).unwrap_or(true),
+                send_behavior: chat.and_then(|chat| chat.send_behavior).unwrap_or_default(),
             },
             sidebar: SidebarSettings {
                 grouping: sidebar.and_then(|sidebar| sidebar.grouping),
@@ -241,6 +251,9 @@ impl Settings for PaseoSettings {
                 system_notifications: alerts
                     .and_then(|alerts| alerts.system_notifications)
                     .unwrap_or(true),
+            },
+            usage: UsageSettings {
+                display_as: usage.and_then(|usage| usage.display_as).unwrap_or_default(),
             },
         }
     }
@@ -260,6 +273,7 @@ const PREFERENCES_KEY: &str = "paseo_create_agent_preferences";
 
 pub fn init(cx: &mut App) {
     PaseoSettings::register(cx);
+    cx.set_global(sidebar::TintedIcons::default());
     workspace::register_serializable_item::<AgentTab>(cx);
     hosts::init(cx);
     init_system_notifications(cx);
@@ -271,6 +285,7 @@ pub fn init(cx: &mut App) {
             follow_paseo_changes(window, cx);
             register_workspace_actions(workspace);
             show_attention_toasts(cx);
+            show_provider_notice_toasts(cx);
         },
     )
     .detach();
@@ -451,6 +466,33 @@ fn show_attention_toasts(cx: &mut Context<Workspace>) {
                     }
                 })
                 .autohide(),
+                cx,
+            );
+        },
+    )
+    .detach();
+}
+
+/// Shows what a provider said about an accepted change, such as that a mode change applies only
+/// after the current turn.
+fn show_provider_notice_toasts(cx: &mut Context<Workspace>) {
+    cx.subscribe(
+        &hosts::registry(cx),
+        |workspace, _, event: &HostsEvent, cx| {
+            let HostsEvent::ProviderNotice(notice) = event else {
+                return;
+            };
+            let toast = Toast::new(
+                // One id, so a newer notice replaces the last.
+                NotificationId::named("paseo-provider-notice".into()),
+                notice.message.clone(),
+            );
+            workspace.show_toast(
+                if notice.kind == paseo_client::NoticeKind::Error {
+                    toast
+                } else {
+                    toast.autohide()
+                },
                 cx,
             );
         },
@@ -2294,6 +2336,7 @@ mod tests {
                     line_length: 80,
                     fold_finished_turns: true,
                     show_thinking: true,
+                    send_behavior: settings::PaseoSendBehavior::Steer,
                 }
             );
             assert_eq!(
@@ -2310,6 +2353,12 @@ mod tests {
                     toasts: true,
                     bell_count: true,
                     system_notifications: true,
+                }
+            );
+            assert_eq!(
+                paseo.usage,
+                UsageSettings {
+                    display_as: settings::PaseoUsageDisplay::Used,
                 }
             );
         });
@@ -2358,6 +2407,31 @@ mod tests {
                 chat_font_size(cx),
                 px(14.),
                 "chat prose matches Zed's label size, seven eighths of the UI font size"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn send_behavior_and_usage_display_read_from_settings(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let mut store = settings::SettingsStore::test(cx);
+            store
+                .set_user_settings(
+                    r#"{"paseo": {"chat": {"send_behavior": "interrupt"},
+                        "usage": {"display_as": "remaining"}}}"#,
+                    cx,
+                )
+                .result()
+                .expect("valid settings");
+            cx.set_global(store);
+            let paseo = PaseoSettings::get_global(cx);
+            assert_eq!(
+                paseo.chat.send_behavior,
+                settings::PaseoSendBehavior::Interrupt
+            );
+            assert_eq!(
+                paseo.usage.display_as,
+                settings::PaseoUsageDisplay::Remaining
             );
         });
     }

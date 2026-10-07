@@ -10,7 +10,7 @@ use std::time::Duration;
 use ui::{Chip, ContextMenu, HighlightedLabel, Tooltip, prelude::*, right_click_menu};
 use workspace::{Item, Workspace, item::ItemEvent};
 
-use crate::sidebar::{provider_icon, title_match_positions};
+use crate::sidebar::title_match_positions;
 use crate::store::{PaseoStore, agent_provider, agent_updated_at, agent_workspace_id};
 use crate::timeline::format_relative;
 
@@ -77,6 +77,8 @@ struct HistoryRow {
     place: String,
     title: String,
     provider: String,
+    /// The daemon's icon for a provider Zaseo has no icon of its own for.
+    provider_icon_svg: Option<String>,
     archived: bool,
     pending: usize,
     project: Option<String>,
@@ -107,6 +109,7 @@ impl HistoryRow {
                 .filter(|title| !title.is_empty())
                 .unwrap_or_else(|| "New agent".to_owned()),
             provider: agent_provider(agent).to_owned(),
+            provider_icon_svg: None,
             archived: agent.extra["archivedAt"].is_string(),
             pending: agent.extra["pendingPermissions"]
                 .as_array()
@@ -142,6 +145,7 @@ pub struct PaseoHistoryView {
     status: HistoryStatus,
     search_debounce: Option<Task<()>>,
     focus_handle: FocusHandle,
+    _timestamp_ticker: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -175,6 +179,7 @@ impl PaseoHistoryView {
             status: HistoryStatus::Loading,
             search_debounce: None,
             focus_handle: cx.focus_handle(),
+            _timestamp_ticker: crate::sidebar::redraw_every_minute(cx),
             _subscriptions: subscriptions,
         };
         view.reload(cx);
@@ -361,8 +366,15 @@ impl PaseoHistoryView {
         self.rows = self
             .hosts
             .iter()
-            .flat_map(|host| host.agents.iter())
-            .map(HistoryRow::new)
+            .flat_map(|host| {
+                let store = host.store.read(cx);
+                host.agents.iter().map(move |agent| {
+                    let mut row = HistoryRow::new(agent);
+                    row.provider_icon_svg =
+                        crate::sidebar::provider_icon_svg(store, &row.provider).map(str::to_owned);
+                    row
+                })
+            })
             .collect();
         self.rows
             .sort_by_key(|row| std::cmp::Reverse(row.updated_at));
@@ -555,11 +567,12 @@ impl PaseoHistoryView {
                                 .size(IconSize::XSmall)
                                 .color(Color::Muted),
                         )
-                        .child(
-                            Icon::new(provider_icon(&row.provider))
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
-                        )
+                        .child(crate::sidebar::source_icon(
+                            &row.provider,
+                            row.provider_icon_svg.as_deref(),
+                            IconSize::Small,
+                            cx,
+                        ))
                         .child(div().min_w_0().flex_shrink_1().child(Self::render_text(
                             row.title.clone(),
                             query,
