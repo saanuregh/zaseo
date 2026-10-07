@@ -33,6 +33,9 @@ jobs:
     needs: create_release
     runs-on: ubuntu-22.04
     timeout-minutes: 300
+    env:
+      CC: clang
+      CXX: clang++
     steps:
       - uses: actions/checkout@v7
       - name: Free disk space
