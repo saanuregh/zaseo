@@ -241,9 +241,9 @@ prompts, and a composer.
 
 - Each run of tool calls shows as one quiet line ("Ran 2 commands and used 1 other
   tool"). A click opens the details in place.
-- Once a turn finishes, its steps before the agent's final answer (narration, tools,
-  and thinking) fold under a "Worked for …" line at the top. Click it to show them
-  again.
+- Once a turn finishes, its tools and thinking before the agent's final answer fold
+  under a "Worked for …" line at the top. The agent's text stays visible. Click the
+  line to show the folded steps again.
 
 ## Features that depend on the daemon
 

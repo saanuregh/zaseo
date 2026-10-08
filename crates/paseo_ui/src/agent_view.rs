@@ -60,9 +60,14 @@ fn is_thinking(item: &StreamItem) -> bool {
     }
 }
 
+/// Whether an item is the agent's text, which stays visible when its turn folds.
+fn is_assistant_text(item: &StreamItem) -> bool {
+    matches!(&item.content, StreamContent::Assistant { text } if !text.trim().is_empty())
+}
+
 /// The steps of a finished turn that its "Worked for" line folds away: everything between the
 /// user's message and the agent's final answer, or after the message when no answer came.
-/// `None` when there is nothing between them.
+/// The agent's text in that range stays visible. `None` when there is nothing between them.
 pub(crate) fn folded_work<Item: std::borrow::Borrow<StreamItem>>(
     items: &[Item],
     turn: Range<usize>,
@@ -73,11 +78,9 @@ pub(crate) fn folded_work<Item: std::borrow::Borrow<StreamItem>>(
         item_at(*index).is_some_and(|item| matches!(item.content, StreamContent::User { .. }))
     };
     let work_start = turn.clone().find(|index| !is_user(index))?;
-    let final_answer = (work_start..turn.end).rev().find(|index| {
-        item_at(*index).is_some_and(|item| {
-            matches!(&item.content, StreamContent::Assistant { text } if !text.trim().is_empty())
-        })
-    });
+    let final_answer = (work_start..turn.end)
+        .rev()
+        .find(|index| item_at(*index).is_some_and(is_assistant_text));
     // A queued prompt the chat doesn't show can start a second reply in the same turn, so the
     // answer is every message after the last step, not just the last message.
     let is_answer_part = |index: usize| {
@@ -918,7 +921,8 @@ impl AgentView {
                         expanded: fold_open,
                     });
                 }
-                if work.contains(&start) && !fold_open {
+                let is_text = matches!(&segment, Segment::Item(index) if items.get(*index).is_some_and(|item| is_assistant_text(item)));
+                if work.contains(&start) && !fold_open && !is_text {
                     continue;
                 }
             }
