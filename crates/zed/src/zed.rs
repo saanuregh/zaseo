@@ -522,6 +522,21 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             },
         )
         .detach();
+
+        let window_handle = window.window_handle();
+        cx.defer(move |cx| {
+            window_handle
+                .update(cx, |_, window, cx| {
+                    let agents_list = cx.new(|cx| {
+                        paseo_ui::AgentsList::new(multi_workspace_handle.downgrade(), window, cx)
+                    });
+                    multi_workspace_handle.update(cx, |multi_workspace, cx| {
+                        multi_workspace.register_sidebar(agents_list, cx);
+                        multi_workspace.open_sidebar_by_default(cx);
+                    });
+                })
+                .log_err();
+        });
     })
     .detach();
 
@@ -604,6 +619,8 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             cx.new(|cx| which_key::PendingKeystrokesIndicator::new(window, cx));
         let image_info = cx.new(|_cx| ImageInfo::new(workspace));
         let paseo_usage = cx.new(paseo_ui::UsageStatusItem::new);
+        let (left_layout_buttons, right_layout_buttons) =
+            paseo_ui::layout_buttons(&workspace_handle, cx);
 
         let lsp_button_menu_handle = PopoverMenuHandle::default();
         let lsp_button =
@@ -629,7 +646,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_left_item(git_blame_status, window, cx);
             status_bar.add_left_item(merge_conflict_indicator, window, cx);
             status_bar.add_left_item(activity_indicator, window, cx);
-            status_bar.add_right_item(paseo_usage, window, cx);
+            status_bar.add_right_item(paseo_usage.clone(), window, cx);
             status_bar.add_right_item(edit_prediction_ui, window, cx);
             status_bar.add_right_item(active_buffer_encoding, window, cx);
             status_bar.add_right_item(active_buffer_language, window, cx);
@@ -640,7 +657,11 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             // Keep these last so they stay leftmost and can change without moving the other items.
             status_bar.add_right_item(vim_mode_indicator, window, cx);
             status_bar.add_right_item(pending_keystrokes_indicator, window, cx);
+            // The layout buttons sit at the edges, beside the areas they show and hide.
+            status_bar.add_far_left_item(left_layout_buttons, window, cx);
+            status_bar.add_far_right_item(right_layout_buttons, window, cx);
         });
+        paseo_ui::UsageStatusItem::follow_chat_panel(&paseo_usage, cx);
 
         let panels_task = initialize_panels(window, cx);
         workspace.set_panels_task(panels_task);
@@ -768,7 +789,7 @@ fn show_software_emulation_warning_if_needed(
 fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<anyhow::Result<()>> {
     cx.spawn_in(window, async move |workspace_handle, cx| {
         let project_panel = ProjectPanel::load(workspace_handle.clone(), cx.clone());
-        let paseo_panel = paseo_ui::PaseoPanel::load(workspace_handle.clone(), cx.clone());
+        let chat_panel = paseo_ui::ChatPanel::load(workspace_handle.clone(), cx.clone());
         let outline_panel = OutlinePanel::load(workspace_handle.clone(), cx.clone());
         let terminal_panel = TerminalPanel::load(workspace_handle.clone(), cx.clone());
         let git_panel = GitPanel::load(workspace_handle.clone(), cx.clone());
@@ -791,7 +812,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
 
         futures::join!(
             add_panel_when_ready(project_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(paseo_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(chat_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(outline_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(terminal_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),
@@ -802,7 +823,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             workspace.finish_dock_restoration(cx);
         })?;
         workspace_handle.update_in(cx, |workspace, window, cx| {
-            paseo_ui::apply_sidebar_size(workspace, window, cx);
+            paseo_ui::move_chats_into_chat_panel(workspace, window, cx);
         })?;
 
         anyhow::Ok(())
@@ -1360,24 +1381,10 @@ fn initialize_pane(
 ) {
     let workspace_handle = cx.weak_entity();
     pane.update(cx, |pane, cx| {
-        // An agent's tab puts its menu in the tab bar, in front of the pane's own buttons.
-        pane.set_render_tab_bar_buttons(cx, |pane, window, cx| {
-            let (left, right) = workspace::pane::default_render_tab_bar_buttons(pane, window, cx);
-            let agent_menu = pane
-                .active_item()
-                .and_then(|item| paseo_ui::agent_tab_menu(item.as_ref(), cx));
-            let right = match (agent_menu, right) {
-                (Some(menu), Some(right)) => Some(
-                    h_flex()
-                        .gap(ui::DynamicSpacing::Base04.rems(cx))
-                        .child(menu)
-                        .child(right)
-                        .into_any_element(),
-                ),
-                (menu, right) => menu.or(right),
-            };
-            (left, right)
-        });
+        // Chats belong in the chat panel, so the editor's panes refuse them.
+        pane.set_can_drop_predicate(Some(Arc::new(|dragged, _, _| {
+            paseo_ui::editor_accepts_drop(dragged)
+        })));
         pane.toolbar().update(cx, |toolbar, cx| {
             let multibuffer_hint = cx.new(|_| MultibufferHint::new());
             toolbar.add_item(multibuffer_hint, window, cx);
@@ -6829,12 +6836,7 @@ mod tests {
         let workspace = window
             .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
             .expect("workspace window");
-        assert!(cx.read(|cx| {
-            workspace
-                .read(cx)
-                .panel::<paseo_ui::PaseoPanel>(cx)
-                .is_some()
-        }));
+        assert!(cx.read(|cx| paseo_ui::test_agents_list(workspace.read(cx), cx).is_some()));
         assert!(cx.read(|cx| {
             workspace
                 .read(cx)
@@ -6845,18 +6847,18 @@ mod tests {
         cx.dispatch_action(window.into(), paseo_ui::OpenTab);
         cx.run_until_parked();
         let first = cx.read(|cx| {
-            workspace
-                .read(cx)
-                .item_of_type::<paseo_ui::AgentTab>(cx)
+            paseo_ui::test_agent_tabs(workspace.read(cx), cx)
+                .into_iter()
+                .next()
                 .expect("Paseo tab")
                 .entity_id()
         });
         cx.dispatch_action(window.into(), paseo_ui::OpenTab);
         cx.run_until_parked();
         let second = cx.read(|cx| {
-            workspace
-                .read(cx)
-                .item_of_type::<paseo_ui::AgentTab>(cx)
+            paseo_ui::test_agent_tabs(workspace.read(cx), cx)
+                .into_iter()
+                .next()
                 .expect("Paseo tab after repeated action")
                 .entity_id()
         });
@@ -7166,9 +7168,8 @@ mod tests {
 
     fn agent_tabs(workspace: &Entity<Workspace>, cx: &TestAppContext) -> Vec<gpui::EntityId> {
         cx.read(|cx| {
-            workspace
-                .read(cx)
-                .items_of_type::<paseo_ui::AgentTab>(cx)
+            paseo_ui::test_agent_tabs(workspace.read(cx), cx)
+                .into_iter()
                 .map(|tab| paseo_ui::AgentTab::test_view_id(&tab, cx))
                 .collect()
         })
@@ -7258,9 +7259,8 @@ mod tests {
 
     fn agent_tab_ids(workspace: &Entity<Workspace>, cx: &TestAppContext) -> Vec<String> {
         cx.read(|cx| {
-            let mut ids = workspace
-                .read(cx)
-                .items_of_type::<paseo_ui::AgentTab>(cx)
+            let mut ids = paseo_ui::test_agent_tabs(workspace.read(cx), cx)
+                .into_iter()
                 .filter_map(|tab| tab.read(cx).agent_id(cx))
                 .collect::<Vec<_>>();
             ids.sort();
@@ -7273,9 +7273,8 @@ mod tests {
         agent_id: &str,
         cx: &App,
     ) -> Entity<paseo_ui::AgentTab> {
-        workspace
-            .read(cx)
-            .items_of_type::<paseo_ui::AgentTab>(cx)
+        paseo_ui::test_agent_tabs(workspace.read(cx), cx)
+            .into_iter()
             .find(|tab| tab.read(cx).agent_id(cx).as_deref() == Some(agent_id))
             .expect("agent tab")
     }
@@ -7319,9 +7318,7 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(agent_tab_ids(&one, cx), ["a1", "a2", "a3"]);
         let active = cx.read(|cx| {
-            one.read(cx)
-                .active_item(cx)
-                .and_then(|item| item.downcast::<paseo_ui::AgentTab>())
+            paseo_ui::test_active_agent_tab(one.read(cx), cx)
                 .and_then(|tab| tab.read(cx).agent_id(cx))
         });
         assert_eq!(
@@ -7530,9 +7527,8 @@ mod tests {
         cx: &TestAppContext,
     ) -> Vec<Option<String>> {
         cx.read(|cx| {
-            workspace
-                .read(cx)
-                .items_of_type::<paseo_ui::AgentTab>(cx)
+            paseo_ui::test_agent_tabs(workspace.read(cx), cx)
+                .into_iter()
                 .filter(|tab| tab.read(cx).agent_id(cx).is_none())
                 .map(|tab| paseo_ui::test_draft_workspace_id(&tab, cx))
                 .collect()
@@ -7553,8 +7549,8 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         let draft = cx.read(|cx| {
-            one.read(cx)
-                .items_of_type::<paseo_ui::AgentTab>(cx)
+            paseo_ui::test_agent_tabs(one.read(cx), cx)
+                .into_iter()
                 .find(|tab| tab.read(cx).agent_id(cx).is_none())
                 .expect("draft")
         });
@@ -7601,9 +7597,7 @@ mod tests {
         assert_eq!(active, one);
         assert_eq!(agent_tab_ids(&one, cx), ["a1", "a2"]);
         let active_agent = cx.read(|cx| {
-            one.read(cx)
-                .active_item(cx)
-                .and_then(|item| item.downcast::<paseo_ui::AgentTab>())
+            paseo_ui::test_active_agent_tab(one.read(cx), cx)
                 .and_then(|tab| tab.read(cx).agent_id(cx))
         });
         assert_eq!(active_agent.as_deref(), Some("a2"), "the most recent agent");
@@ -7632,8 +7626,8 @@ mod tests {
         open_from(&one, cx);
         open_from(&two, cx);
         let drafts = cx.read(|cx| {
-            one.read(cx)
-                .items_of_type::<paseo_ui::AgentTab>(cx)
+            paseo_ui::test_agent_tabs(one.read(cx), cx)
+                .into_iter()
                 .filter(|tab| tab.read(cx).agent_id(cx).is_none())
                 .count()
         });
@@ -7799,8 +7793,8 @@ mod tests {
         };
         let restored_agents = |cx: &TestAppContext| {
             cx.read(|cx| {
-                two.read(cx)
-                    .items_of_type::<paseo_ui::AgentTab>(cx)
+                paseo_ui::test_agent_tabs(two.read(cx), cx)
+                    .into_iter()
                     .filter_map(|tab| tab.read(cx).agent_id(cx))
                     .collect::<Vec<_>>()
             })
@@ -7864,8 +7858,8 @@ mod tests {
         cx.run_until_parked();
         let tab_hosts = |cx: &TestAppContext| {
             cx.read(|cx| {
-                two.read(cx)
-                    .items_of_type::<paseo_ui::AgentTab>(cx)
+                paseo_ui::test_agent_tabs(two.read(cx), cx)
+                    .into_iter()
                     .map(|tab| {
                         (
                             tab.read(cx).agent_id(cx),
@@ -7994,9 +7988,8 @@ mod tests {
     ) {
         window
             .update(cx, |_, window, cx| {
-                let tab = workspace
-                    .read(cx)
-                    .items_of_type::<paseo_ui::AgentTab>(cx)
+                let tab = paseo_ui::test_agent_tabs(workspace.read(cx), cx)
+                    .into_iter()
                     .next()
                     .expect("agent tab");
                 paseo_ui::AgentTab::test_type_in_composer(&tab, text, window, cx);
@@ -8106,88 +8099,6 @@ mod tests {
         );
     }
 
-    fn paseo_sidebar_size(
-        workspace: &Entity<Workspace>,
-        cx: &TestAppContext,
-    ) -> Option<workspace::dock::PanelSizeState> {
-        cx.read(|cx| {
-            let workspace = workspace.read(cx);
-            let panel = workspace.panel::<paseo_ui::PaseoPanel>(cx)?;
-            workspace
-                .all_docks()
-                .into_iter()
-                .find_map(|dock| dock.read(cx).stored_panel_size_state(&panel))
-        })
-    }
-
-    #[gpui::test]
-    async fn paseo_sidebar_width_is_shared(cx: &mut TestAppContext) {
-        let (window, one, two) = paseo_two_workspaces(cx).await;
-        let wide = workspace::dock::PanelSizeState {
-            size: Some(px(420.)),
-            flex: None,
-        };
-        window
-            .update(cx, |_, window, cx| {
-                one.update(cx, |workspace, cx| {
-                    workspace.set_panel_size_state::<paseo_ui::PaseoPanel>(wide, window, cx)
-                })
-            })
-            .unwrap();
-        activate_workspace(window, &two, cx);
-        assert_eq!(paseo_sidebar_size(&two, cx), Some(wide));
-
-        let project = Project::test(
-            one.read_with(cx, |workspace, _| workspace.app_state().fs.clone()),
-            [],
-            cx,
-        )
-        .await;
-        let three = window
-            .update(cx, |multi_workspace, window, cx| {
-                multi_workspace.test_add_workspace(project, window, cx)
-            })
-            .unwrap();
-        cx.run_until_parked();
-        assert_eq!(
-            paseo_sidebar_size(&three, cx),
-            Some(wide),
-            "a project opened later starts at the shared width"
-        );
-
-        let wider = workspace::dock::PanelSizeState {
-            size: Some(px(600.)),
-            flex: None,
-        };
-        let panel_three = paseo_panel(&three, cx);
-        window
-            .update(cx, |_, window, cx| {
-                three.update(cx, |workspace, cx| {
-                    workspace.set_panel_size_state::<paseo_ui::PaseoPanel>(wider, window, cx)
-                });
-                paseo_ui::PaseoPanel::test_size_changed(&panel_three, window, cx);
-            })
-            .unwrap();
-        cx.run_until_parked();
-        let project = Project::test(
-            one.read_with(cx, |workspace, _| workspace.app_state().fs.clone()),
-            [],
-            cx,
-        )
-        .await;
-        let four = window
-            .update(cx, |multi_workspace, window, cx| {
-                multi_workspace.test_add_workspace(project, window, cx)
-            })
-            .unwrap();
-        cx.run_until_parked();
-        assert_eq!(
-            paseo_sidebar_size(&four, cx),
-            Some(wider),
-            "a resize, not only a switch, sets the shared width"
-        );
-    }
-
     #[gpui::test]
     async fn paseo_chat_tabs_follow_from_the_empty_start(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
@@ -8234,106 +8145,299 @@ mod tests {
     fn paseo_panel(
         workspace: &Entity<Workspace>,
         cx: &TestAppContext,
-    ) -> Entity<paseo_ui::PaseoPanel> {
-        cx.read(|cx| {
-            workspace
-                .read(cx)
-                .panel::<paseo_ui::PaseoPanel>(cx)
-                .expect("Paseo panel")
-        })
+    ) -> Entity<paseo_ui::AgentsList> {
+        cx.read(|cx| paseo_ui::test_agents_list(workspace.read(cx), cx).expect("agents list"))
+    }
+
+    fn agents_list_shown(window: WindowHandle<MultiWorkspace>, cx: &TestAppContext) -> bool {
+        window
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace.sidebar_render_state(cx).open
+            })
+            .expect("window")
     }
 
     #[gpui::test]
-    async fn paseo_sidebar_grouping_is_shared(cx: &mut TestAppContext) {
+    async fn paseo_agents_list_is_the_window_sidebar(cx: &mut TestAppContext) {
         let (window, one, two) = paseo_two_workspaces(cx).await;
-        let (panel_one, panel_two) = (paseo_panel(&one, cx), paseo_panel(&two, cx));
-        assert!(!cx.read(|cx| paseo_ui::PaseoPanel::test_groups_by_status(&panel_two, cx)));
+        assert_eq!(
+            paseo_panel(&one, cx),
+            paseo_panel(&two, cx),
+            "one agents list serves every project of a window"
+        );
+        assert!(
+            agents_list_shown(window, cx),
+            "a new window shows the agents list"
+        );
+
+        cx.dispatch_action(window.into(), paseo_ui::TogglePanel);
+        cx.run_until_parked();
+        assert!(!agents_list_shown(window, cx));
+        cx.dispatch_action(window.into(), paseo_ui::TogglePanel);
+        cx.run_until_parked();
+        assert!(agents_list_shown(window, cx));
+
+        let panel = paseo_panel(&one, cx);
         window
-            .update(cx, |_, window, cx| {
-                paseo_ui::PaseoPanel::test_toggle_grouping(&panel_one, window, cx)
+            .update(cx, |multi_workspace, _, cx| {
+                if let Some(sidebar) = multi_workspace.sidebar() {
+                    sidebar.set_width(Some(px(420.)), cx);
+                }
             })
             .unwrap();
-        cx.run_until_parked();
-        assert!(
-            cx.read(|cx| paseo_ui::PaseoPanel::test_groups_by_status(&panel_two, cx)),
-            "every project's sidebar shows the grouping just chosen"
+        let saved = window
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace
+                    .sidebar()
+                    .and_then(|sidebar| sidebar.serialized_state(cx))
+            })
+            .unwrap()
+            .expect("saved agents list state");
+        window
+            .update(cx, |multi_workspace, window, cx| {
+                if let Some(sidebar) = multi_workspace.sidebar() {
+                    sidebar.set_width(None, cx);
+                    sidebar.restore_serialized_state(&saved, window, cx);
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            cx.read(|cx| paseo_ui::AgentsList::test_width(&panel, cx)),
+            px(420.),
+            "the width survives a restart"
         );
     }
 
     #[gpui::test]
-    async fn paseo_sidebar_left_behind_catches_up(cx: &mut TestAppContext) {
-        let (window, one, two) = paseo_two_workspaces(cx).await;
-        let panel_one = paseo_panel(&one, cx);
-        cx.update(|cx| paseo_ui::PaseoPanel::test_set_pointer_inside(&panel_one, true, cx));
-        cx.update(|cx| {
-            paseo_ui::test_add_permission(
-                paseo_client::PermissionRequest {
-                    agent_id: "agent".into(),
-                    request_id: "request".into(),
-                    title: "Run".into(),
-                    description: None,
-                    extra: json!({}),
-                },
-                cx,
-            )
-        });
+    async fn paseo_hidden_agents_list_catches_up_when_shown(cx: &mut TestAppContext) {
+        let (window, one, _two) = paseo_two_workspaces(cx).await;
+        let panel = paseo_panel(&one, cx);
+        // The pointer is over the list as it hides, so the list never sees it leave.
+        cx.update(|cx| paseo_ui::AgentsList::test_set_pointer_inside(&panel, true, cx));
+        cx.dispatch_action(window.into(), paseo_ui::TogglePanel);
         cx.run_until_parked();
-        assert!(cx.read(|cx| paseo_ui::PaseoPanel::test_refresh_pending(&panel_one, cx)));
+        assert!(!agents_list_shown(window, cx));
 
-        activate_workspace(window, &two, cx);
-        assert!(
-            !cx.read(|cx| paseo_ui::PaseoPanel::test_refresh_pending(&panel_one, cx)),
-            "a sidebar switched away from stops waiting for the pointer to leave"
-        );
-    }
-
-    #[gpui::test]
-    async fn paseo_hidden_sidebar_changes_dont_flash_when_shown(cx: &mut TestAppContext) {
-        let (window, one, two) = paseo_two_workspaces(cx).await;
-        let (panel_one, panel_two) = (paseo_panel(&one, cx), paseo_panel(&two, cx));
         add_paseo_agent("agent", path!("/one"), cx);
         cx.run_until_parked();
-        activate_workspace(window, &two, cx);
-        activate_workspace(window, &one, cx);
-        let mut working = paseo_ui::test_agent("agent", "Fix login", "running");
-        working.directory = Some(PathBuf::from(path!("/one")));
-        cx.update(|cx| paseo_ui::test_upsert_agent(working, cx));
-        cx.run_until_parked();
         assert!(
-            cx.read(|cx| paseo_ui::PaseoPanel::test_flashing(&panel_one, "agent", cx)),
-            "the sidebar on screen flashes the row that changed"
-        );
-        activate_workspace(window, &two, cx);
-        assert!(
-            !cx.read(|cx| paseo_ui::PaseoPanel::test_flashing(&panel_two, "agent", cx)),
-            "a sidebar shown after the change shows it without a flash"
-        );
-    }
-
-    #[gpui::test]
-    async fn paseo_hidden_sidebar_rebuilds_when_drawn_or_read(cx: &mut TestAppContext) {
-        let (window, one, two) = paseo_two_workspaces(cx).await;
-        let (panel_one, panel_two) = (paseo_panel(&one, cx), paseo_panel(&two, cx));
-        add_paseo_agent("agent", path!("/one"), cx);
-        cx.run_until_parked();
-        assert!(!cx.read(|cx| paseo_ui::PaseoPanel::test_rows_pending(&panel_one, cx)));
-        assert!(
-            cx.read(|cx| paseo_ui::PaseoPanel::test_rows_pending(&panel_two, cx)),
-            "a sidebar that isn't drawn leaves its rows for later"
+            cx.read(|cx| paseo_ui::AgentsList::test_rows_pending(&panel, cx)),
+            "a hidden list leaves its rows for later"
         );
         assert_eq!(
-            cx.update(|cx| paseo_ui::PaseoPanel::test_agent_order(&panel_two, cx)),
+            cx.update(|cx| paseo_ui::AgentsList::test_agent_order(&panel, cx)),
             ["agent"],
-            "number keys read rows brought up to date"
+            "number keys read rows brought up to date, without waiting for the pointer"
         );
 
         add_paseo_agent("second", path!("/two"), cx);
         cx.run_until_parked();
-        assert!(cx.read(|cx| paseo_ui::PaseoPanel::test_rows_pending(&panel_two, cx)));
-        activate_workspace(window, &two, cx);
+        cx.dispatch_action(window.into(), paseo_ui::TogglePanel);
+        cx.run_until_parked();
         assert!(
-            !cx.read(|cx| paseo_ui::PaseoPanel::test_rows_pending(&panel_two, cx)),
-            "a sidebar catches up when it is drawn"
+            !cx.read(|cx| paseo_ui::AgentsList::test_rows_pending(&panel, cx)),
+            "the list catches up when it is shown"
+        );
+        assert!(
+            !cx.read(|cx| paseo_ui::AgentsList::test_flashing(&panel, "second", cx)),
+            "a change made while hidden shows without a flash"
+        );
+    }
+
+    fn chat_panel(
+        workspace: &Entity<Workspace>,
+        cx: &TestAppContext,
+    ) -> Entity<paseo_ui::ChatPanel> {
+        cx.read(|cx| {
+            workspace
+                .read(cx)
+                .panel::<paseo_ui::ChatPanel>(cx)
+                .expect("chat panel")
+        })
+    }
+
+    fn editor_chats(workspace: &Entity<Workspace>, cx: &TestAppContext) -> usize {
+        cx.read(|cx| {
+            workspace
+                .read(cx)
+                .panes()
+                .iter()
+                .flat_map(|pane| pane.read(cx).items_of_type::<paseo_ui::AgentTab>())
+                .count()
+        })
+    }
+
+    #[gpui::test]
+    async fn paseo_chats_open_in_the_chat_panel(cx: &mut TestAppContext) {
+        let (window, one, _two) = paseo_two_workspaces(cx).await;
+        add_paseo_agent("agent", path!("/one/src"), cx);
+        place_paseo_agent(window, &one, "agent", cx);
+        let panel = chat_panel(&one, cx);
+        assert_eq!(cx.read(|cx| panel.read(cx).agent_tabs(cx).len()), 1);
+        assert_eq!(editor_chats(&one, cx), 0, "the editor keeps only files");
+        assert!(cx.read(|cx| paseo_ui::test_chat_panel_shown(one.read(cx), cx)));
+    }
+
+    #[gpui::test]
+    async fn paseo_chats_in_the_editor_move_to_the_chat_panel(cx: &mut TestAppContext) {
+        let (window, one, _two) = paseo_two_workspaces(cx).await;
+        add_paseo_agent("agent", path!("/one/src"), cx);
+        window
+            .update(cx, |_, window, cx| {
+                one.update(cx, |workspace, cx| {
+                    paseo_ui::test_open_chat_in_editor(workspace, "agent", window, cx)
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(editor_chats(&one, cx), 0);
+        let panel = chat_panel(&one, cx);
+        assert_eq!(
+            cx.read(|cx| panel.read(cx).agent_tabs(cx).len()),
+            1,
+            "a chat restored into the editor by an older build moves to the chat panel"
+        );
+    }
+
+    #[gpui::test]
+    async fn paseo_editor_refuses_dragged_chats(cx: &mut TestAppContext) {
+        let (window, one, _two) = paseo_two_workspaces(cx).await;
+        add_paseo_agent("agent", path!("/one/src"), cx);
+        place_paseo_agent(window, &one, "agent", cx);
+        let panel = chat_panel(&one, cx);
+        let (chat_tab, chat_pane) = cx.read(|cx| {
+            let panel = panel.read(cx);
+            (
+                panel.agent_tabs(cx).into_iter().next().expect("chat"),
+                panel.active_pane().clone(),
+            )
+        });
+        let editor_pane = cx.read(|cx| one.read(cx).active_pane().clone());
+        let dragged_chat = workspace::pane::DraggedTab {
+            pane: chat_pane,
+            item: Box::new(chat_tab),
+            ix: 0,
+            detail: 0,
+            is_active: true,
+        };
+        assert!(!paseo_ui::editor_accepts_drop(&dragged_chat));
+        let file = window
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| Editor::single_line(window, cx))
+            })
+            .unwrap();
+        let dragged_file = workspace::pane::DraggedTab {
+            pane: editor_pane,
+            item: Box::new(file),
+            ix: 0,
+            detail: 0,
+            is_active: true,
+        };
+        assert!(paseo_ui::editor_accepts_drop(&dragged_file));
+    }
+
+    #[gpui::test]
+    async fn paseo_chat_panel_restores_tabs_and_splits(cx: &mut TestAppContext) {
+        let (window, one, _two) = paseo_two_workspaces(cx).await;
+        add_paseo_agent("first", path!("/one/src"), cx);
+        add_paseo_agent("second", path!("/one/src"), cx);
+        place_paseo_agent(window, &one, "first", cx);
+        place_paseo_agent(window, &one, "second", cx);
+        let panel = chat_panel(&one, cx);
+        window
+            .update(cx, |_, window, cx| {
+                let pane = panel.read(cx).active_pane().clone();
+                pane.update(cx, |pane, cx| {
+                    pane.split(
+                        workspace::SplitDirection::Right,
+                        workspace::pane::SplitMode::MovePane,
+                        window,
+                        cx,
+                    )
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let chats_by_pane = |cx: &TestAppContext| {
+            cx.read(|cx| {
+                panel
+                    .read(cx)
+                    .panes()
+                    .into_iter()
+                    .map(|pane| {
+                        pane.read(cx)
+                            .items_of_type::<paseo_ui::AgentTab>()
+                            .filter_map(|tab| tab.read(cx).agent_id(cx))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let before = chats_by_pane(cx);
+        assert_eq!(
+            before,
+            [vec!["first".to_string()], vec!["second".to_string()]]
+        );
+
+        let saved = cx.read(|cx| panel.read(cx).test_saved(cx));
+        // Startup restores while the workspace is being updated, so this does too.
+        window
+            .update(cx, |_, window, cx| {
+                one.update(cx, |workspace, cx| {
+                    let project = workspace.project().clone();
+                    panel.update(cx, |panel, cx| {
+                        panel.test_restore(&saved, &project, window, cx)
+                    })
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(chats_by_pane(cx), before, "chats come back in their splits");
+    }
+
+    #[gpui::test]
+    async fn paseo_layout_toggles_hide_each_area(cx: &mut TestAppContext) {
+        let (window, one, _two) = paseo_two_workspaces(cx).await;
+        let chat_shown =
+            |cx: &TestAppContext| cx.read(|cx| paseo_ui::test_chat_panel_shown(one.read(cx), cx));
+        let editor_hidden = |cx: &TestAppContext| cx.read(|cx| one.read(cx).editor_area_hidden());
+        let right_shown =
+            |cx: &TestAppContext| cx.read(|cx| one.read(cx).right_dock().read(cx).is_open());
+
+        assert!(chat_shown(cx), "the chat panel starts shown");
+        assert!(
+            cx.read(|cx| {
+                let status_bar = one.read(cx).status_bar().read(cx);
+                status_bar
+                    .item_of_type::<paseo_ui::LayoutButtons>()
+                    .is_some()
+            }),
+            "the layout buttons are in the status bar"
+        );
+        cx.dispatch_action(window.into(), paseo_ui::ToggleChatPanel);
+        cx.run_until_parked();
+        assert!(!chat_shown(cx));
+        cx.dispatch_action(window.into(), paseo_ui::ToggleChatPanel);
+        cx.run_until_parked();
+        assert!(chat_shown(cx));
+
+        assert!(!editor_hidden(cx));
+        cx.dispatch_action(window.into(), workspace::ToggleEditorArea);
+        cx.run_until_parked();
+        assert!(editor_hidden(cx));
+        assert!(chat_shown(cx), "hiding the editor leaves the chat panel");
+        cx.dispatch_action(window.into(), workspace::ToggleEditorArea);
+        cx.run_until_parked();
+        assert!(!editor_hidden(cx));
+
+        let right_before = right_shown(cx);
+        cx.dispatch_action(window.into(), workspace::ToggleRightDock);
+        cx.run_until_parked();
+        assert_ne!(right_shown(cx), right_before);
+        assert!(chat_shown(cx), "the right dock hides on its own");
+        assert!(
+            agents_list_shown(window, cx),
+            "the agents list hides on its own"
         );
     }
 
@@ -8413,11 +8517,12 @@ mod tests {
 
         let (tab_count, text) = cx.read(|cx| {
             let workspace = workspace.read(cx);
-            let tab = workspace
-                .item_of_type::<paseo_ui::AgentTab>(cx)
+            let tab = paseo_ui::test_agent_tabs(workspace, cx)
+                .into_iter()
+                .next()
                 .expect("the agent draft tab");
             (
-                workspace.items_of_type::<paseo_ui::AgentTab>(cx).count(),
+                paseo_ui::test_agent_tabs(workspace, cx).len(),
                 tab.read(cx).composer_text(cx),
             )
         });
@@ -8456,8 +8561,8 @@ mod tests {
         cx.run_until_parked();
 
         let agents = cx.read(|cx| {
-            one.read(cx)
-                .items_of_type::<paseo_ui::AgentTab>(cx)
+            paseo_ui::test_agent_tabs(one.read(cx), cx)
+                .into_iter()
                 .map(|tab| tab.read(cx).agent_id(cx))
                 .collect::<Vec<_>>()
         });
@@ -8513,10 +8618,9 @@ mod tests {
         cx.run_until_parked();
         window
             .update(cx, |multi_workspace, window, cx| {
-                let tab = multi_workspace
-                    .workspace()
-                    .read(cx)
-                    .item_of_type::<paseo_ui::AgentTab>(cx)
+                let tab = paseo_ui::test_agent_tabs(multi_workspace.workspace().read(cx), cx)
+                    .into_iter()
+                    .next()
                     .expect("the agent tab");
                 let composer = tab.read(cx).composer_focus_handle(cx);
                 window.focus(&composer, cx);
@@ -8802,9 +8906,9 @@ mod tests {
         cx.run_until_parked();
 
         let text = cx.read(|cx| {
-            workspace
-                .read(cx)
-                .item_of_type::<paseo_ui::AgentTab>(cx)
+            paseo_ui::test_agent_tabs(workspace.read(cx), cx)
+                .into_iter()
+                .next()
                 .expect("an agent draft tab")
                 .read(cx)
                 .composer_text(cx)

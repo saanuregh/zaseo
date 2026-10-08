@@ -315,6 +315,8 @@ pub struct MultiWorkspace {
     active_workspace_id: Rc<Cell<EntityId>>,
     sidebar: Option<Box<dyn SidebarHandle>>,
     sidebar_open: bool,
+    /// The window's saved open state was applied, so a default must not replace it.
+    sidebar_open_restored: bool,
     sidebar_overlay: Option<AnyView>,
     pending_removal_tasks: Vec<Task<()>>,
     _serialize_task: Option<Task<()>>,
@@ -352,8 +354,8 @@ impl MultiWorkspace {
         Self::subscribe_to_workspace(&workspace, window, cx);
         let weak_self = cx.weak_entity();
         let active_workspace_id = Rc::new(Cell::new(workspace.entity_id()));
-        workspace.update(cx, |workspace, cx| {
-            workspace.set_multi_workspace(weak_self, active_workspace_id.clone(), cx);
+        workspace.update(cx, |workspace, _| {
+            workspace.set_multi_workspace(weak_self, active_workspace_id.clone());
         });
         Self {
             window_id: window.window_handle().window_id(),
@@ -366,6 +368,7 @@ impl MultiWorkspace {
             active_workspace_id,
             sidebar: None,
             sidebar_open: false,
+            sidebar_open_restored: false,
             sidebar_overlay: None,
             pending_removal_tasks: Vec::new(),
             _serialize_task: None,
@@ -492,7 +495,31 @@ impl MultiWorkspace {
     /// Restores the sidebar to open state from persisted session data without
     /// firing a telemetry event, since this is not a user-initiated action.
     pub(crate) fn restore_open_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_open_restored = true;
         self.apply_open_sidebar(cx);
+    }
+
+    /// Applies a saved closed sidebar, which may follow a default open.
+    pub(crate) fn restore_closed_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_open_restored = true;
+        if !self.sidebar_open {
+            return;
+        }
+        self.sidebar_open = false;
+        for workspace in self.workspaces().cloned().collect::<Vec<_>>() {
+            workspace.update(cx, |workspace, _cx| {
+                workspace.set_sidebar_focus_handle(None);
+            });
+        }
+        cx.notify();
+    }
+
+    /// Opens the sidebar of a window whose saved state hasn't said otherwise, without a
+    /// telemetry event.
+    pub fn open_sidebar_by_default(&mut self, cx: &mut Context<Self>) {
+        if !self.sidebar_open_restored && !self.sidebar_open {
+            self.apply_open_sidebar(cx);
+        }
     }
 
     fn apply_open_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -789,8 +816,8 @@ impl MultiWorkspace {
         Self::subscribe_to_workspace(workspace, window, cx);
         let weak_self = cx.weak_entity();
         let active_workspace_id = self.active_workspace_id.clone();
-        workspace.update(cx, |workspace, cx| {
-            workspace.set_multi_workspace(weak_self, active_workspace_id, cx);
+        workspace.update(cx, |workspace, _| {
+            workspace.set_multi_workspace(weak_self, active_workspace_id);
         });
 
         let entity = cx.entity();
@@ -2045,7 +2072,13 @@ impl Render for MultiWorkspace {
 
         let workspace = self.workspace().clone();
         let workspace_key_context = workspace.update(cx, |workspace, cx| workspace.key_context(cx));
-        let root = workspace.update(cx, |workspace, cx| workspace.actions(h_flex(), window, cx));
+        let root = workspace.update(cx, |workspace, cx| workspace.actions(v_flex(), window, cx));
+        let status_bar = {
+            let workspace = workspace.read(cx);
+            workspace
+                .status_bar_visible(cx)
+                .then(|| workspace.status_bar().clone())
+        };
 
         client_side_decorations(
             root.key_context(workspace_key_context)
@@ -2146,16 +2179,25 @@ impl Render for MultiWorkspace {
                         ))
                     },
                 )
-                .children(left_sidebar)
                 .child(
-                    div()
-                        .flex()
+                    h_flex()
                         .flex_1()
-                        .size_full()
-                        .overflow_hidden()
-                        .child(self.workspace().clone()),
+                        .min_h_0()
+                        .w_full()
+                        .children(left_sidebar)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_1()
+                                .size_full()
+                                .overflow_hidden()
+                                .child(self.workspace().clone()),
+                        )
+                        .children(right_sidebar),
                 )
-                .children(right_sidebar)
+                // The status bar runs under the sidebar too, so the window draws it rather
+                // than the workspace.
+                .children(status_bar)
                 .child(self.workspace().read(cx).modal_layer.clone())
                 .children(self.sidebar_overlay.as_ref().map(|view| {
                     deferred(div().absolute().size_full().inset_0().occlude().child(

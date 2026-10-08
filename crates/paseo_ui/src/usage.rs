@@ -1492,6 +1492,33 @@ impl StatusItemView for UsageStatusItem {
         let agent_id = active_pane_item
             .and_then(|item| item.downcast::<crate::AgentTab>())
             .and_then(|tab| tab.read(cx).agent_id(cx));
+        self.show_agent(agent_id, cx);
+    }
+
+    fn hide_setting(&self, _: &App) -> Option<HideStatusItem> {
+        None
+    }
+}
+
+impl UsageStatusItem {
+    /// Follows the chat in front of `workspace`'s chat panel; the status bar itself only reports
+    /// the editor's tabs.
+    pub fn follow_chat_panel(item: &Entity<Self>, cx: &mut Context<Workspace>) {
+        let item = item.downgrade();
+        cx.subscribe_self(move |workspace, event: &workspace::Event, cx| {
+            if !matches!(event, workspace::Event::ActiveItemChanged) {
+                return;
+            }
+            let agent_id = crate::chat_panel::active_agent_tab(workspace, cx)
+                .and_then(|tab| tab.read(cx).agent_id(cx));
+            if let Err(error) = item.update(cx, |item, cx| item.show_agent(agent_id, cx)) {
+                log::debug!("Paseo usage item released: {error}");
+            }
+        })
+        .detach();
+    }
+
+    fn show_agent(&mut self, agent_id: Option<String>, cx: &mut Context<Self>) {
         // Other tabs, such as files, keep showing the agent that was last in view.
         if let Some(agent) = agent_id.clone()
             && agent_id != self.active_agent_id
@@ -1503,10 +1530,6 @@ impl StatusItemView for UsageStatusItem {
                 .update(cx, |shared, cx| shared.refresh_if_stale(host, &agent, cx));
             cx.notify();
         }
-    }
-
-    fn hide_setting(&self, _: &App) -> Option<HideStatusItem> {
-        None
     }
 }
 

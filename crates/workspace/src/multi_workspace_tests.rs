@@ -302,7 +302,7 @@ async fn test_open_new_window_does_not_open_sidebar_on_existing_window(cx: &mut 
 }
 
 #[gpui::test]
-async fn test_open_directory_in_existing_window_opens_sidebar(cx: &mut TestAppContext) {
+async fn test_open_directory_in_existing_window_keeps_sidebar_open(cx: &mut TestAppContext) {
     init_test(cx);
 
     let app_state = cx.update(AppState::test);
@@ -315,6 +315,8 @@ async fn test_open_directory_in_existing_window_opens_sidebar(cx: &mut TestAppCo
     let project = Project::test(app_state.fs.clone(), [path!("/project_a").as_ref()], cx).await;
     let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
     cx.run_until_parked();
+    // Zaseo's sidebar is the agents list, which keeps the user's choice instead of opening.
+    window.update(cx, |mw, _, cx| mw.open_sidebar(cx)).unwrap();
 
     cx.update(|cx| {
         open_paths(
@@ -331,7 +333,7 @@ async fn test_open_directory_in_existing_window_opens_sidebar(cx: &mut TestAppCo
         .read_with(cx, |mw, _cx| {
             assert!(
                 mw.sidebar_open(),
-                "adding a directory to an existing window opens the sidebar by default",
+                "adding a directory to an existing window keeps an open sidebar open",
             );
             assert_eq!(mw.workspaces().count(), 2);
         })

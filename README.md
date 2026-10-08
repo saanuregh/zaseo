@@ -69,7 +69,7 @@ remote daemons, SSH, and passwords, see
 
 | Keys (`cmd` on macOS) | Action |
 | --- | --- |
-| `ctrl-alt-p` | Focus or hide the Paseo sidebar |
+| `ctrl-alt-1` … `ctrl-alt-4` | Show or hide the agents list, chat panel, editor, or right dock |
 | `ctrl-n` (or `ctrl-alt-n`) | New workspace |
 | `ctrl-t` (or `ctrl-alt-t`) | New agent in the shown workspace |
 | `ctrl-shift-p` | Command palette, with agents first |

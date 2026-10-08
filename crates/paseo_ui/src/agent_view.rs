@@ -633,8 +633,8 @@ impl AgentView {
                         window,
                         cx,
                         move |workspace, window, cx| {
-                            let tab = workspace
-                                .items_of_type::<AgentTab>(cx)
+                            let tab = crate::chat_panel::agent_tabs(workspace, cx)
+                                .into_iter()
                                 .find(|tab| tab.read(cx).view == view);
                             if let Some(tab) = tab {
                                 crate::follow_created_agent(workspace, tab, &agent_id, window, cx);
@@ -2549,8 +2549,8 @@ impl AgentView {
         };
         let this = cx.entity();
         crate::defer_workspace_update(workspace, window, cx, move |workspace, window, cx| {
-            let old_tab = workspace
-                .items_of_type::<AgentTab>(cx)
+            let old_tab = crate::chat_panel::agent_tabs(workspace, cx)
+                .into_iter()
                 .find(|tab| tab.read(cx).view() == &this);
             crate::open_draft_on(workspace, store, None, window, cx);
             if let Some(old_tab) = old_tab {
@@ -4606,19 +4606,13 @@ mod tests {
         );
 
         let blank_reasoning = |key| item_row(key, StreamContent::Reasoning { text: " ".into() });
-        let items = [
-            user(0),
-            reasoning(1),
-            text(2),
-            blank_reasoning(3),
-            text(4),
-        ]
-        .into_iter()
-        .filter_map(|row| match row {
-            Row::Item { item, .. } => Some(item),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+        let items = [user(0), reasoning(1), text(2), blank_reasoning(3), text(4)]
+            .into_iter()
+            .filter_map(|row| match row {
+                Row::Item { item, .. } => Some(item),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
             folded_work(&items, 0..5),
             Some(1..2),

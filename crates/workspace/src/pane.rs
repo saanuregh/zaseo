@@ -858,6 +858,13 @@ impl Pane {
         cx.notify();
     }
 
+    pub fn set_can_drop_predicate(
+        &mut self,
+        can_drop_predicate: Option<Arc<dyn Fn(&dyn Any, &mut Window, &mut App) -> bool>>,
+    ) {
+        self.can_drop_predicate = can_drop_predicate;
+    }
+
     pub fn set_can_navigate(&mut self, can_navigate: bool, cx: &mut Context<Self>) {
         self.toolbar.update(cx, |toolbar, cx| {
             toolbar.set_can_navigate(can_navigate, cx);
@@ -3707,6 +3714,9 @@ impl Pane {
             // HACK: This empty child is currently necessary to force the drop target to appear
             // despite us setting a min width above.
             .child("")
+            .when_some(self.can_drop_predicate.clone(), |this, predicate| {
+                this.can_drop(move |dragged, window, cx| predicate(dragged, window, cx))
+            })
             .drag_over::<DraggedTab>(|bar, _, _, cx| {
                 bar.bg(cx.theme().colors().drop_target_background)
             })
@@ -3753,6 +3763,9 @@ impl Pane {
             // HACK: This empty child is currently necessary to force the drop target to appear
             // despite us setting a min width above.
             .child("")
+            .when_some(self.can_drop_predicate.clone(), |this, predicate| {
+                this.can_drop(move |dragged, window, cx| predicate(dragged, window, cx))
+            })
             .drag_over::<DraggedTab>(|bar, _, _, cx| {
                 bar.bg(cx.theme().colors().drop_target_background)
             })

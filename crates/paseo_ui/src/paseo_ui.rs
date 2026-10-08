@@ -1,6 +1,7 @@
 mod agent_edits;
 mod agent_view;
 mod attention;
+mod chat_panel;
 mod choice_picker;
 mod command_center;
 mod composer;
@@ -11,6 +12,7 @@ mod editor_context;
 mod history;
 mod hosts;
 mod last_turn;
+mod layout_buttons;
 mod sidebar;
 mod store;
 mod stream;
@@ -46,9 +48,11 @@ use workspace::{
 pub use agent_edits::{AgentEditsToolbar, KeepAllEdits, KeepEdit, RejectAllEdits, RejectEdit};
 #[cfg(any(test, feature = "test-support"))]
 pub use agent_edits::{test_locating_agent_edits, test_refresh_agent_edits};
-pub use agent_view::{AgentTab, AgentView, agent_tab_menu};
+pub use agent_view::{AgentTab, AgentView};
+pub use chat_panel::{ChatPanel, editor_accepts_drop, move_chats_into_chat_panel};
 use hosts::HostsEvent;
-pub use sidebar::PaseoPanel;
+pub use layout_buttons::{LayoutButtons, layout_buttons};
+pub use sidebar::AgentsList;
 use store::PaseoStore;
 #[cfg(any(test, feature = "test-support"))]
 pub use timeline::{FileEdit, reverse_edits_tracking};
@@ -60,8 +64,10 @@ pub use zed_actions::paseo::{NewAgent, NewAgentWorkspace};
 actions!(
     paseo_ui,
     [
-        /// Shows or hides the Paseo sidebar.
+        /// Shows or hides the agents list.
         TogglePanel,
+        /// Shows or hides the chat panel.
+        ToggleChatPanel,
         /// Opens the most recent Paseo agent, or a new agent draft.
         OpenTab,
         /// Opens the selected Paseo agent's workspace in the editor.
@@ -293,8 +299,12 @@ pub fn init(cx: &mut App) {
 
 /// Keeps a workspace's chats in step with every host and with its own tabs.
 fn follow_paseo_changes(window: Option<&mut Window>, cx: &mut Context<Workspace>) {
+    // The chat panel announces its tab changes as `ActiveItemChanged`.
     cx.subscribe_self(|workspace, event: &workspace::Event, cx| {
-        if matches!(event, workspace::Event::ItemAdded { .. }) {
+        if matches!(
+            event,
+            workspace::Event::ItemAdded { .. } | workspace::Event::ActiveItemChanged
+        ) {
             close_restored_tabs_of_other_workspaces(workspace, cx);
         }
     })
@@ -320,6 +330,12 @@ fn follow_paseo_changes(window: Option<&mut Window>, cx: &mut Context<Workspace>
         &cx.entity(),
         window,
         |workspace, _, event: &workspace::Event, window, cx| {
+            // Only the editor's panes announce added items, and chats belong in the chat panel.
+            if let workspace::Event::ItemAdded { item } = event
+                && item.downcast::<AgentTab>().is_some()
+            {
+                chat_panel::move_chats_into_chat_panel(workspace, window, cx);
+            }
             if matches!(
                 event,
                 workspace::Event::ItemAdded { .. } | workspace::Event::ActiveItemChanged
@@ -352,8 +368,11 @@ fn follow_paseo_changes(window: Option<&mut Window>, cx: &mut Context<Workspace>
 }
 
 fn register_workspace_actions(workspace: &mut Workspace) {
-    workspace.register_action(|workspace, _: &TogglePanel, window, cx| {
-        workspace.toggle_panel_focus::<PaseoPanel>(window, cx);
+    workspace.register_action(|_, _: &TogglePanel, window, cx| {
+        sidebar::toggle_agents_list(window, cx);
+    });
+    workspace.register_action(|workspace, _: &ToggleChatPanel, window, cx| {
+        chat_panel::toggle_chat_panel(workspace, window, cx);
     });
     workspace.register_action(|workspace, _: &OpenTab, window, cx| {
         open_tab(workspace, window, cx);
@@ -573,9 +592,7 @@ pub(crate) fn current_agent(
     workspace: &Workspace,
     cx: &App,
 ) -> Option<(Entity<PaseoStore>, String)> {
-    workspace
-        .active_item(cx)
-        .and_then(|item| item.downcast::<AgentTab>())
+    crate::chat_panel::active_agent_tab(workspace, cx)
         .and_then(|tab| {
             let view = tab.read(cx).view().read(cx);
             Some((view.store.clone(), view.agent_id.clone()?))
@@ -910,8 +927,8 @@ fn project_directory(workspace: &Workspace, store: &PaseoStore, cx: &App) -> Opt
 
 /// The workspace's tab for an agent, in any pane.
 fn agent_tab_in(workspace: &Workspace, agent_id: &str, cx: &App) -> Option<Entity<AgentTab>> {
-    workspace
-        .items_of_type::<AgentTab>(cx)
+    crate::chat_panel::agent_tabs(workspace, cx)
+        .into_iter()
         .find(|tab| tab.read(cx).agent_id(cx).as_deref() == Some(agent_id))
 }
 
@@ -1024,9 +1041,7 @@ pub(crate) fn follow_created_agent(
     .detach_and_log_err(cx);
 }
 
-/// Keeps Paseo the same across a window's project switch: chats left in a workspace with no
-/// folders, sidebar width, and the sidebar left behind, which no longer sees the pointer leave
-/// and would hold its reorders.
+/// Keeps chats left in a workspace with no folders when the window switches project.
 pub fn workspace_switched(
     previous: &Entity<Workspace>,
     active: &Entity<Workspace>,
@@ -1034,10 +1049,6 @@ pub fn workspace_switched(
     cx: &mut App,
 ) {
     move_tabs_out_of_empty_workspace(previous, active, window, cx);
-    carry_sidebar_size(previous, active, window, cx);
-    if let Some(panel) = previous.read(cx).panel::<PaseoPanel>(cx) {
-        panel.update(cx, |panel, cx| panel.set_pointer_inside(false, cx));
-    }
 }
 
 /// Shows why an agent or folder couldn't open, with every cause in the error's chain: a
@@ -1100,8 +1111,8 @@ fn reopen_tabs_on_their_hosts(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let misplaced = workspace
-        .items_of_type::<AgentTab>(cx)
+    let misplaced = crate::chat_panel::agent_tabs(workspace, cx)
+        .into_iter()
         .filter_map(|tab| {
             let view = tab.read(cx).view().read(cx);
             let agent_id = view.agent_id.clone()?;
@@ -1117,7 +1128,7 @@ fn reopen_tabs_on_their_hosts(
         })
         .collect::<Vec<_>>();
     for (tab, agent_id) in misplaced {
-        let Some(pane) = workspace.pane_for(&tab) else {
+        let Some(pane) = crate::chat_panel::pane_for_tab(workspace, &tab, cx) else {
             continue;
         };
         let (index, previously_active) = {
@@ -1145,8 +1156,8 @@ fn close_restored_tabs_of_other_workspaces(workspace: &mut Workspace, cx: &mut C
     let Ok(switcher) = project_switcher(cx) else {
         return;
     };
-    let pending = workspace
-        .items_of_type::<AgentTab>(cx)
+    let pending = crate::chat_panel::agent_tabs(workspace, cx)
+        .into_iter()
         .filter(|tab| tab.read(cx).owner_check_pending)
         .collect::<Vec<_>>();
     for tab in pending {
@@ -1213,11 +1224,9 @@ fn detach_every_chat(
     cx: &mut App,
 ) -> (Vec<MovedChat>, Option<Entity<AgentView>>) {
     source.update(cx, |source, cx| {
-        let tabs = source.items_of_type::<AgentTab>(cx).collect::<Vec<_>>();
-        let source_active_view = source
-            .active_item(cx)
-            .and_then(|item| item.downcast::<AgentTab>())
-            .map(|tab| tab.read(cx).view().clone());
+        let tabs = crate::chat_panel::agent_tabs(source, cx);
+        let source_active_view =
+            crate::chat_panel::active_agent_tab(source, cx).map(|tab| tab.read(cx).view().clone());
         for tab in &tabs {
             workspace_tabs::detach_tab(source, tab, window, cx);
         }
@@ -1293,7 +1302,7 @@ fn move_chats_home(
                             error.context("Could not open the agent's workspace in the editor");
                         show_open_error(home, &error, cx);
                     }
-                    let pane = home.active_pane().clone();
+                    let pane = crate::chat_panel::chat_pane(home, cx);
                     for view in views {
                         add_moved_chat(home, &pane, view, false, window, cx);
                     }
@@ -1312,7 +1321,7 @@ fn keep_moved_chats(
     cx: &mut App,
 ) {
     target.update(cx, |target, cx| {
-        let pane = target.active_pane().clone();
+        let pane = crate::chat_panel::chat_pane(target, cx);
         for (view, owner_check_pending) in stay {
             add_moved_chat(target, &pane, view, owner_check_pending, window, cx);
         }
@@ -1394,47 +1403,6 @@ fn add_chat_view(
     });
 }
 
-/// The Paseo sidebar size last set, shared by every project because Zed saves dock sizes per
-/// workspace.
-struct SharedSidebarSize(workspace::dock::PanelSizeState);
-
-impl Global for SharedSidebarSize {}
-
-/// Records `workspace`'s Paseo sidebar size as the shared one.
-pub(crate) fn remember_sidebar_size(workspace: &Entity<Workspace>, cx: &mut App) {
-    let workspace = workspace.read(cx);
-    let size = workspace.panel::<PaseoPanel>(cx).and_then(|panel| {
-        workspace
-            .all_docks()
-            .into_iter()
-            .find_map(|dock| dock.read(cx).stored_panel_size_state(&panel))
-    });
-    if let Some(size) = size {
-        cx.set_global(SharedSidebarSize(size));
-    }
-}
-
-fn carry_sidebar_size(
-    source: &Entity<Workspace>,
-    target: &Entity<Workspace>,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    remember_sidebar_size(source, cx);
-    target.update(cx, |target, cx| apply_sidebar_size(target, window, cx));
-}
-
-/// Applies the shared Paseo sidebar size, such as once a workspace's panels are added.
-pub fn apply_sidebar_size(
-    workspace: &mut Workspace,
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-) {
-    if let Some(size) = cx.try_global::<SharedSidebarSize>().map(|shared| shared.0) {
-        workspace.set_panel_size_state::<PaseoPanel>(size, window, cx);
-    }
-}
-
 pub(crate) fn new_agent_tab(
     workspace: &Workspace,
     agent_id: &str,
@@ -1466,14 +1434,14 @@ pub(crate) fn open_agent_here(
 ) -> Entity<AgentTab> {
     workspace_tabs::prepare_to_open(workspace, agent_id, window, cx);
     if let Some(tab) = agent_tab_in(workspace, agent_id, cx) {
-        workspace.activate_item(&tab, true, focus, window, cx);
+        crate::chat_panel::activate_agent_tab(workspace, &tab, focus, window, cx);
         if focus {
             focus_tab_composer(&tab, window, cx);
         }
         return tab;
     }
     let tab = new_agent_tab(workspace, agent_id, window, cx);
-    workspace.add_item_to_active_pane(Box::new(tab.clone()), None, focus, window, cx);
+    crate::chat_panel::add_agent_tab(workspace, Box::new(tab.clone()), true, focus, window, cx);
     if focus {
         focus_tab_composer(&tab, window, cx);
     }
@@ -1490,12 +1458,12 @@ pub(crate) fn open_subagent(
 ) {
     let timeline_id = paseo_client::subagent_timeline_id(parent_agent_id, subagent_id);
     if let Some(tab) = agent_tab_in(workspace, &timeline_id, cx) {
-        workspace.activate_item(&tab, true, true, window, cx);
+        crate::chat_panel::activate_agent_tab(workspace, &tab, true, window, cx);
         return;
     }
     let workspace_handle = Some(cx.weak_entity());
     let tab = cx.new(|cx| AgentTab::new(Some(timeline_id), None, workspace_handle, window, cx));
-    workspace.add_item_to_active_pane(Box::new(tab), None, true, window, cx);
+    crate::chat_panel::add_agent_tab(workspace, Box::new(tab), true, true, window, cx);
 }
 
 /// Starts a draft on the default host.
@@ -1520,7 +1488,7 @@ pub(crate) fn open_draft_on(
     let directory = directory.or_else(|| project_directory(workspace, store.read(cx), cx));
     let workspace_handle = Some(cx.weak_entity());
     let tab = cx.new(|cx| AgentTab::on_host(store, None, directory, workspace_handle, window, cx));
-    workspace.add_item_to_active_pane(Box::new(tab.clone()), None, true, window, cx);
+    crate::chat_panel::add_agent_tab(workspace, Box::new(tab.clone()), true, true, window, cx);
     focus_tab_composer(&tab, window, cx);
     tab
 }
@@ -1630,7 +1598,7 @@ pub fn open_paseo_workspace_tabs(
         Some(agent_id) => open_agent(workspace, &agent_id, true, window, cx),
         None => {
             if let Some(tab) = draft_tab_in(workspace, paseo_workspace_id, cx) {
-                workspace.activate_item(&tab, true, true, window, cx);
+                crate::chat_panel::activate_agent_tab(workspace, &tab, true, window, cx);
                 focus_tab_composer(&tab, window, cx);
                 return;
             }
@@ -1668,7 +1636,7 @@ pub fn open_paseo_workspace_tabs(
                             multi_workspace.activate(owner.clone(), None, window, cx)
                         });
                         owner.update(cx, |owner, cx| {
-                            owner.activate_item(&tab, true, true, window, cx);
+                            crate::chat_panel::activate_agent_tab(owner, &tab, true, window, cx);
                         });
                         focus_tab_composer(&tab, window, cx);
                     }
@@ -1689,11 +1657,13 @@ fn draft_tab_in(
     paseo_workspace_id: &str,
     cx: &App,
 ) -> Option<Entity<AgentTab>> {
-    workspace.items_of_type::<AgentTab>(cx).find(|tab| {
-        let view = tab.read(cx).view().read(cx);
-        view.agent_id.is_none()
-            && view.composer.read(cx).draft_workspace_id.as_deref() == Some(paseo_workspace_id)
-    })
+    crate::chat_panel::agent_tabs(workspace, cx)
+        .into_iter()
+        .find(|tab| {
+            let view = tab.read(cx).view().read(cx);
+            view.agent_id.is_none()
+                && view.composer.read(cx).draft_workspace_id.as_deref() == Some(paseo_workspace_id)
+        })
 }
 
 /// Drops an archived Paseo workspace's chats from `workspace`, and closes `workspace` when it was
@@ -1712,7 +1682,7 @@ fn paseo_workspace_removed(
             .iter()
             .all(|root| **root == *directory)
     }) && !workspace.root_paths(cx).is_empty();
-    if !showed || !own_worktree || workspace.items_of_type::<AgentTab>(cx).next().is_some() {
+    if !showed || !own_worktree || !crate::chat_panel::agent_tabs(workspace, cx).is_empty() {
         return;
     }
     let this = cx.entity();
@@ -1879,9 +1849,11 @@ fn focus_tab_composer(tab: &Entity<AgentTab>, window: &mut Window, cx: &mut App)
 }
 
 pub fn open_tab(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
-    let existing = workspace.items_of_type::<AgentTab>(cx).next();
+    let existing = crate::chat_panel::agent_tabs(workspace, cx)
+        .into_iter()
+        .next();
     if let Some(tab) = existing {
-        workspace.activate_item(&tab, true, true, window, cx);
+        crate::chat_panel::activate_agent_tab(workspace, &tab, true, window, cx);
         focus_tab_composer(&tab, window, cx);
         return;
     }
@@ -2090,6 +2062,43 @@ pub fn test_open_agent_here(
     open_agent_here(workspace, agent_id, false, window, cx);
 }
 
+/// Every chat open in `workspace`, for tests.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_agent_tabs(workspace: &Workspace, cx: &App) -> Vec<Entity<AgentTab>> {
+    chat_panel::agent_tabs(workspace, cx)
+}
+
+/// The chat in front of `workspace`'s chat panel, for tests.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_active_agent_tab(workspace: &Workspace, cx: &App) -> Option<Entity<AgentTab>> {
+    chat_panel::active_agent_tab(workspace, cx)
+}
+
+/// Opens a chat in the editor's active pane, the way builds before the chat panel restored one,
+/// for tests.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_open_chat_in_editor(
+    workspace: &mut Workspace,
+    agent_id: &str,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let tab = new_agent_tab(workspace, agent_id, window, cx);
+    workspace.add_item_to_active_pane(Box::new(tab), None, false, window, cx);
+}
+
+/// Whether `workspace` shows its chat panel, for tests.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_chat_panel_shown(workspace: &Workspace, cx: &App) -> bool {
+    chat_panel::chat_panel_shown(workspace, cx)
+}
+
+/// The agents list of `workspace`'s window, for tests.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_agents_list(workspace: &Workspace, cx: &App) -> Option<Entity<AgentsList>> {
+    sidebar::agents_list(workspace, cx)
+}
+
 /// Adds a Paseo workspace working in `directory`, for tests.
 #[cfg(any(test, feature = "test-support"))]
 pub fn test_add_paseo_workspace(
@@ -2219,7 +2228,7 @@ pub fn test_restore_agent_tab(
     let workspace_handle = cx.weak_entity();
     let agent_id = agent_id.to_owned();
     let tab = cx.new(|cx| AgentTab::restored(agent_id, None, workspace_handle, window, cx));
-    workspace.add_item_to_active_pane(Box::new(tab), None, false, window, cx);
+    crate::chat_panel::add_agent_tab(workspace, Box::new(tab), true, false, window, cx);
 }
 
 /// Records `agent_id` as the agent last focused in a Paseo view, for tests.

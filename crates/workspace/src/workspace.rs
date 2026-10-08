@@ -43,7 +43,6 @@ pub use remote::{
 };
 pub use toast_layer::{ToastAction, ToastLayer, ToastView};
 
-use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
 use client::{
     ChannelId, Client, ErrorExt, ParticipantIndex, Status, TypedEnvelope, User, UserStore,
@@ -176,6 +175,7 @@ use crate::{
 
 pub const SERIALIZATION_THROTTLE_TIME: Duration = Duration::from_millis(200);
 pub const MAX_RECENT_SELECTIONS: usize = 20;
+const EDITOR_AREA_HIDDEN_KEY: &str = "workspace_editor_area_hidden";
 
 /// Which optional window-title variables are actually referenced by the active
 /// template. Used to skip expensive lookups when the template doesn't need them.
@@ -472,6 +472,8 @@ actions!(
         ToggleCenteredLayout,
         /// Toggles edit prediction feature globally for all files.
         ToggleEditPrediction,
+        /// Shows or hides the editor area.
+        ToggleEditorArea,
         /// Toggles the left dock.
         ToggleLeftDock,
         /// Toggles the right dock.
@@ -1654,6 +1656,7 @@ pub struct Workspace {
     persisted_recent_navigation_history: Vec<PathBuf>,
     last_active_project_path: Option<ProjectPath>,
     restoring_workspace: bool,
+    editor_area_hidden: bool,
 }
 
 impl EventEmitter<Event> for Workspace {}
@@ -1979,8 +1982,7 @@ impl Workspace {
             .flatten()
             .map(|mw| mw.downgrade());
         let status_bar = cx.new(|cx| {
-            let mut status_bar =
-                StatusBar::new(&center_pane.clone(), multi_workspace.clone(), window, cx);
+            let mut status_bar = StatusBar::new(&center_pane.clone(), window, cx);
             status_bar.add_left_item(left_dock_buttons, window, cx);
             status_bar.add_right_item(right_dock_buttons, window, cx);
             status_bar.add_right_item(bottom_dock_buttons, window, cx);
@@ -2086,6 +2088,9 @@ impl Workspace {
         center.set_is_center(true);
         center.mark_positions(cx);
 
+        let editor_area_hidden = workspace_id
+            .is_some_and(|workspace_id| Self::load_editor_area_hidden(workspace_id, cx));
+
         Workspace {
             weak_self: weak_handle.clone(),
             zoomed: None,
@@ -2156,6 +2161,7 @@ impl Workspace {
             persisted_recent_navigation_history: Vec::new(),
             last_active_project_path: None,
             restoring_workspace: false,
+            editor_area_hidden,
         }
     }
 
@@ -2676,6 +2682,57 @@ impl Workspace {
         .detach_and_log_err(cx);
     }
 
+    pub fn editor_area_hidden(&self) -> bool {
+        self.editor_area_hidden
+    }
+
+    pub fn set_editor_area_hidden(
+        &mut self,
+        hidden: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editor_area_hidden == hidden {
+            return;
+        }
+        self.editor_area_hidden = hidden;
+
+        if hidden {
+            let editor_has_focus = self
+                .center
+                .panes()
+                .iter()
+                .any(|pane| pane.focus_handle(cx).contains_focused(window, cx));
+            if editor_has_focus
+                && self.zoomed_position != Some(DockPosition::Left)
+                && let Some(panel) = self.left_dock.read(cx).visible_panel()
+            {
+                panel.activation_focus_handle(cx).focus(window, cx);
+            }
+        }
+
+        if let Some(workspace_id) = self.database_id {
+            let kvp = db::kvp::KeyValueStore::global(cx);
+            cx.background_spawn(async move {
+                kvp.scoped(EDITOR_AREA_HIDDEN_KEY)
+                    .write(i64::from(workspace_id).to_string(), hidden.to_string())
+                    .await
+            })
+            .detach_and_log_err(cx);
+        }
+
+        cx.notify();
+    }
+
+    fn load_editor_area_hidden(workspace_id: WorkspaceId, cx: &App) -> bool {
+        db::kvp::KeyValueStore::global(cx)
+            .scoped(EDITOR_AREA_HIDDEN_KEY)
+            .read(&i64::from(workspace_id).to_string())
+            .log_err()
+            .flatten()
+            .is_some_and(|value| value == "true")
+    }
+
     pub fn set_panel_size_state<T: Panel>(
         &mut self,
         size_state: dock::PanelSizeState,
@@ -2893,11 +2950,7 @@ impl Workspace {
         &mut self,
         multi_workspace: WeakEntity<MultiWorkspace>,
         active_workspace_id: Rc<Cell<EntityId>>,
-        cx: &mut App,
     ) {
-        self.status_bar.update(cx, |status_bar, cx| {
-            status_bar.set_multi_workspace(multi_workspace.clone(), cx);
-        });
         self.multi_workspace = Some(multi_workspace);
         self.active_workspace_id = Some(active_workspace_id);
     }
@@ -6087,6 +6140,7 @@ impl Workspace {
         let mut serialize_workspace = true;
         match event {
             pane::Event::AddItem { item } => {
+                self.show_editor_area_for_item_change(window, cx);
                 item.added_to_pane(self, pane.clone(), window, cx);
                 cx.emit(Event::ItemAdded {
                     item: item.boxed_clone(),
@@ -6125,6 +6179,7 @@ impl Workspace {
                     pane.track_alternate_file_items();
                 });
                 if *local {
+                    self.show_editor_area_for_item_change(window, cx);
                     self.unfollow_in_pane(pane, window, cx);
                 }
                 serialize_workspace = *focus_changed || pane != self.active_pane();
@@ -6191,6 +6246,14 @@ impl Workspace {
 
         if serialize_workspace {
             self.serialize_workspace(window, cx);
+        }
+    }
+
+    fn show_editor_area_for_item_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Restored items fire the same pane events; showing the editor for them would undo the
+        // hidden state loaded with the workspace.
+        if self.editor_area_hidden && !self.restoring_workspace {
+            self.set_editor_area_hidden(false, window, cx);
         }
     }
 
@@ -8201,6 +8264,9 @@ impl Workspace {
             .on_action(cx.listener(|this, _: &ToggleLeftDock, window, cx| {
                 this.toggle_dock(DockPosition::Left, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleEditorArea, window, cx| {
+                this.set_editor_area_hidden(!this.editor_area_hidden, window, cx);
+            }))
             .on_action(cx.listener(
                 |workspace: &mut Workspace, _: &ToggleRightDock, window, cx| {
                     workspace.toggle_dock(DockPosition::Right, window, cx);
@@ -8679,6 +8745,7 @@ impl Workspace {
                         this.track_focus(self.region_focus_handles.dock(position))
                     })
             })
+            .debug_selector(|| dock_element_id.into())
             .flex()
             .overflow_hidden()
             .flex_none()
@@ -8701,7 +8768,12 @@ impl Workspace {
                 } else {
                     None
                 };
-                if let Some(grow) = flex_grow {
+                if position == DockPosition::Left && self.editor_area_hidden {
+                    let style = container.style();
+                    style.flex_grow = Some(1.0);
+                    style.flex_shrink = Some(1.0);
+                    style.flex_basis = Some(relative(0.).into());
+                } else if let Some(grow) = flex_grow {
                     let grow = (grow / self.center_full_height_column_count()).max(0.001);
                     let style = container.style();
                     style.flex_grow = Some(grow);
@@ -8735,7 +8807,7 @@ impl Workspace {
 
     /// Returns the currently-visible major window regions ("parts"), in a stable
     /// cyclic order: title bar, left dock, editor, right dock, bottom dock,
-    /// status bar. Closed docks are skipped. Used by
+    /// status bar. Closed docks, and the editor while hidden, are skipped. Used by
     /// [`FocusNextPart`]/[`FocusPreviousPart`] so keyboard and screen-reader
     /// users can move between regions without a mouse.
     fn focusable_parts(&self, cx: &App) -> Vec<FocusablePart> {
@@ -8766,15 +8838,17 @@ impl Workspace {
             &self.region_focus_handles.left_dock,
         ));
 
-        let center_pane = self
-            .last_active_center_pane
-            .as_ref()
-            .and_then(|pane| pane.upgrade())
-            .unwrap_or_else(|| self.center.first_pane());
-        parts.push(FocusablePart::landmark(
-            self.region_focus_handles.editor.clone(),
-            center_pane.read(cx).focus_handle(cx),
-        ));
+        if !self.editor_area_hidden {
+            let center_pane = self
+                .last_active_center_pane
+                .as_ref()
+                .and_then(|pane| pane.upgrade())
+                .unwrap_or_else(|| self.center.first_pane());
+            parts.push(FocusablePart::landmark(
+                self.region_focus_handles.editor.clone(),
+                center_pane.read(cx).focus_handle(cx),
+            ));
+        }
 
         parts.extend(dock_part(
             &self.right_dock,
@@ -8980,6 +9054,9 @@ impl Workspace {
     }
 
     fn resize_left_dock(&mut self, new_size: Pixels, window: &mut Window, cx: &mut App) {
+        if self.editor_area_hidden {
+            return;
+        }
         let workspace_width = self.bounds.size.width;
         let mut size = new_size.min(workspace_width - RESIZE_HANDLE_SIZE);
 
@@ -9611,6 +9688,24 @@ impl Render for Workspace {
             workspace: &self.weak_self,
         };
 
+        let editor_area_hidden = self.editor_area_hidden;
+        let left_dock_fills = editor_area_hidden
+            && self.zoomed_position != Some(DockPosition::Left)
+            && self.left_dock.read(cx).visible_panel().is_some();
+        let bottom_dock_open = self.zoomed_position != Some(DockPosition::Bottom)
+            && self.bottom_dock.read(cx).visible_panel().is_some();
+        // Keeps the right dock at the right edge when nothing fills the middle.
+        let needs_spacer = editor_area_hidden && !left_dock_fills;
+        let center_column = (!editor_area_hidden).then(|| {
+            div().flex().flex_col().flex_1().overflow_hidden().child(
+                h_flex()
+                    .flex_1()
+                    .when_some(centered_paddings.0, |this, p| this.child(p.border_r_1()))
+                    .child(self.render_center(&pane_render_context, window, cx))
+                    .when_some(centered_paddings.1, |this, p| this.child(p.border_l_1())),
+            )
+        });
+
         div()
             .relative()
             .size_full()
@@ -9781,34 +9876,10 @@ impl Render for Workspace {
                                                     window,
                                                     cx,
                                                 ))
-                                                .child(
-                                                    div()
-                                                        .flex()
-                                                        .flex_col()
-                                                        .flex_1()
-                                                        .overflow_hidden()
-                                                        .child(
-                                                            h_flex()
-                                                                .flex_1()
-                                                                .when_some(
-                                                                    centered_paddings.0,
-                                                                    |this, p| {
-                                                                        this.child(p.border_r_1())
-                                                                    },
-                                                                )
-                                                                .child(self.render_center(
-                                                                    &pane_render_context,
-                                                                    window,
-                                                                    cx,
-                                                                ))
-                                                                .when_some(
-                                                                    centered_paddings.1,
-                                                                    |this, p| {
-                                                                        this.child(p.border_l_1())
-                                                                    },
-                                                                ),
-                                                        ),
-                                                )
+                                                .children(center_column)
+                                                .when(needs_spacer, |this| {
+                                                    this.child(div().flex_1())
+                                                })
                                                 .children(self.render_dock(
                                                     DockPosition::Right,
                                                     &self.right_dock,
@@ -9844,38 +9915,10 @@ impl Render for Workspace {
                                                             window,
                                                             cx,
                                                         ))
-                                                        .child(
-                                                            div()
-                                                                .flex()
-                                                                .flex_col()
-                                                                .flex_1()
-                                                                .overflow_hidden()
-                                                                .child(
-                                                                    h_flex()
-                                                                        .flex_1()
-                                                                        .when_some(
-                                                                            centered_paddings.0,
-                                                                            |this, p| {
-                                                                                this.child(
-                                                                                    p.border_r_1(),
-                                                                                )
-                                                                            },
-                                                                        )
-                                                                        .child(self.render_center(
-                                                                            &pane_render_context,
-                                                                            window,
-                                                                            cx,
-                                                                        ))
-                                                                        .when_some(
-                                                                            centered_paddings.1,
-                                                                            |this, p| {
-                                                                                this.child(
-                                                                                    p.border_l_1(),
-                                                                                )
-                                                                            },
-                                                                        ),
-                                                                ),
-                                                        ),
+                                                        .children(center_column)
+                                                        .when(needs_spacer, |this| {
+                                                            this.child(div().flex_1())
+                                                        }),
                                                 )
                                                 .child(div().w_full().children(self.render_dock(
                                                     DockPosition::Bottom,
@@ -9911,38 +9954,14 @@ impl Render for Workspace {
                                                         .flex()
                                                         .flex_row()
                                                         .flex_1()
-                                                        .child(
-                                                            div()
-                                                                .flex()
-                                                                .flex_col()
-                                                                .flex_1()
-                                                                .overflow_hidden()
-                                                                .child(
-                                                                    h_flex()
-                                                                        .flex_1()
-                                                                        .when_some(
-                                                                            centered_paddings.0,
-                                                                            |this, p| {
-                                                                                this.child(
-                                                                                    p.border_r_1(),
-                                                                                )
-                                                                            },
-                                                                        )
-                                                                        .child(self.render_center(
-                                                                            &pane_render_context,
-                                                                            window,
-                                                                            cx,
-                                                                        ))
-                                                                        .when_some(
-                                                                            centered_paddings.1,
-                                                                            |this, p| {
-                                                                                this.child(
-                                                                                    p.border_l_1(),
-                                                                                )
-                                                                            },
-                                                                        ),
-                                                                ),
-                                                        )
+                                                        .children(center_column)
+                                                        // The right dock shares this column with the
+                                                        // bottom dock, so it needs the spacer to stay
+                                                        // at the right edge even while the left dock
+                                                        // fills.
+                                                        .when(editor_area_hidden, |this| {
+                                                            this.child(div().flex_1())
+                                                        })
                                                         .children(self.render_dock(
                                                             DockPosition::Right,
                                                             &self.right_dock,
@@ -9957,52 +9976,51 @@ impl Render for Workspace {
                                                     cx,
                                                 ))),
                                         ),
-                                    BottomDockLayout::Contained => div()
-                                        .flex()
-                                        .flex_row()
-                                        .h_full()
-                                        .children(self.render_dock(
-                                            DockPosition::Left,
-                                            &self.left_dock,
+                                    BottomDockLayout::Contained => {
+                                        let bottom_dock = self.render_dock(
+                                            DockPosition::Bottom,
+                                            &self.bottom_dock,
                                             window,
                                             cx,
-                                        ))
-                                        .child(
-                                            div()
+                                        );
+                                        let center_column = match center_column {
+                                            Some(center_column) => {
+                                                center_column.children(bottom_dock)
+                                            }
+                                            // A closed bottom dock is still mounted so its
+                                            // focus handle stays reachable.
+                                            None => div()
                                                 .flex()
                                                 .flex_col()
-                                                .flex_1()
                                                 .overflow_hidden()
-                                                .child(
-                                                    h_flex()
-                                                        .flex_1()
-                                                        .when_some(
-                                                            centered_paddings.0,
-                                                            |this, p| this.child(p.border_r_1()),
-                                                        )
-                                                        .child(self.render_center(
-                                                            &pane_render_context,
-                                                            window,
-                                                            cx,
-                                                        ))
-                                                        .when_some(
-                                                            centered_paddings.1,
-                                                            |this, p| this.child(p.border_l_1()),
-                                                        ),
-                                                )
-                                                .children(self.render_dock(
-                                                    DockPosition::Bottom,
-                                                    &self.bottom_dock,
-                                                    window,
-                                                    cx,
-                                                )),
-                                        )
-                                        .children(self.render_dock(
-                                            DockPosition::Right,
-                                            &self.right_dock,
-                                            window,
-                                            cx,
-                                        )),
+                                                .when(bottom_dock_open, |this| this.flex_1())
+                                                .children(bottom_dock.map(|dock| {
+                                                    dock.when(bottom_dock_open, |dock| {
+                                                        dock.flex_1()
+                                                    })
+                                                })),
+                                        };
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .h_full()
+                                            .children(self.render_dock(
+                                                DockPosition::Left,
+                                                &self.left_dock,
+                                                window,
+                                                cx,
+                                            ))
+                                            .child(center_column)
+                                            .when(needs_spacer && !bottom_dock_open, |this| {
+                                                this.child(div().flex_1())
+                                            })
+                                            .children(self.render_dock(
+                                                DockPosition::Right,
+                                                &self.right_dock,
+                                                window,
+                                                cx,
+                                            ))
+                                    }
                                 }
                             })
                             .children(self.zoomed.as_ref().and_then(|view| {
@@ -10056,9 +10074,12 @@ impl Render for Workspace {
                             }))
                             .children(self.render_notifications(window, cx)),
                     )
-                    .when(self.status_bar_visible(cx), |parent| {
-                        parent.child(self.status_bar.clone())
-                    })
+                    // A window draws its active workspace's status bar itself, under the
+                    // sidebar too.
+                    .when(
+                        self.multi_workspace.is_none() && self.status_bar_visible(cx),
+                        |parent| parent.child(self.status_bar.clone()),
+                    )
                     .child(self.toast_layer.clone()),
             )
     }
@@ -10382,13 +10403,18 @@ pub async fn apply_restored_multiworkspace_state(
             .ok();
     }
 
-    if *sidebar_open {
-        window_handle
-            .update(cx, |multi_workspace, _, cx| {
+    // The sidebar may already be open by default, so a saved closed state closes it. Windows
+    // saved before Zaseo registered a sidebar have no sidebar state and were never shown one,
+    // so their closed flag is no choice to keep.
+    window_handle
+        .update(cx, |multi_workspace, _, cx| {
+            if *sidebar_open {
                 multi_workspace.restore_open_sidebar(cx);
-            })
-            .ok();
-    }
+            } else if sidebar_state.is_some() {
+                multi_workspace.restore_closed_sidebar(cx);
+            }
+        })
+        .ok();
 
     if let Some(sidebar_state) = sidebar_state {
         window_handle
@@ -11218,14 +11244,10 @@ pub fn open_paths(
                     open_options.requesting_window = Some(window);
                     window
                         .update(cx, |multi_workspace, _, cx| {
-                            if AgentSettings::get_global(cx).threads_sidebar.auto_open {
-                                multi_workspace.open_sidebar(cx);
-                            } else {
-                                // Opening the sidebar is also what pins the
-                                // workspace we are about to navigate away from,
-                                // so pin it here to keep it in this window.
-                                multi_workspace.retain_active_workspace(cx);
-                            }
+                            // Zaseo's sidebar is the agents list, which keeps the user's
+                            // shown or hidden choice, so this only pins the workspace we are
+                            // about to navigate away from to keep it in this window.
+                            multi_workspace.retain_active_workspace(cx);
                         })
                         .log_err();
                 }
@@ -15744,6 +15766,115 @@ mod tests {
             left.right() <= content.left() && content.right() <= right.left(),
             "the zoomed pane should sit between the paddings: left {left:?}, content {content:?}, right {right:?}"
         );
+    }
+
+    #[gpui::test]
+    async fn test_editor_area_hides_and_left_dock_fills(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+
+        add_an_item_to_active_pane(cx, &workspace, 1);
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(panel, window, cx);
+            workspace.toggle_dock(DockPosition::Left, window, cx);
+        });
+        cx.run_until_parked();
+
+        let workspace_width = workspace.read_with(cx, |workspace, _| workspace.bounds.size.width);
+        let shown_width = cx
+            .debug_bounds("left-dock")
+            .expect("the open left dock should be rendered")
+            .size
+            .width;
+        assert!(
+            shown_width < workspace_width,
+            "the left dock should leave room for the editor: {shown_width:?} of {workspace_width:?}"
+        );
+
+        cx.dispatch_action(ToggleEditorArea);
+        cx.run_until_parked();
+
+        assert!(workspace.read_with(cx, |workspace, _| workspace.editor_area_hidden()));
+        let hidden_width = cx
+            .debug_bounds("left-dock")
+            .expect("the open left dock should be rendered")
+            .size
+            .width;
+        assert_eq!(
+            hidden_width, workspace_width,
+            "the left dock should fill the editor's space"
+        );
+
+        cx.dispatch_action(ToggleEditorArea);
+        cx.run_until_parked();
+
+        assert!(!workspace.read_with(cx, |workspace, _| workspace.editor_area_hidden()));
+        let restored_width = cx
+            .debug_bounds("left-dock")
+            .expect("the open left dock should be rendered")
+            .size
+            .width;
+        assert_eq!(restored_width, shown_width);
+    }
+
+    #[gpui::test]
+    async fn test_opening_item_shows_editor_area(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.set_editor_area_hidden(true, window, cx);
+        });
+        assert!(workspace.read_with(cx, |workspace, _| workspace.editor_area_hidden()));
+
+        add_an_item_to_active_pane(cx, &workspace, 1);
+
+        assert!(!workspace.read_with(cx, |workspace, _| workspace.editor_area_hidden()));
+    }
+
+    #[gpui::test]
+    async fn test_editor_area_hidden_is_restored(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let (workspace_id, app_state) = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.set_random_database_id();
+            workspace.set_editor_area_hidden(true, window, cx);
+            (
+                workspace
+                    .database_id()
+                    .expect("a random database id was just set"),
+                workspace.app_state().clone(),
+            )
+        });
+        cx.run_until_parked();
+
+        let restored_project = Project::test(fs, None, cx).await;
+        let (restored_workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new(Some(workspace_id), restored_project, app_state, window, cx)
+        });
+        assert!(
+            restored_workspace.read_with(cx, |workspace, _| workspace.editor_area_hidden()),
+            "the hidden editor area should be restored for the same workspace id"
+        );
+
+        // Items restored from the database must not show the editor again.
+        restored_workspace.update(cx, |workspace, _| workspace.set_restoring_workspace(true));
+        add_an_item_to_active_pane(cx, &restored_workspace, 1);
+        restored_workspace.update(cx, |workspace, _| workspace.set_restoring_workspace(false));
+        assert!(restored_workspace.read_with(cx, |workspace, _| workspace.editor_area_hidden()));
     }
 
     #[gpui::test]

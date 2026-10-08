@@ -47,11 +47,35 @@ machine and uploads it.
 - SSH profiles always use a typed password.
 - A remote `ws://` connection is only as private as the network or VPN it runs over.
 
+## Window layout
+
+From left to right a window shows four areas, and each one hides on its own:
+
+| Area | Holds | Show or hide |
+| --- | --- | --- |
+| Agents list | Every host's agents | `ctrl-alt-1` or `ctrl-alt-p` |
+| Chat panel | Agent chats, in tabs and splits | `ctrl-alt-2` or `ctrl-b` |
+| Editor | Files and every other tab | `ctrl-alt-3` |
+| Right dock | Folder, outline, git and the other panels | `ctrl-alt-4` or `ctrl-alt-b` |
+
+The layout buttons in the status bar do the same, each at the edge on the side of its
+area: agents list, chat panel and editor at the bottom left, right dock at the bottom
+right. Each is highlighted while its area shows, and the agents button shows a dot while
+the list is hidden and an agent needs you. The status bar runs the full width of the
+window, under the agents list too. With the editor hidden the chat panel takes its
+width. Opening an agent shows the chat panel, and opening a file shows the editor.
+
+Chats open only in the chat panel, and files never do. Dragging a chat into the editor,
+or a file into the chat panel, does nothing. The chat panel's split button starts a new
+agent beside the current one, and **Split Right** and the other split commands work there
+too. Chat tabs drag between the panel's splits. The panel keeps its tabs and splits per
+project across restarts.
+
 ## Sidebar
 
-The Paseo sidebar (left dock, **View → Paseo Agents**) lists projects, their
-workspaces, and each workspace's agents, as Paseo 0.9 does, with pinned workspaces
-first.
+The agents list (**View → Paseo Agents**) runs down the window's left edge and lists
+projects, their workspaces, and each workspace's agents, as Paseo 0.9 does, with
+pinned workspaces first. One list serves every project open in the window.
 
 - A workspace with one agent is a single row that opens the agent.
 - Each row's title wraps onto two lines. Under it the row shows its project (outside
@@ -83,13 +107,12 @@ Alerts for finished or waiting agents replace each other instead of stacking up.
 ### Title bar
 
 The title bar shows the same bell with how many agents are running. After the project
-name it shows the active tab's agent and its state. It has no worktree or branch
-pickers, since the sidebar shows each agent's.
+name it shows the agent of the chat in front and its state. It has no worktree or branch pickers, since the sidebar shows each agent's.
 
 ## Agent tabs
 
-Each agent opens in its own tab with its conversation, permission prompts, and a
-composer.
+Each agent opens in its own tab in the chat panel with its conversation, permission
+prompts, and a composer.
 
 - A new agent starts as a draft tab. Its first message creates the agent.
 - A failed agent's chat shows the error above the conversation.
@@ -280,7 +303,10 @@ kept or rejected, like Zed's own agent.
 
 | Keys | Action |
 | --- | --- |
-| `ctrl-alt-p` | Focus or hide the Paseo sidebar |
+| `ctrl-alt-1` (or `ctrl-alt-p`) | Show or hide the agents list |
+| `ctrl-alt-2` (or `ctrl-b`) | Show or hide the chat panel |
+| `ctrl-alt-3` | Show or hide the editor |
+| `ctrl-alt-4` (or `ctrl-alt-b`) | Show or hide the right dock |
 | `ctrl-n` (or `ctrl-alt-n`) | New workspace; Zed's New File stays in the command palette |
 | `ctrl-t` (or `ctrl-alt-t`) | New agent in the shown workspace; Zed's project symbols stay in the command palette |
 | `ctrl-shift-p` | Command palette, with agents first |

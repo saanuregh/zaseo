@@ -13,7 +13,7 @@ path = "src/paseo_ui.rs"
 doctest = false
 
 [features]
-test-support = ["db/test-support", "dep:theme", "settings/test-support"]
+test-support = ["db/test-support", "settings/test-support"]
 
 [dependencies]
 anyhow.workspace = true
@@ -39,6 +39,7 @@ menu.workspace = true
 multi_buffer.workspace = true
 paseo_client.workspace = true
 picker.workspace = true
+platform_title_bar.workspace = true
 project.workspace = true
 project_symbols.workspace = true
 schemars.workspace = true
@@ -49,7 +50,7 @@ settings.workspace = true
 terminal.workspace = true
 terminal_view.workspace = true
 text.workspace = true
-theme = { workspace = true, optional = true }
+theme.workspace = true
 theme_settings.workspace = true
 ui.workspace = true
 ui_input.workspace = true

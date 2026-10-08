@@ -115,8 +115,8 @@ pub(crate) fn show(
 ) {
     let workspace_id = cx.entity_id();
     shown_mut(workspace_id, cx).paseo_workspace_id = Some(paseo_workspace_id.to_owned());
-    let to_hide = workspace
-        .items_of_type::<AgentTab>(cx)
+    let to_hide = crate::chat_panel::agent_tabs(workspace, cx)
+        .into_iter()
         .filter_map(|tab| {
             let chat_workspace = tab_paseo_workspace(&tab, cx)?;
             (chat_workspace != paseo_workspace_id).then_some((tab, chat_workspace))
@@ -135,7 +135,7 @@ pub(crate) fn show(
         .into_iter()
         .partition(|chat| chat.paseo_workspace_id == paseo_workspace_id);
     shown_mut(workspace_id, cx).hidden = still_hidden;
-    let pane = workspace.active_pane().clone();
+    let pane = crate::chat_panel::chat_pane(workspace, cx);
     for chat in revealed {
         add_without_activating(&pane, chat.view, window, cx);
     }
@@ -150,7 +150,7 @@ pub(crate) fn detach_tab(
     cx: &mut Context<Workspace>,
 ) {
     tab.update(cx, |tab, _| tab.leaving = true);
-    if let Some(pane) = workspace.pane_for(tab) {
+    if let Some(pane) = crate::chat_panel::pane_for_tab(workspace, tab, cx) {
         pane.update(cx, |pane, cx| {
             pane.remove_item(tab.entity_id(), false, true, window, cx)
         });
@@ -177,7 +177,7 @@ fn open_missing_tabs(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let tabs = workspace.items_of_type::<AgentTab>(cx).collect::<Vec<_>>();
+    let tabs = crate::chat_panel::agent_tabs(workspace, cx);
     // A sent draft becomes its new agent's tab once the daemon answers, and the agent can reach
     // the store first.
     let creating = tabs.iter().any(|tab| {
@@ -234,7 +234,7 @@ fn open_missing_tabs(
     if missing.is_empty() {
         return;
     }
-    let pane = workspace.active_pane().clone();
+    let pane = crate::chat_panel::chat_pane(workspace, cx);
     for agent_id in missing {
         let tab = crate::new_agent_tab(workspace, &agent_id, window, cx);
         pane.update(cx, |pane, cx| {
@@ -249,27 +249,25 @@ fn open_missing_tabs(
 /// workspaces working in this workspace's folders are shown.
 pub(crate) fn refresh(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     let current = shown(cx.entity_id(), cx).and_then(|shown| shown.paseo_workspace_id.clone());
+    let tabs = crate::chat_panel::agent_tabs(workspace, cx);
     // Most editor workspaces hold no Paseo chats, and this runs on every change on any host.
-    if current.is_none() && workspace.items_of_type::<AgentTab>(cx).next().is_none() {
+    if current.is_none() && tabs.is_empty() {
         return;
     }
-    let active = workspace
-        .active_item(cx)
-        .and_then(|item| item.downcast::<AgentTab>())
+    let active = crate::chat_panel::active_agent_tab(workspace, cx)
         .and_then(|tab| tab_paseo_workspace(&tab, cx));
-    let Some(target) = active.or_else(|| current.clone()).or_else(|| {
-        workspace
-            .items_of_type::<AgentTab>(cx)
-            .find_map(|tab| tab_paseo_workspace(&tab, cx))
-    }) else {
+    let Some(target) = active
+        .or_else(|| current.clone())
+        .or_else(|| tabs.iter().find_map(|tab| tab_paseo_workspace(tab, cx)))
+    else {
         return;
     };
     if !crate::workspace_holds_paseo_workspace(workspace, &target, cx) {
         return;
     }
     let needs_show = current.as_ref() != Some(&target)
-        || workspace.items_of_type::<AgentTab>(cx).any(|tab| {
-            tab_paseo_workspace(&tab, cx).is_some_and(|chat_workspace| chat_workspace != target)
+        || tabs.iter().any(|tab| {
+            tab_paseo_workspace(tab, cx).is_some_and(|chat_workspace| chat_workspace != target)
         });
     if needs_show {
         show(workspace, &target, window, cx);
@@ -304,7 +302,7 @@ pub(crate) fn paseo_workspace_removed(
         .filter(|agent| agent_workspace_id(agent) == Some(paseo_workspace_id))
         .map(|agent| agent.id.clone())
         .collect::<HashSet<_>>();
-    let tabs = workspace.items_of_type::<AgentTab>(cx).collect::<Vec<_>>();
+    let tabs = crate::chat_panel::agent_tabs(workspace, cx);
     for tab in tabs {
         let (agent_id, pending) = {
             let tab = tab.read(cx);

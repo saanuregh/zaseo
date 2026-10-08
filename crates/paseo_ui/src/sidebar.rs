@@ -1,12 +1,11 @@
-use anyhow::Result;
 use chrono::{DateTime, Utc};
 use db::kvp::KeyValueStore;
 use editor::Editor;
 use gpui::{
-    Action as _, Animation, AnimationExt as _, AnyElement, App, AppContext as _,
-    AsyncWindowContext, ClipboardItem, Context, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, Global, IntoElement, ListAlignment, ListOffset, ListState, Pixels, Subscription,
-    Task, WeakEntity, Window, ease_in_out, list, prelude::*, pulsating_between, px, relative,
+    Action as _, Animation, AnimationExt as _, AnyElement, App, AppContext as _, ClipboardItem,
+    Context, Decorations, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Global,
+    IntoElement, ListAlignment, ListOffset, ListState, Pixels, Subscription, Task, WeakEntity,
+    Window, ease_in_out, list, prelude::*, pulsating_between, px, relative,
 };
 use menu::{Cancel, Confirm, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use paseo_client::{AgentSummary, ProjectDescriptor, WorkspaceDescriptor, WorkspaceLabel};
@@ -15,14 +14,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use theme::CLIENT_SIDE_DECORATION_ROUNDING;
 use ui::{
     ContextMenu, HighlightedLabel, IconButton, Indicator, KeyBinding, PopoverMenu, Tooltip,
     prelude::*, right_click_menu,
 };
 use util::ResultExt as _;
 use workspace::{
-    Workspace,
-    dock::{DockPosition, Panel, PanelEvent},
+    MultiWorkspace, MultiWorkspaceEvent, Sidebar, SidebarEvent, SidebarSide, Workspace,
 };
 
 use crate::store::{
@@ -36,7 +35,7 @@ use crate::timeline::{format_relative, parse_timestamp};
 use crate::workspace_tools;
 use crate::{
     ArchiveAgent, CopyAgentId, FocusSidebarFilter, ManageHosts, NewAgentWorkspace, OpenWorkspace,
-    PaseoSettings, Reconnect, RenameAgent, ToggleGroupByStatus, TogglePanel, connection_picker,
+    PaseoSettings, Reconnect, RenameAgent, ToggleGroupByStatus, connection_picker,
     hosts::{self, HostsEvent},
     open_agent,
 };
@@ -1350,11 +1349,14 @@ struct SharedSidebarView {
 
 impl Global for SharedSidebarView {}
 
-pub struct PaseoPanel {
-    workspace: WeakEntity<Workspace>,
+pub struct AgentsList {
+    /// The window the list belongs to; it acts on the window's active workspace.
+    multi_workspace: WeakEntity<MultiWorkspace>,
     focus_handle: FocusHandle,
     filter: Entity<Editor>,
-    position: DockPosition,
+    width: Option<Pixels>,
+    /// Whether the window shows the list.
+    shown: bool,
     grouping: SidebarGrouping,
     collapsed: HashSet<String>,
     host_filter: BTreeSet<String>,
@@ -1376,6 +1378,8 @@ pub struct PaseoPanel {
     motion: RowMotion,
     row_hosts: RowHosts,
     _timestamp_ticker: Task<()>,
+    /// Follows the active workspace, which changes as the window switches workspaces.
+    _workspace_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1635,17 +1639,12 @@ fn row_motion(
     }
 }
 
-impl PaseoPanel {
-    pub fn load(
-        workspace: WeakEntity<Workspace>,
-        mut cx: AsyncWindowContext,
-    ) -> Task<Result<Entity<Self>>> {
-        Task::ready(workspace.clone().update_in(&mut cx, |_, window, cx| {
-            cx.new(|cx| Self::new(workspace, window, cx))
-        }))
-    }
-
-    fn new(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+impl AgentsList {
+    pub fn new(
+        multi_workspace: WeakEntity<MultiWorkspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let registry = hosts::registry(cx);
         let filter = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
@@ -1713,21 +1712,38 @@ impl PaseoPanel {
                 },
             ),
         ];
-        // The History row is highlighted while History is the active tab.
-        if let Some(workspace) = workspace.upgrade() {
-            subscriptions.push(
-                cx.subscribe(&workspace, |_, _, event: &workspace::Event, cx| {
-                    if matches!(event, workspace::Event::ActiveItemChanged) {
-                        cx.notify();
+        let mut shown = false;
+        if let Some(multi_workspace) = multi_workspace.upgrade() {
+            shown = multi_workspace.read(cx).sidebar_open();
+            subscriptions.push(cx.subscribe(
+                &multi_workspace,
+                |panel: &mut Self, _, event: &MultiWorkspaceEvent, cx| {
+                    if matches!(event, MultiWorkspaceEvent::ActiveWorkspaceChanged { .. }) {
+                        panel.follow_active_workspace(cx);
                     }
-                }),
-            );
+                },
+            ));
+            subscriptions.push(cx.observe(
+                &multi_workspace,
+                |panel: &mut Self, multi_workspace, cx| {
+                    let shown = multi_workspace.read(cx).sidebar_open();
+                    if shown != panel.shown {
+                        panel.shown = shown;
+                        // A hidden list gets no hover-leave event, so a pending re-sort would
+                        // otherwise wait until the pointer next passes over it.
+                        if !shown {
+                            panel.set_pointer_inside(false, cx);
+                        }
+                    }
+                },
+            ));
         }
         let mut panel = Self {
-            workspace,
+            multi_workspace,
             focus_handle: cx.focus_handle(),
             filter,
-            position: DockPosition::Left,
+            width: None,
+            shown,
             grouping: shared.grouping,
             collapsed: shared.collapsed,
             host_filter: shared.hosts,
@@ -1742,11 +1758,37 @@ impl PaseoPanel {
             motion: RowMotion::default(),
             row_hosts: RowHosts::default(),
             _timestamp_ticker: redraw_every_minute(cx),
+            _workspace_subscriptions: Vec::new(),
             _subscriptions: subscriptions,
         };
+        panel.follow_active_workspace(cx);
         panel.observe_motion(false, cx);
         panel.refresh_entries(cx);
         panel
+    }
+
+    /// The window's active workspace, which the list opens agents in.
+    fn workspace(&self, cx: &App) -> WeakEntity<Workspace> {
+        self.multi_workspace
+            .upgrade()
+            .map(|multi_workspace| multi_workspace.read(cx).workspace().downgrade())
+            .unwrap_or_else(WeakEntity::new_invalid)
+    }
+
+    fn follow_active_workspace(&mut self, cx: &mut Context<Self>) {
+        self._workspace_subscriptions.clear();
+        if let Some(workspace) = self.workspace(cx).upgrade() {
+            // The History row is highlighted while History is the active tab.
+            self._workspace_subscriptions.push(cx.subscribe(
+                &workspace,
+                |_, _, event: &workspace::Event, cx| {
+                    if matches!(event, workspace::Event::ActiveItemChanged) {
+                        cx.notify();
+                    }
+                },
+            ));
+        }
+        cx.notify();
     }
 
     fn store_changed(&mut self, cx: &mut Context<Self>) {
@@ -1920,7 +1962,7 @@ impl PaseoPanel {
         db::write_and_log(cx, move || async move {
             kvp.write_kvp(GROUPING_KEY.to_owned(), value).await
         });
-        if let Some(workspace) = self.workspace.upgrade() {
+        if let Some(workspace) = self.workspace(cx).upgrade() {
             let fs = workspace.read(cx).app_state().fs.clone();
             settings::update_settings_file(fs, cx, move |settings, _| {
                 settings
@@ -2037,7 +2079,7 @@ impl PaseoPanel {
                 ..
             } => {
                 let agent_id = agent_id.clone();
-                if let Some(workspace) = self.workspace.upgrade() {
+                if let Some(workspace) = self.workspace(cx).upgrade() {
                     workspace.update(cx, |workspace, cx| {
                         open_agent(workspace, &agent_id, focus, window, cx);
                     });
@@ -2045,7 +2087,7 @@ impl PaseoPanel {
             }
             SidebarEntry::Workspace { workspace_id, .. } => {
                 let workspace_id = workspace_id.clone();
-                if let Some(workspace) = self.workspace.upgrade() {
+                if let Some(workspace) = self.workspace(cx).upgrade() {
                     workspace.update(cx, |workspace, cx| {
                         crate::open_paseo_workspace_tabs(workspace, &workspace_id, window, cx);
                     });
@@ -2053,7 +2095,7 @@ impl PaseoPanel {
             }
             SidebarEntry::Agent { agent_id, .. } => {
                 let agent_id = agent_id.clone();
-                if let Some(workspace) = self.workspace.upgrade() {
+                if let Some(workspace) = self.workspace(cx).upgrade() {
                     workspace.update(cx, |workspace, cx| {
                         open_agent(workspace, &agent_id, focus, window, cx);
                     });
@@ -2091,7 +2133,7 @@ impl PaseoPanel {
     }
 
     fn rename(&mut self, agent_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(workspace) = self.workspace.upgrade() {
+        if let Some(workspace) = self.workspace(cx).upgrade() {
             workspace.update(cx, |workspace, cx| {
                 workspace_tools::open_agent_rename(workspace, agent_id, window, cx);
             });
@@ -2112,7 +2154,7 @@ impl PaseoPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(workspace) = self.workspace.upgrade() {
+        if let Some(workspace) = self.workspace(cx).upgrade() {
             let host = host.unwrap_or_else(|| hosts::default_store(cx));
             workspace.update(cx, |workspace, cx| match directory {
                 Some(directory) => {
@@ -2331,20 +2373,50 @@ impl PaseoPanel {
             .collect()
     }
 
-    fn render_header(&self, cx: &Context<Self>) -> impl IntoElement {
+    /// The header sits beside the title bar, so it matches its height and draws the window
+    /// controls the title bar hides while the list is open.
+    fn render_header(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let focus = self.focus_handle.clone();
         let group_focus = self.focus_handle.clone();
+        let not_fullscreen = !window.is_fullscreen() && !window.is_simple_fullscreen();
+        let traffic_lights = cfg!(target_os = "macos") && not_fullscreen;
+        let left_window_controls = (!cfg!(target_os = "macos") && not_fullscreen)
+            .then(|| {
+                platform_title_bar::render_left_window_controls(
+                    cx.button_layout(),
+                    Box::new(workspace::CloseWindow),
+                    window,
+                )
+            })
+            .flatten();
         h_flex()
-            .h(px(40.))
+            .h(ui::utils::platform_title_bar_height(window))
             .flex_none()
-            .px_2p5()
+            .map(|header| match window.window_decorations() {
+                Decorations::Client { .. } => platform_title_bar::apply_title_bar_insets(
+                    header,
+                    left_window_controls.is_some(),
+                    false,
+                    false,
+                ),
+                Decorations::Server => header,
+            })
+            .children(left_window_controls)
+            .map(|header| {
+                if traffic_lights {
+                    header.pl(px(ui::utils::TRAFFIC_LIGHT_PADDING))
+                } else {
+                    header.pl_2p5()
+                }
+            })
+            .pr_2p5()
             .gap_1()
-            .justify_between()
             .border_b_1()
             .border_color(cx.theme().colors().border_variant)
-            .child(self.render_host_menu(cx))
+            .child(div().flex_1().min_w_0().child(self.render_host_menu(cx)))
             .child(
                 h_flex()
+                    .flex_none()
                     .gap_0p5()
                     .child(
                         IconButton::new("paseo-command-palette", IconName::MagnifyingGlass)
@@ -2367,7 +2439,7 @@ impl PaseoPanel {
                     )
                     .child(crate::attention::attention_bell(
                         "paseo-attention",
-                        self.workspace.clone(),
+                        self.workspace(cx),
                         hosts::activity(cx).attention,
                         cx,
                     ))
@@ -2450,18 +2522,17 @@ impl PaseoPanel {
             })
     }
 
-    /// The agent whose chat is the workspace's active item, if one is.
+    /// The agent whose chat is in front of the chat panel, if one is.
     fn active_agent_tab_id(&self, cx: &App) -> Option<String> {
-        self.workspace
+        self.workspace(cx)
             .upgrade()
-            .and_then(|workspace| workspace.read(cx).active_item(cx))
-            .and_then(|item| item.downcast::<crate::agent_view::AgentTab>())
+            .and_then(|workspace| crate::chat_panel::active_agent_tab(workspace.read(cx), cx))
             .and_then(|tab| tab.read(cx).agent_id(cx))
     }
 
     /// Paseo highlights its History row while History is the screen in front.
     fn history_open(&self, cx: &App) -> bool {
-        self.workspace
+        self.workspace(cx)
             .upgrade()
             .and_then(|workspace| workspace.read(cx).active_item(cx))
             .is_some_and(|item| {
@@ -2713,7 +2784,7 @@ impl PaseoPanel {
         let header = div().mt_3().mb_0p5().child(header).into_any_element();
         match project_id {
             Some(project_id) => {
-                let workspace = self.workspace.clone();
+                let workspace = self.workspace(cx);
                 right_click_menu(("paseo-project-menu", index))
                     .trigger(move |_, _, _| header)
                     .menu(move |window, cx| {
@@ -2865,7 +2936,7 @@ impl PaseoPanel {
             panel.activate(&entry, false, window, cx)
         }))
         .into_any_element();
-        let menu_row = self.workspace_row_menu(index, row, workspace_id, host, single_agent);
+        let menu_row = self.workspace_row_menu(index, row, workspace_id, host, single_agent, cx);
         let row = alert_line(menu_row, alert, ("paseo-workspace-alert", index), cx);
         row_motion(
             row,
@@ -2885,8 +2956,9 @@ impl PaseoPanel {
         workspace_id: &str,
         host: Entity<PaseoStore>,
         single_agent: Option<String>,
+        cx: &App,
     ) -> AnyElement {
-        let menu_workspace = self.workspace.clone();
+        let menu_workspace = self.workspace(cx);
         let menu_workspace_id = workspace_id.to_owned();
         right_click_menu(("paseo-workspace-menu", index))
             .trigger(move |_, _, _| row)
@@ -3066,7 +3138,7 @@ impl PaseoPanel {
                         .entry("Fork", None, move |window, cx| {
                             let (this, host, agent_id) = fork.clone();
                             if let Err(error) = this.update(cx, |panel, cx| {
-                                if let Some(workspace) = panel.workspace.upgrade() {
+                                if let Some(workspace) = panel.workspace(cx).upgrade() {
                                     workspace.update(cx, |workspace, cx| {
                                         crate::fork_agent(workspace, host, &agent_id, window, cx)
                                     });
@@ -3281,13 +3353,32 @@ fn toggle_host_filter(name: &str, cx: &mut App) {
     }
 }
 
+/// The agents list of `workspace`'s window.
+pub(crate) fn agents_list(workspace: &Workspace, cx: &App) -> Option<Entity<AgentsList>> {
+    workspace
+        .multi_workspace()?
+        .upgrade()?
+        .read(cx)
+        .sidebar()?
+        .to_any()
+        .downcast::<AgentsList>()
+        .ok()
+}
+
+/// Shows and focuses the agents list, or hides it.
+pub(crate) fn toggle_agents_list(window: &mut Window, cx: &mut App) {
+    // The window's root handles it, outside the workspace update this runs in, because opening
+    // the list updates every workspace of the window.
+    window.dispatch_action(workspace::ToggleWorkspaceSidebar.boxed_clone(), cx);
+}
+
 pub(crate) fn open_row_at_index(
     workspace: &mut Workspace,
     index: usize,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let Some(panel) = workspace.panel::<PaseoPanel>(cx) else {
+    let Some(panel) = agents_list(workspace, cx) else {
         return;
     };
     let targets = panel.update(cx, |panel, cx| {
@@ -3312,7 +3403,7 @@ pub(crate) fn open_adjacent_agent(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let Some(panel) = workspace.panel::<PaseoPanel>(cx) else {
+    let Some(panel) = agents_list(workspace, cx) else {
         return;
     };
     let order = panel.update(cx, |panel, cx| agent_order(panel.current_entries(cx)));
@@ -3331,9 +3422,9 @@ pub(crate) fn open_adjacent_agent(
     }
 }
 
-impl EventEmitter<PanelEvent> for PaseoPanel {}
+impl EventEmitter<SidebarEvent> for AgentsList {}
 
-impl Focusable for PaseoPanel {
+impl Focusable for AgentsList {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
@@ -3348,7 +3439,7 @@ fn lists_agents(entries: &[SidebarEntry]) -> bool {
     })
 }
 
-impl Render for PaseoPanel {
+impl Render for AgentsList {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.apply_store_changes(cx);
         let colors = cx.theme().colors();
@@ -3378,9 +3469,28 @@ impl Render for PaseoPanel {
             .on_action(cx.listener(Self::archive_selected))
             .on_action(cx.listener(Self::rename_selected))
             .on_action(cx.listener(Self::copy_selected_id))
-            .size_full()
+            .map(|sidebar| match window.window_decorations() {
+                Decorations::Server => sidebar.size_full(),
+                // As in Zed's own sidebar: with client-side decorations the list owns the
+                // window's top-left corner, so it is stretched 1px over untiled window borders
+                // and rounded like the title bar, leaving no transparent gap in the corner. The
+                // status bar below it owns the bottom-left corner.
+                Decorations::Client { tiling, .. } => sidebar
+                    .absolute()
+                    .right(px(0.))
+                    .bottom(px(0.))
+                    .top(if tiling.top { px(0.) } else { px(-1.) })
+                    .left(if tiling.left { px(0.) } else { px(-1.) })
+                    .when(!tiling.top, |sidebar| sidebar.pt_px())
+                    .when(!tiling.left, |sidebar| sidebar.pl(px(1.)))
+                    .when(!(tiling.top || tiling.left), |sidebar| {
+                        sidebar.rounded_tl(CLIENT_SIDE_DECORATION_ROUNDING)
+                    }),
+            })
             .bg(colors.panel_background)
-            .child(self.render_header(cx))
+            .border_r_1()
+            .border_color(colors.border)
+            .child(self.render_header(window, cx))
             .child(self.render_nav(window, cx))
             .child(
                 list(
@@ -3394,7 +3504,7 @@ impl Render for PaseoPanel {
     }
 }
 
-impl PaseoPanel {
+impl AgentsList {
     fn render_list_item(
         &mut self,
         index: usize,
@@ -3424,28 +3534,14 @@ impl PaseoPanel {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-impl PaseoPanel {
+impl AgentsList {
     /// A sidebar outside any workspace, listing the hosts `crate::test_init` set up.
     pub fn test_new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self::new(WeakEntity::new_invalid(), window, cx)
     }
 
-    pub fn test_toggle_grouping(panel: &Entity<Self>, window: &mut Window, cx: &mut App) {
-        panel.update(cx, |panel, cx| {
-            panel.toggle_group_by_status(&ToggleGroupByStatus, window, cx)
-        });
-    }
-
-    pub fn test_groups_by_status(panel: &Entity<Self>, cx: &App) -> bool {
-        panel.read(cx).grouping == SidebarGrouping::Status
-    }
-
     pub fn test_set_pointer_inside(panel: &Entity<Self>, inside: bool, cx: &mut App) {
         panel.update(cx, |panel, cx| panel.set_pointer_inside(inside, cx));
-    }
-
-    pub fn test_refresh_pending(panel: &Entity<Self>, cx: &App) -> bool {
-        panel.read(cx).refresh_pending
     }
 
     /// Whether the row of `agent_id` flashes for a state change.
@@ -3462,73 +3558,52 @@ impl PaseoPanel {
         panel.update(cx, |panel, cx| agent_order(panel.current_entries(cx)))
     }
 
-    /// What the dock does after the user resizes the sidebar.
-    pub fn test_size_changed(panel: &Entity<Self>, window: &mut Window, cx: &mut App) {
-        panel.update(cx, |panel, cx| panel.size_state_changed(window, cx));
+    pub fn test_width(panel: &Entity<Self>, cx: &App) -> Pixels {
+        panel.read(cx).width(cx)
     }
 }
 
-impl Panel for PaseoPanel {
-    fn persistent_name() -> &'static str {
-        "Paseo"
+const DEFAULT_WIDTH: Pixels = px(300.);
+const MIN_WIDTH: Pixels = px(200.);
+const MAX_WIDTH: Pixels = px(600.);
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SerializedSidebar {
+    width: Option<f32>,
+}
+
+impl Sidebar for AgentsList {
+    fn width(&self, _: &App) -> Pixels {
+        self.width.unwrap_or(DEFAULT_WIDTH)
     }
 
-    fn panel_key() -> &'static str {
-        "PaseoPanel"
-    }
-
-    fn position(&self, _: &Window, _: &App) -> DockPosition {
-        self.position
-    }
-
-    fn position_is_valid(&self, position: DockPosition) -> bool {
-        matches!(position, DockPosition::Left | DockPosition::Right)
-    }
-
-    fn set_position(&mut self, position: DockPosition, _: &mut Window, cx: &mut Context<Self>) {
-        self.position = position;
+    fn set_width(&mut self, width: Option<Pixels>, cx: &mut Context<Self>) {
+        self.width = width.map(|width| width.clamp(MIN_WIDTH, MAX_WIDTH));
+        cx.emit(SidebarEvent::SerializeNeeded);
         cx.notify();
     }
 
-    fn default_size(&self, _: &Window, _: &App) -> Pixels {
-        px(300.)
+    fn has_notifications(&self, cx: &App) -> bool {
+        hosts::activity(cx).attention.count > 0
     }
 
-    // The dock calls this while it is being updated, so the new size is read afterwards.
-    fn size_state_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let workspace = self.workspace.clone();
-        cx.defer_in(window, move |_, _, cx| {
-            if let Some(workspace) = workspace.upgrade() {
-                crate::remember_sidebar_size(&workspace, cx);
-            }
-        });
+    fn side(&self, _: &App) -> SidebarSide {
+        SidebarSide::Left
     }
 
-    fn icon(&self, _: &Window, _: &App) -> Option<IconName> {
-        Some(IconName::Sparkle)
+    fn serialized_state(&self, _: &App) -> Option<String> {
+        serde_json::to_string(&SerializedSidebar {
+            width: self.width.map(f32::from),
+        })
+        .log_err()
     }
 
-    fn icon_tooltip(&self, _: &Window, _: &App) -> Option<&'static str> {
-        Some("Paseo Agents")
-    }
-
-    fn toggle_action(&self) -> Box<dyn gpui::Action> {
-        Box::new(TogglePanel)
-    }
-
-    fn activation_priority(&self) -> u32 {
-        4
-    }
-
-    fn starts_open(&self, _: &Window, _: &App) -> bool {
-        true
-    }
-
-    // A hidden panel gets no hover-leave event, so a pending re-sort would otherwise wait
-    // until the pointer next passes over the panel.
-    fn set_active(&mut self, active: bool, _: &mut Window, cx: &mut Context<Self>) {
-        if !active {
-            self.set_pointer_inside(false, cx);
+    fn restore_serialized_state(&mut self, state: &str, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = serde_json::from_str::<SerializedSidebar>(state).log_err() {
+            self.width = state
+                .width
+                .map(|width| px(width).clamp(MIN_WIDTH, MAX_WIDTH));
+            cx.notify();
         }
     }
 }
@@ -3567,7 +3642,7 @@ mod tests {
     fn sidebar_with_agents(
         count: usize,
         cx: &mut gpui::TestAppContext,
-    ) -> (Entity<PaseoPanel>, &mut gpui::VisualTestContext) {
+    ) -> (Entity<AgentsList>, &mut gpui::VisualTestContext) {
         cx.update(crate::test_init);
         cx.update(|cx| {
             crate::test_set_agents(
@@ -3577,7 +3652,7 @@ mod tests {
                 cx,
             )
         });
-        let (panel, cx) = cx.add_window_view(PaseoPanel::test_new);
+        let (panel, cx) = cx.add_window_view(AgentsList::test_new);
         cx.run_until_parked();
         (panel, cx)
     }
@@ -3594,7 +3669,8 @@ mod tests {
             rows += 1;
             assert_eq!(
                 (row.origin.x, row.size.width),
-                (sidebar.origin.x + px(8.), sidebar.size.width - px(16.)),
+                // 8px padding on each side, inside the list's 1px right border.
+                (sidebar.origin.x + px(8.), sidebar.size.width - px(17.)),
                 "row {index} spans the list, inside its padding"
             );
         }

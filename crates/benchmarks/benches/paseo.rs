@@ -5,7 +5,7 @@ use gpui::{
     Render, Styled as _, Window, div, px,
 };
 use paseo_client::{AgentSummary, TimelineEntry, TimelinePayload};
-use paseo_ui::{AgentView, FileEdit, PaseoPanel};
+use paseo_ui::{AgentView, AgentsList, FileEdit};
 use serde_json::json;
 
 /// Sidebar frames while agents work: rows re-render every frame a status animates.
@@ -20,8 +20,8 @@ fn paseo_sidebar_frame(agent_count: &usize, cx: &mut BenchAppContext) {
     let agent_count = *agent_count;
     cx.update(|cx| paseo_ui::test_set_agents(agents(agent_count), cx));
     let mut window = cx.add_empty_window();
-    let panel = window.update(|window, cx| window.replace_root(cx, PaseoPanel::test_new));
-    let listed = cx.update(|cx| PaseoPanel::test_agent_order(&panel, cx).len());
+    let panel = window.update(|window, cx| window.replace_root(cx, AgentsList::test_new));
+    let listed = cx.update(|cx| AgentsList::test_agent_order(&panel, cx).len());
     assert_eq!(listed, agent_count, "the sidebar lists every agent");
     cx.bench_renderer(panel, |_, _, cx| cx.notify());
 }
@@ -38,8 +38,8 @@ fn paseo_sidebar_agent_update(agent_count: &usize, cx: &mut BenchAppContext) {
     let agent_count = *agent_count;
     cx.update(|cx| paseo_ui::test_set_agents(agents(agent_count), cx));
     let mut window = cx.add_empty_window();
-    let panel = window.update(|window, cx| window.replace_root(cx, PaseoPanel::test_new));
-    let listed = cx.update(|cx| PaseoPanel::test_agent_order(&panel, cx).len());
+    let panel = window.update(|window, cx| window.replace_root(cx, AgentsList::test_new));
+    let listed = cx.update(|cx| AgentsList::test_agent_order(&panel, cx).len());
     assert_eq!(listed, agent_count, "the sidebar lists every agent");
     let mut update = 0;
     cx.bench_renderer(panel, move |_, _, cx| {
@@ -70,12 +70,12 @@ fn paseo_sidebar_resize(agent_count: &usize, cx: &mut BenchAppContext) {
     let mut window = cx.add_empty_window();
     let dock = window.update(|window, cx| {
         window.replace_root(cx, |window, cx| SidebarDock {
-            panel: cx.new(|cx| PaseoPanel::test_new(window, cx)),
+            panel: cx.new(|cx| AgentsList::test_new(window, cx)),
             width: px(300.),
         })
     });
     let panel = cx.read(|cx| dock.read(cx).panel.clone());
-    let listed = cx.update(|cx| PaseoPanel::test_agent_order(&panel, cx).len());
+    let listed = cx.update(|cx| AgentsList::test_agent_order(&panel, cx).len());
     assert_eq!(listed, agent_count, "the sidebar lists every agent");
     cx.bench_renderer(dock, |dock, _, cx| {
         dock.width = if dock.width == px(300.) {
@@ -90,7 +90,7 @@ fn paseo_sidebar_resize(agent_count: &usize, cx: &mut BenchAppContext) {
 /// The sidebar at a set width, as the dock holds it. A test window's own resize doesn't lay the
 /// window out again, so the width changes here.
 struct SidebarDock {
-    panel: Entity<PaseoPanel>,
+    panel: Entity<AgentsList>,
     width: Pixels,
 }
 

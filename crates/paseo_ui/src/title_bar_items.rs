@@ -5,7 +5,6 @@ use gpui::{AnyView, App, AppContext as _, Context, Entity, Subscription, WeakEnt
 use ui::{CommonAnimationExt as _, Tooltip, prelude::*};
 use workspace::Workspace;
 
-use crate::agent_view::AgentTab;
 use crate::attention::HostActivity;
 use crate::sidebar::AgentAlert;
 use crate::store::AgentBucket;
@@ -53,10 +52,7 @@ impl TitleBarAgent {
 
     fn active_agent(&self, cx: &App) -> Option<(String, AgentBucket)> {
         let agent_id = self.workspace.upgrade().and_then(|workspace| {
-            workspace
-                .read(cx)
-                .active_item(cx)
-                .and_then(|item| item.downcast::<AgentTab>())
+            crate::chat_panel::active_agent_tab(workspace.read(cx), cx)
                 .and_then(|tab| tab.read(cx).agent_id(cx))
         })?;
         let store = crate::hosts::store_for_agent(&agent_id, cx)?;

@@ -26,6 +26,7 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
         MenuItem::separator(),
         MenuItem::action("Toggle Left Dock", workspace::ToggleLeftDock),
         MenuItem::action("Toggle Right Dock", workspace::ToggleRightDock),
+        MenuItem::action("Toggle Editor", workspace::ToggleEditorArea),
         MenuItem::action("Toggle Bottom Dock", workspace::ToggleBottomDock),
         MenuItem::action("Toggle All Docks", workspace::ToggleAllDocks),
         MenuItem::submenu(Menu {
@@ -41,6 +42,7 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
         MenuItem::separator(),
         MenuItem::action("Folder Panel", project_panel::ToggleFocus),
         MenuItem::action("Paseo Agents", paseo_ui::TogglePanel),
+        MenuItem::action("Paseo Chats", paseo_ui::ToggleChatPanel),
         MenuItem::action("New Paseo Agent", paseo_ui::NewAgent),
         MenuItem::action("New Paseo Workspace", paseo_ui::NewAgentWorkspace),
         MenuItem::action("Paseo History", paseo_ui::OpenHistory),

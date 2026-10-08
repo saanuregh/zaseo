@@ -259,7 +259,7 @@ fn send_to_agent(
 ) {
     let tab = match target(workspace, cx) {
         Target::Tab(tab) => {
-            workspace.activate_item(&tab, true, true, window, cx);
+            crate::chat_panel::activate_agent_tab(workspace, &tab, true, window, cx);
             tab
         }
         Target::Agent(agent_id) => open_agent_here(workspace, &agent_id, true, window, cx),
@@ -313,8 +313,12 @@ fn target(workspace: &Workspace, cx: &App) -> Target {
 }
 
 fn recent_agent_tab(workspace: &Workspace, cx: &App) -> Option<Entity<AgentTab>> {
-    workspace
-        .panes()
+    // Chats live in the chat panel; before it loads, in the editor.
+    let panes = match crate::chat_panel::chat_panel(workspace, cx) {
+        Some(panel) => panel.read(cx).panes().into_iter().cloned().collect(),
+        None => workspace.panes().to_vec(),
+    };
+    panes
         .iter()
         .flat_map(|pane| {
             let pane = pane.read(cx);

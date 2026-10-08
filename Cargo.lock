@@ -12811,6 +12811,7 @@ dependencies = [
  "multi_buffer",
  "paseo_client",
  "picker",
+ "platform_title_bar",
  "project",
  "project_symbols",
  "schemars 1.0.4",
