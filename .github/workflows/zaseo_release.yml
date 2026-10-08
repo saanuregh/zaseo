@@ -69,3 +69,12 @@ jobs:
         run: gh release upload "$GITHUB_REF_NAME" target/aarch64-apple-darwin/release/Zaseo-aarch64.dmg --clobber
         env:
           GH_TOKEN: ${{ github.token }}
+
+  publish_release:
+    needs: [bundle_linux_x86_64, bundle_mac_aarch64]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish release
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+        env:
+          GH_TOKEN: ${{ github.token }}
