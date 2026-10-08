@@ -1,50 +1,106 @@
-# Zaseo reference
+# Zaseo guide
 
-This is the full guide to Zaseo's Paseo features. For install and first run, see the
-[README](../README.md).
+This guide covers how Zaseo differs from Zed, its Paseo features, building from source,
+and upstream versions. For downloads and first run, see the [README](../README.md).
+
+## How Zaseo differs from Zed
+
+### Command line and links
+
+- `zaseo` takes `zaseo://` links only. File and folder paths, `-` (stdin), `--diff`,
+  `file://` and `ssh://` arguments are rejected, because projects open from agents.
+  `--uninstall` and `--dev-container` are gone.
+- `zaseo://` replaces `zed://`, including the `/settings`, `/extension`, `/ssh` and
+  `/git` routes. `zaseo://` links in the terminal are clickable.
+- Zaseo registers no file types, so it doesn't appear in "Open With".
+- On macOS, **Install CLI** links `/usr/local/bin/zaseo` and refuses to replace
+  anything already there.
+
+### Files and identity
+
+Zaseo installs next to Zed and shares nothing with it:
+
+| | Linux | macOS |
+| --- | --- | --- |
+| Settings | `~/.config/zaseo` | `~/.config/zaseo` |
+| Data | `~/.local/share/zaseo` | `~/Library/Application Support/Zaseo` |
+
+The app ID is `local.zaseo.Zaseo`, and the app reports Zaseo's own version, not Zed's.
+
+### Removed or changed
+
+- **Zed's AI.** `disable_ai` defaults to `true`, and Zed's agent panel, inline assistant,
+  threads, and their settings pages are gone. Edit predictions keep their own settings
+  page.
+- **Accounts and collaboration.** Sign-in, calls, the collab panel and their settings
+  are removed.
+- **Updates.** `auto_update` is off and the updater never runs. Update Zaseo by
+  installing a newer build.
+- **Telemetry.** `telemetry.diagnostics` and `telemetry.metrics` default to `false`, and
+  the Privacy settings and onboarding toggles are gone, because the data would go to
+  Zed's servers.
+- **Opening folders by hand.** The File menu, welcome page, title bar and command
+  palette have no Open, Open Recent, Open Remote or Add Folder actions, and their keys
+  (`ctrl-o`, `ctrl-r`, `ctrl-shift-a` and the rest) are unbound. The title bar's project
+  name is a plain label.
+- **Dev containers** are removed.
+- **Welcome and onboarding.** The welcome page offers **New Workspace**, **New Agent**
+  and **Recent Folders**. Onboarding replaces settings import and agent setup with
+  **Paseo Hosts**.
+- **Menus.** **Close Project** is **Close Folders**. View adds **Toggle Editor**,
+  **Paseo Agents**, **Paseo Chats**, **New Paseo Agent**, **New Paseo Workspace**,
+  **Paseo History**, **Paseo Last Turn** and **Paseo Usage**. Help links to the Zaseo repository and to Zed and Paseo documentation.
+- **Agent entry points in the editor.** The pane's `+` menu has **New Agent**, and the
+  editor toolbar has **Add Selection to Agent** in place of Inline Assist.
 
 ## Connections
 
-Zaseo connects to a Paseo daemon you install and start yourself. It does not bundle or
-start Paseo. It targets Paseo v0.11.0 and shows an incompatibility error when a daemon
-lacks the features it needs.
+Zaseo connects to Paseo daemons you install and start yourself. It does not bundle or
+start Paseo. It shows an incompatibility error when a daemon lacks a feature it needs.
 
-At startup Zaseo connects to every profile at once and lists all their agents in one
-sidebar. The default `Local` profile points to `ws://127.0.0.1:6767/ws`. Use the host
-menu at the top of the Paseo sidebar, or **Manage Hosts…**, to add a host or pick the
-default host for new agents. The sidebar's filter menu can show only some hosts.
+At startup Zaseo connects to every host at once and lists all their agents in one
+sidebar. The host button at the top of the sidebar shows a dot for the worst host
+status. Its menu:
+
+- adds hosts and picks the default host for new agents (**Manage Hosts…**),
+- reconnects one host (click it) or all of them (**Reconnect All**),
+- opens [Usage](#usage) and [Daemon Status](#daemon-status).
+
+With two or more hosts, the sidebar shows a row for each host that is offline, rejects
+its password, or is a duplicate of another, with **Try again**.
 
 ### Profiles
 
-Profiles are stored under `paseo.profiles` in your settings:
+Hosts are stored under `paseo.profiles` in your settings, and `paseo.active_profile`
+names the default host for new agents.
 
-- `target_uri`: a `ws://` or `wss://` daemon URL, or
+- `name`: the host's name in the sidebar and menus.
+- `target_uri`: a `ws://` or `wss://` URL ending in `/ws`, or
   `ssh://user@host:port?daemonPort=6767` to reach a remote daemon's loopback port
   through `ssh -W`.
-- `editor_ssh_uri` (direct URLs only): the SSH host that **Open Workspace** uses to
-  open an agent's directory remotely. A direct URL to another machine needs it,
-  because every agent opens in an editor workspace for its folder; a `localhost` URL
-  doesn't. SSH profiles use their own target for this.
+- `editor_ssh_uri` (`ws://` and `wss://` hosts only): the SSH host Zaseo uses to open an
+  agent's folder. A URL to another machine needs it, because every agent opens in an
+  editor for its folder; a `localhost` URL doesn't. SSH hosts use their own target.
+- `client_id`: leave it empty to use Zaseo's generated ID.
 
 ### SSH editing
 
-SSH editing, including project switching for remote agents, needs a Zed remote server
-on the host. Builds run with `cargo run` compile and upload one. Installed release
-builds install Zed's official server for the release pinned in
-`UPSTREAM_REMOTE_SERVER_TAG` (`crates/remote/src/transport.rs`), whose protocol matches
-Zaseo's. The host downloads it into `~/.zed_server`. If that fails, or the host's
-`ssh_connections` entry sets `upload_binary_over_ssh`, Zaseo downloads it on this
-machine and uploads it.
+Opening a remote agent's folder needs a Zed remote server on the host. Builds run with
+`cargo run` compile and upload one. Release builds install Zed's official server for
+the release pinned in `UPSTREAM_REMOTE_SERVER_TAG` (`crates/remote/src/transport.rs`),
+whose protocol matches Zaseo's. The host downloads it into `~/.zed_server`. If that
+fails, or the host's `ssh_connections` entry sets `upload_binary_over_ssh`, Zaseo
+downloads it on this machine and uploads it.
 
 ### Passwords and credentials
 
 - Zaseo keeps passwords in memory only and never saves them.
 - It rejects URLs that contain credentials.
-- When no password was typed, a `ws://` or `wss://` profile that points at the daemon
-  running on this machine signs in with that daemon's local credential
+- When no password was typed, a `ws://` or `wss://` host that points at the daemon on
+  this machine signs in with that daemon's local credential
   (`$PASEO_HOME/local-credential`, default `~/.paseo`), as the Paseo CLI does. A
   password-protected local daemon therefore needs no password.
-- SSH profiles always use a typed password.
+- SSH hosts always use a typed password.
 - A remote `ws://` connection is only as private as the network or VPN it runs over.
 
 ## Window layout
@@ -54,36 +110,66 @@ From left to right a window shows four areas, and each one hides on its own:
 | Area | Holds | Show or hide |
 | --- | --- | --- |
 | Agents list | Every host's agents | `ctrl-alt-1` or `ctrl-alt-p` |
-| Chat panel | Agent chats, in tabs and splits | `ctrl-alt-2` or `ctrl-b` |
+| Chat panel | Agent chats, in tabs and splits | `ctrl-alt-2` |
 | Editor | Files and every other tab | `ctrl-alt-3` |
 | Right dock | Folder, outline, git and the other panels | `ctrl-alt-4` or `ctrl-alt-b` |
 
+The chat panel starts in the left dock, so `ctrl-b` toggles it too. It can move to the
+right dock instead.
+
 The layout buttons in the status bar do the same, each at the edge on the side of its
-area: agents list, chat panel and editor at the bottom left, right dock at the bottom
-right. Each is highlighted while its area shows, and the agents button shows a dot while
-the list is hidden and an agent needs you. The status bar runs the full width of the
-window, under the agents list too. With the editor hidden the chat panel takes its
-width. Opening an agent shows the chat panel, and opening a file shows the editor.
+area. Each is highlighted while its area shows, and the agents button shows a dot while
+the list is hidden and an agent needs you. With the editor hidden the chat panel takes
+its width, and the editor stays hidden for that workspace after a restart. Opening an
+agent shows the chat panel, and opening a file shows the editor.
 
 Chats open only in the chat panel, and files never do. Dragging a chat into the editor,
-or a file into the chat panel, does nothing. The chat panel's split button starts a new
-agent beside the current one, and **Split Right** and the other split commands work there
-too. Chat tabs drag between the panel's splits. The panel keeps its tabs and splits per
-project across restarts.
+or a file into the chat panel, does nothing.
+
+- The tab bar's **+** starts a new agent. An empty panel says "No agent chats open" with
+  a **New Agent** button.
+- The split button and **Split Right** and the other split commands start a new agent
+  beside the current one, since a chat can't show twice. The split-and-move commands
+  move the current chat into the new split instead.
+- Chat tabs drag between splits, and a split can be zoomed.
+- The panel restores its chats and splits for each workspace after a restart. Drafts
+  and subagent tabs are not restored.
 
 ## Sidebar
 
 The agents list (**View → Paseo Agents**) runs down the window's left edge and lists
-projects, their workspaces, and each workspace's agents, as Paseo 0.9 does, with
-pinned workspaces first. One list serves every project open in the window.
+projects, their workspaces, and each workspace's agents, with pinned workspaces first.
+One list serves every project open in the window.
 
 - A workspace with one agent is a single row that opens the agent.
-- Each row's title wraps onto two lines. Under it the row shows its project (outside
-  the project grouping), worktree and branch, changed lines, and last activity.
+- A row's title takes one line by default (`paseo.sidebar.title_lines`, up to 4). Under
+  it the row shows its host (when several are listed), its project (outside project
+  grouping), worktree and branch, and last activity.
 - Rows keep their order while the pointer is over the sidebar and re-sort when it
   leaves.
-- The sidebar can also group workspaces by status (each under its most urgent agent,
-  as Paseo lists them), or by label.
+- The filter field (`ctrl-f` in the sidebar) matches titles, projects, providers, and
+  the start of agent IDs.
+- The grouping menu groups workspaces by project, by status (each under its most urgent
+  agent, as Paseo lists them), or by label. With two or more hosts it can also hide
+  hosts. It adds a project or creates a project directory.
+- The header has a command palette button.
+
+### Row menus
+
+Right-click a row for its menu.
+
+- **Agent:** Open, **Fork**, **New Agent in Project**, **Open in Editor**, **Mark as
+  Read**, **Copy Agent ID**, **Copy Path**, **Archive**.
+- **Workspace:** **New Agent Here**, rename, **Mark as Read** or **Mark as Unread**, pin,
+  labels (assign, create, rename, recolor, delete), scripts (start, stop, open, run a
+  blocked setup), copy path or branch, reveal in the file manager, and **Archive
+  Workspace…**. Archiving a Paseo worktree workspace removes the worktree folder once no
+  other workspace uses it; the branch is kept.
+- **Project:** a new agent, **New Workspace…** (Local or a new worktree from a base
+  branch, starting a chat or only a terminal), **Paseo Worktrees…** (list and archive
+  the project's Paseo worktrees), rename, icon or **Use Automatic Icon**, **Copy Path**,
+  reveal in the file manager, and remove. Removing a project never changes files on
+  disk.
 
 ### Agent state
 
@@ -102,54 +188,59 @@ one's colour. It lists them: waiting for input first, then failed or finished an
 unread. Each entry shows how long the agent has needed you and, for a failure, the
 daemon's error. An entry opens its agent, and unread ones can be marked read.
 
-Alerts for finished or waiting agents replace each other instead of stacking up.
+Toasts for finished, failed or waiting agents replace each other instead of stacking
+up.
 
 ### Title bar
 
-The title bar shows the same bell with how many agents are running. After the project
-name it shows the agent of the chat in front and its state. It has no worktree or branch pickers, since the sidebar shows each agent's.
+The title bar shows the same bell with how many agents are running. After the folder
+name it shows the agent of the chat in front and its state. Zed's branch and worktree
+buttons are hidden by default (`title_bar.show_branch_name` and
+`title_bar.show_worktree_name`), since the sidebar shows each agent's.
 
 ## Agent tabs
 
 Each agent opens in its own tab in the chat panel with its conversation, permission
 prompts, and a composer.
 
-- A new agent starts as a draft tab. Its first message creates the agent.
+- A new agent starts as a draft tab, with a host picker (when there are several hosts)
+  and a folder picker. Its first message creates the agent.
 - A failed agent's chat shows the error above the conversation.
 - An agent whose provider isn't available on the host says so and doesn't send
   messages.
-- Opening an agent switches the window to that agent's project, opening the project if
-  needed, as Paseo does. Remote agents switch only when an SSH target is known (see
+- Opening an agent switches the window to that agent's folder, opening it if needed, as
+  Paseo does. Remote agents switch only when an SSH target is known (see
   `editor_ssh_uri` under [Profiles](#profiles)).
-- The agent's menu (rename, copy ID, fork, reload, archive) is the ⋯ button at the
-  right of the tab bar.
+- The ⋯ button at the right of the tab bar has rename, copy ID, **Fork Agent**, reload,
+  and archive.
 
 ### Composer
 
 - Provider, model, thinking, and mode pickers. Each opens a list with descriptions.
   Long lists (some hosts offer hundreds of models) can be searched by name or
   description.
-- After the pickers come the provider's own features, as in Paseo: Codex's **Speed**
-  menu (a bolt, yellow while Fast or Ultrafast is picked), Claude's **Fast** toggle, the
-  **Plan** toggle, and any option list a provider defines. A draft's choices apply when
-  its agent is created.
+- After the pickers come the provider's own features, as the daemon defines them, such
+  as Codex's **Speed** menu, Claude's **Fast** toggle, and **Plan**. A speed option turns
+  yellow while a non-default choice is picked. A draft's choices apply when its agent
+  is created.
 - The context ring shows how full the agent's context window is. Hover it for token
   counts, session cost, and the usage of the account the agent runs under.
 - A message sent while the agent works steers its turn. Set
   `paseo.chat.send_behavior` to `"interrupt"` to stop the turn and start a new one
   instead. A queued message sent automatically when the turn ends always steers, so a
   turn the agent starts by itself at that moment is not cut short.
+- Queued messages can be sent now, or edited back into the composer.
 - When a provider accepts a change with a note, such as a mode change that applies after
   the current turn, the note shows as a toast.
-- `/` lists the agent's commands, and `@` completes file paths.
+- `/` lists the agent's commands and skills, and `@` completes file paths.
 - Pasted images are sent with the message.
-- The paperclip button attaches files. PNG, JPEG, GIF and WebP files attach as images;
-  other files upload to the Paseo host, where the agent reads them.
+- The paperclip button attaches files up to 50 MB. PNG, JPEG, GIF and WebP files attach
+  as images; other files upload to the Paseo host, where the agent reads them.
 
 ### Conversation
 
-- Tool calls show as one quiet line each ("Ran 2 commands and used 1 other tool"). A
-  click opens the details in place.
+- Each run of tool calls shows as one quiet line ("Ran 2 commands and used 1 other
+  tool"). A click opens the details in place.
 - Once a turn finishes, its steps before the agent's final answer (narration, tools,
   and thinking) fold under a "Worked for …" line at the top. Click it to show them
   again.
@@ -168,19 +259,20 @@ Turn**, or **Review** on the changed files card under the latest finished turn.
 - Paseo keeps no per-turn checkpoints, so the old text is rebuilt by undoing the
   turn's edits.
 - A file that changed after the turn shows only its edit snippets.
-- Files outside the open project are read through the daemon and shown read-only.
+- Files outside the open folder are read through the daemon and shown read-only.
 - Use Zed's git panel for uncommitted and branch changes.
 
 ### Rewind
 
 Rewind from a user message's hover row: the conversation, the files, or both, as the
-agent's provider allows. A rewind cannot be undone.
+agent's provider allows. Rewinding the conversation puts that message back in an empty
+composer. A rewind cannot be undone.
 
 ### Terminals
 
-Terminals run on the Paseo host in the agent's directory. Open one from the command
-center or `ctrl-shift-t`. Closing a tab keeps the shell running; the tab's **Kill**
-stops it.
+Terminals run on the Paseo host in the agent's directory. Open one with **New
+terminal** in the command palette or `ctrl-shift-t`. Closing a tab keeps the shell
+running; the tab's **Kill** stops it.
 
 ### Links in chat
 
@@ -219,8 +311,8 @@ Use the composer's microphone button when the daemon has speech-to-text enabled.
 
 ### Usage
 
-**View → Paseo Usage**, the host menu's **Usage**, or a click on the status-bar usage chip
-opens Usage. It shows one card per account: each limit window with its reset time,
+**View → Paseo Usage**, the host menu's **Usage**, or a click on the status-bar usage
+chip opens Usage. It shows one card per account: each limit window with its reset time,
 balances, and why an account can't be read, such as an expired login and the command
 that refreshes it. Refresh one card or all of them. Pick **Used** or **Remaining** for
 the percentages. With several hosts connected, pick which host to show.
@@ -230,33 +322,22 @@ which report usage per provider, show that provider's usage instead.
 
 ### Send code to an agent
 
-- **Add Selection to Agent** (right-click, or `ctrl->`) adds `@file:lines` and the
-  selected code, or the cursor's line.
+- **Add Selection to Agent** (right-click, the editor toolbar, or `ctrl->`) adds
+  `@file:lines` and the selected code, or the cursor's line.
 - The project panel's **Add to Agent** adds `@path` mentions.
 - **Ask Agent to Fix** in the code actions menu (`ctrl-.`) on an error or warning adds
   the problem and its lines.
 
 The text goes to the agent tab used last in this project, else the agent last focused
-anywhere (opened here), else a new agent draft. It is never sent on its own.
-
-### Workspaces and projects
-
-- A workspace row's right-click menu has rename, **Mark as Read** or **Mark as
-  Unread**, pin, labels (assign, create, rename, recolor, delete), scripts (start,
-  stop, open, run a blocked setup), copy path or branch, and **Archive Workspace…**.
-  Archiving a Paseo worktree workspace removes the worktree folder once no other
-  workspace uses it; the branch is kept.
-- A project's menu has a new agent, **New Workspace…** (Local or a new worktree from a
-  base branch, starting a chat or only a terminal), **Paseo Worktrees…** (list and
-  archive the project's Paseo worktrees), rename, icon, and remove. Removing a project
-  never changes files on disk.
-- The sidebar's grouping menu adds a project or creates a project directory.
+anywhere (opened here), else a new agent draft. From a subagent's tab it goes to the
+parent agent. It is never sent on its own.
 
 ### History
 
-Open it from the sidebar row under **New workspace**, or **Open history** in the
-command palette. As in Paseo, it lists every agent the host keeps, active and archived,
-newest first under Today, Yesterday, This week, This month and Older.
+Open it from the sidebar row under **New workspace**, **View → Paseo History**, or
+**Open history** in the command palette. As in Paseo, it lists every agent the host
+keeps, active and archived, newest first under Today, Yesterday, This week, This month
+and Older.
 
 - A row shows its workspace › provider and title, an **Archived** or pending badge,
   the project, branch and last activity.
@@ -273,8 +354,10 @@ newest first under Today, Yesterday, This week, This month and Older.
 Zed's palette is the only one, on `ctrl-shift-p` and the keys below. Before you type,
 it lists the most recently active agents above its commands. Typing finds agents
 (**Agent: title — project · status**), the current agent's terminals, and Paseo's
-commands under their own names. Zed's collaboration, account, update, feedback,
-threads and assistant commands are hidden.
+commands under their own names, such as **New terminal**, **Copy agent ID**, **Change
+thinking effort**, **Reconnect to host** and **Group sidebar by project or status**.
+Typing "project" also finds Zed's commands that Zaseo calls "folder". The commands
+removed in [Removed or changed](#removed-or-changed) are hidden.
 
 ### Daemon status
 
@@ -304,7 +387,7 @@ kept or rejected, like Zed's own agent.
 | Keys | Action |
 | --- | --- |
 | `ctrl-alt-1` (or `ctrl-alt-p`) | Show or hide the agents list |
-| `ctrl-alt-2` (or `ctrl-b`) | Show or hide the chat panel |
+| `ctrl-alt-2` | Show or hide the chat panel (`ctrl-b` toggles the left dock, where it starts) |
 | `ctrl-alt-3` | Show or hide the editor |
 | `ctrl-alt-4` (or `ctrl-alt-b`) | Show or hide the right dock |
 | `ctrl-n` (or `ctrl-alt-n`) | New workspace; Zed's New File stays in the command palette |
@@ -317,51 +400,49 @@ kept or rejected, like Zed's own agent.
 | `escape` | Interrupt the running agent |
 | `shift-tab` | Cycle the permission mode |
 | `ctrl-/` | Choose the model |
-| `ctrl-alt-/` (Linux and Windows) | Choose the permission mode |
+| `ctrl-alt-/` | Choose the permission mode |
 | `ctrl-l` | Focus the composer |
 | `shift-alt-a` / `shift-alt-x` | Accept / deny the pending permission |
 | `ctrl-shift-backspace`, or `ctrl-backspace` in the sidebar | Archive the agent |
 | `ctrl-shift-down` | Scroll to the latest message |
-| `ctrl-f` in the sidebar (Linux and Windows) | Filter agents |
+| `ctrl-f` in the sidebar | Filter agents |
 | `ctrl-=` / `ctrl--` / `ctrl-0` | Zoom the chat and editors in / out / reset |
 | `f2` | Rename the agent |
 | `ctrl-alt-shift-e` | Open the Last turn tab |
 | `ctrl-shift-t` in Paseo views | New terminal in the agent's directory |
 | `ctrl-d` in the composer | Start or stop dictation |
 | `ctrl->` in the editor (`ctrl-shift-.` on Windows) | Add the selection to the agent |
-| `alt-y` / `ctrl-alt-z` on an agent edit (`cmd-y` / `cmd-alt-z` on macOS) | Keep / reject it |
+| `alt-y` or `ctrl-alt-y` / `ctrl-alt-z` on an agent edit (`cmd-y` or `cmd-alt-y` / `cmd-alt-z` on macOS) | Keep / reject it |
 | `shift-alt-y` / `shift-alt-z` on a file with agent edits | Keep / reject all of them |
 
 ## Settings
 
 The settings window's **Paseo** page, or the `paseo` key in `settings.json`, controls
-how chats, the sidebar, alerts and usage behave. The defaults and their meaning are in
+hosts, chats, the sidebar, alerts and usage. The defaults and their meaning are in
 `assets/settings/default.json` under `paseo`:
 
-- `chat`: prose `font_family`, `font_size` (unset follows the UI font size; editor
-  zoom zooms it), `line_height`, `line_length` (characters), whether finished turns
-  start folded (`fold_finished_turns`), and whether thinking shows while an agent works
-  (`show_thinking`).
-- `sidebar`: `grouping` (the grouping menu sets it too), `title_lines`, and whether
-  sidebar rows and tabs animate (`animate_status`): the activity line, and a row easing
-  in or flashing when its agent appears or changes state.
+- `profiles` and `active_profile`: see [Profiles](#profiles).
+- `chat`: prose `font_family`, `font_size` (unset uses Zed's label size, seven eighths of
+  the UI font size; editor zoom zooms it), `line_height`, `line_length` (characters),
+  whether finished turns start folded (`fold_finished_turns`), whether thinking shows
+  while an agent works (`show_thinking`), and `send_behavior` (`"steer"` or
+  `"interrupt"`).
+- `sidebar`: `grouping` (`"project"`, `"status"` or `"labels"`; the grouping menu sets it
+  too), `title_lines`, and whether sidebar rows and tabs animate (`animate_status`): the
+  activity line, and a row easing in or flashing when its agent appears or changes
+  state.
 - `alerts`: whether agents raise `toasts`, whether the bell shows its count
   (`bell_count`), and whether agents raise `system_notifications` while no Zaseo window
   has focus (clicking one opens the agent).
-- `chat.send_behavior`: `"steer"` adds a message sent mid-turn to the running turn;
-  `"interrupt"` stops the turn and starts a new one.
 - `usage.display_as`: whether usage percentages show the share `"used"` or
   `"remaining"`.
-
-Zed's own agent is off in Zaseo, so its panel, inline assistant and settings pages are
-gone. Edit predictions keep their own settings page.
 
 The default theme is **Paseo Dark** / **Paseo Light**.
 
 ## Terms
 
-Zaseo uses Paseo's words for Paseo things. Zed's own panels say "folder" where Zed
-says "project".
+Zaseo uses Paseo's words for Paseo things. Zed's own panels and commands say "folder"
+where Zed says "project".
 
 | Word | In the Paseo sidebar and chats | In Zed's own panels |
 | --- | --- | --- |
@@ -395,15 +476,65 @@ says "project".
 - Chats opened while no folder is open go to their own folder when you switch away.
   Drafts without an agent yet go to the folder you switch to.
 
+## Building from source
+
+Follow [Building Zed for Linux](./src/development/linux.md), then run:
+
+```sh
+cargo run -p zed
+```
+
+If startup fails with `NoWaylandLib`, add the Wayland library directory first:
+
+```sh
+export LD_LIBRARY_PATH="$(pkg-config --variable=libdir wayland-client):$LD_LIBRARY_PATH"
+```
+
+- **Linux:** `script/install-linux` builds a release bundle and installs it as
+  `~/.local/bin/zaseo` with a desktop entry. `script/install.sh` installs an existing
+  bundle from `ZASEO_BUNDLE_PATH` and refuses to replace another installation's
+  `zaseo` link.
+- **macOS:** `script/bundle-mac -i` builds and installs into `/Applications`.
+- `script/uninstall.sh` removes the installed app on either system but keeps your
+  settings and data.
+
+Release builds come from the `zaseo_release` workflow when a `v*` tag is pushed. It
+builds Linux x86_64 and Apple silicon only; the macOS build is not notarized.
+
+### Nix
+
+`nix build .#zaseo` builds a stable release package with the `zaseo` command. From
+another flake, add this repository as an input and use
+`inputs.zaseo.packages.${system}.zaseo`, or apply `inputs.zaseo.overlays.default` and
+use `pkgs.zaseo`. It installs next to nixpkgs' `zed-editor`, and has no `zeditor`
+alias.
+
+Flakes only see files tracked by git, so commit new source files before
+`nix build .#zaseo` can include them.
+
+## Upstream versions
+
+The current Zed and Paseo releases are listed in the
+[README](../README.md#upstream-versions).
+
+Zaseo follows Paseo v0.11.0. It was tested against a v0.10.3 daemon, which covers the
+usage list that older daemons send; the per-account usage stream from v0.11 daemons is
+covered by tests against a simulated daemon.
+
+Resyncs move to stable release tags only. A Zed resync moves the Zed base and the
+remote server pin (`UPSTREAM_REMOTE_SERVER_TAG` in
+`crates/remote/src/transport.rs`) together, so Zaseo and its SSH remote server stay on
+one Zed release.
+
 ## Licensing checks
 
 License information for third-party dependencies must be correct for CI to pass. Zed
 uses [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) to comply with open
 source licenses. If the check fails:
 
-- `no license specified` for a crate you created: add `publish = false` under
-  `[package]` in its `Cargo.toml`, and give the crate a `LICENSE-GPL` or
-  `LICENSE-APACHE` symlink as the other crates have.
+- `no license specified` for a crate you created: set `publish.workspace = true` under
+  `[package]` in its `Cargo.toml`, as the Paseo crates do, and give the crate a
+  `LICENSE-GPL` or `LICENSE-APACHE` symlink.
 - `failed to satisfy license requirements` for a dependency: find the project's
   license and confirm this system can comply with it. If you're unsure, ask a lawyer.
   Then add the license's SPDX identifier to the `accepted` array in

@@ -1,83 +1,48 @@
-> [!IMPORTANT]
-> Remove this line to confirm you've reviewed this PR before submitting.
 # Zaseo
 
-Zaseo is a fork of [Zed](https://zed.dev) that shows [Paseo](https://paseo.sh) agents
-in a native sidebar and agent tabs.
+Zaseo is a fork of the [Zed](https://zed.dev) editor built around
+[Paseo](https://paseo.sh) agents. Agents from every host share one native sidebar and
+open as tabs next to your code.
 
-- **Agents first.** Run `zaseo` with no arguments. Projects open from agents, so the
-  command takes `zaseo://` links but not file or folder paths. The File menu, title
-  bar, and welcome page have no project-opening actions.
-- **Installs next to Zed.** Zaseo has its own `zaseo` command, `zaseo://` links, and
-  data directory. It does not update itself.
-- **Zed's cloud features are gone.** Zed's built-in AI features are always off. Sign-in
-  and collaboration are removed. Telemetry is off by default, because it would go to
-  Zed's servers.
+- **Agents first.** Projects open from agents, so `zaseo` takes `zaseo://` links, not
+  file or folder paths.
+- **Installs next to Zed.** It has its own command, links, and data directory, and does
+  not update itself.
+- **No Zed cloud.** Zed's AI, sign-in, and collaboration are gone; telemetry is off by
+  default.
 
-The full feature guide, shortcuts, settings, and terms are in
-[docs/zaseo.md](./docs/zaseo.md).
+The full guide is [docs/zaseo.md](./docs/zaseo.md).
 
 ## Install
 
-### Linux
+Download a build from
+[GitHub Releases](https://github.com/saanuregh/zaseo/releases/latest).
 
-Follow [Building Zed for Linux](./docs/src/development/linux.md), then run:
+- **Linux x86_64:** install the tarball as `~/.local/bin/zaseo` with this repository's
+  script:
 
-```sh
-cargo run -p zed
-```
+  ```sh
+  ZASEO_BUNDLE_PATH=~/Downloads/zaseo-linux-x86_64.tar.gz script/install.sh
+  ```
 
-If startup fails with `NoWaylandLib`, add the Wayland library directory first:
+- **macOS (Apple silicon):** open `Zaseo-aarch64.dmg` and drag Zaseo to Applications.
+  The build is not notarized, so run this once before the first launch:
 
-```sh
-export LD_LIBRARY_PATH="$(pkg-config --variable=libdir wayland-client):$LD_LIBRARY_PATH"
-```
+  ```sh
+  xattr -dr com.apple.quarantine /Applications/Zaseo.app
+  ```
 
-To build a release bundle and install it as `~/.local/bin/zaseo`, run
-`script/install-linux`. `script/uninstall.sh` removes the installed app but keeps your
-settings and data.
+- **Nix:** `nix build .#zaseo`.
 
-### Nix
-
-The flake builds a stable release package with the `zaseo` command:
-
-```sh
-nix build .#zaseo
-```
-
-To install it from another flake, add this repository as an input and use
-`inputs.zaseo.packages.${system}.zaseo`, or apply `inputs.zaseo.overlays.default` and
-use `pkgs.zaseo`. It installs next to nixpkgs' `zed-editor`.
-
-Flakes only see files tracked by git, so new source files must be committed before
-`nix build .#zaseo` includes them.
+To build from source or use the flake from another flake, see
+[Building from source](./docs/zaseo.md#building-from-source).
 
 ## Connect to Paseo
 
-1. Install and start a Paseo daemon yourself. Zaseo does not bundle or start Paseo.
-2. Start Zaseo. It connects to every configured host at once and lists all their agents
-   in one sidebar. The default `Local` profile points to `ws://127.0.0.1:6767/ws`.
-3. To add a host, or pick the default host for new agents, open the host menu at the
-   top of the Paseo sidebar, or **Manage Hosts…**. The sidebar's filter menu can show
-   only some hosts.
-
-Zaseo shows an incompatibility error when a daemon lacks the features it needs. For
-remote daemons, SSH, and passwords, see
-[Connections](./docs/zaseo.md#connections).
-
-## Getting around
-
-| Keys (`cmd` on macOS) | Action |
-| --- | --- |
-| `ctrl-alt-1` … `ctrl-alt-4` | Show or hide the agents list, chat panel, editor, or right dock |
-| `ctrl-n` (or `ctrl-alt-n`) | New workspace |
-| `ctrl-t` (or `ctrl-alt-t`) | New agent in the shown workspace |
-| `ctrl-shift-p` | Command palette, with agents first |
-| `ctrl-alt-]` / `ctrl-alt-[` | Next / previous agent |
-| `enter` / `shift-enter` | Send / new line |
-| `escape` | Interrupt the running agent |
-
-See [Keyboard shortcuts](./docs/zaseo.md#keyboard-shortcuts) for the full list.
+Install and start a Paseo daemon; Zaseo does not bundle one. Zaseo connects to
+`ws://127.0.0.1:6767/ws` by default. Add more hosts from the host menu at the top of
+the sidebar. See [Connections](./docs/zaseo.md#connections) for remote daemons and
+SSH, and [Keyboard shortcuts](./docs/zaseo.md#keyboard-shortcuts) to get around.
 
 ## Upstream versions
 
@@ -87,21 +52,11 @@ See [Keyboard shortcuts](./docs/zaseo.md#keyboard-shortcuts) for the full list.
 | Zed remote server | [`v1.23.2`](https://github.com/zed-industries/zed/releases/tag/v1.23.2), installed on SSH hosts; its protocol matches the Zed base |
 | Paseo | [`v0.11.0`](https://github.com/getpaseo/paseo/releases/tag/v0.11.0), protocol v1 |
 
-Zaseo's UI and protocol follow Paseo v0.11.0. It was tested against a v0.10.3 daemon,
-which exercises the usage list older daemons send. The per-account usage stream that
-v0.11 daemons send is covered by tests against a simulated daemon. Future resyncs move both projects to stable release tags only. Each Zed resync
-moves the Zed base and the remote server pin
-(`UPSTREAM_REMOTE_SERVER_TAG` in `crates/remote/src/transport.rs`) together,
-so Zaseo and its SSH remote server stay on one Zed release.
-
-## Based on Zed
-
-Zaseo is built on [Zed](https://github.com/zed-industries/zed), a code editor by Zed
-Industries, Inc. For Zed itself, see [zed.dev](https://zed.dev).
+See [Upstream versions](./docs/zaseo.md#upstream-versions) for compatibility and
+resync notes.
 
 ## License
 
-Zed source code is licensed primarily under GPL-3.0-or-later, with Apache-2.0
-components where marked. The Paseo Dark and Paseo Light themes come from Paseo under
-Apache-2.0; see `assets/themes/LICENSES`. For CI license checks, see
-[Licensing checks](./docs/zaseo.md#licensing-checks).
+Zaseo is built on [Zed](https://github.com/zed-industries/zed) by Zed Industries, Inc.,
+and is licensed mainly under GPL-3.0-or-later, with Apache-2.0 components where marked.
+The Paseo themes come from Paseo under Apache-2.0; see `assets/themes/LICENSES`.
