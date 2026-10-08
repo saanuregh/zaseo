@@ -1,5 +1,3 @@
-> [!IMPORTANT]
-> Remove this line to confirm you've reviewed this PR before submitting.
 # Zaseo
 
 Zaseo is a fork of [Zed](https://zed.dev) that shows [Paseo](https://paseo.sh) agents
