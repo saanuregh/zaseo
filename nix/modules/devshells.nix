@@ -70,6 +70,9 @@
             PATH="$mbx_cargo_shim_dir:$PATH"
           fi
           unset mbx_cargo_shim_dir
+          # A host `LD_LIBRARY_PATH` outranks the binaries' RUNPATH, so libraries built against a
+          # newer glibc than this shell's would load and fail to start.
+          unset LD_LIBRARY_PATH
         '';
 
         packages =
